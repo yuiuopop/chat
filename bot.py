@@ -66,6 +66,10 @@ receiver_cache_lock = threading.Lock()
 receiver_cache = []
 receiver_cache_at = 0.0
 pending_recovery_import = set()
+pending_fw_add = set()
+pending_fw_remove = set()
+pending_vip_add = set()
+pending_vip_remove = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 
@@ -1859,6 +1863,57 @@ def _process_album(messages):
         save_mappings(mappings)
     # external_forward.forward_album(bot, messages)
 
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text" and m.chat.id in (
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove
+    ),
+    content_types=['text']
+)
+def handle_admin_pending_inputs(message):
+    if not is_admin(message.chat.id):
+        pending_fw_add.discard(message.chat.id)
+        pending_fw_remove.discard(message.chat.id)
+        pending_vip_add.discard(message.chat.id)
+        pending_vip_remove.discard(message.chat.id)
+        return
+
+    text = (message.text or "").strip()
+
+    if message.chat.id in pending_fw_add:
+        if add_force_channel(text):
+            bot.send_message(message.chat.id, "✅ Channel added.")
+        else:
+            bot.send_message(message.chat.id, "Invalid channel.")
+        pending_fw_add.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_fw_remove:
+        remove_force_channel(text)
+        bot.send_message(message.chat.id, "❌ Channel removed.")
+        pending_fw_remove.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_vip_add:
+        try:
+            uid = int(text)
+            add_vip(uid)
+            bot.send_message(message.chat.id, "💎 VIP added.")
+        except Exception:
+            bot.send_message(message.chat.id, "Invalid ID.")
+        pending_vip_add.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_vip_remove:
+        try:
+            uid = int(text)
+            remove_vip(uid)
+            bot.send_message(message.chat.id, "❌ VIP removed.")
+        except Exception:
+            bot.send_message(message.chat.id, "Invalid ID.")
+        pending_vip_remove.discard(message.chat.id)
+        return
+
 # =========================
 # 🔁 RELAY HANDLER
 # =========================
@@ -2188,6 +2243,21 @@ def admin_panel(message):
     markup.add(
         InlineKeyboardButton("📤Export Recovery", callback_data="admin_export_recovery"),
         InlineKeyboardButton("📥Import Recovery", callback_data="admin_import_recovery")
+    )
+    markup.add(
+        InlineKeyboardButton("🧱 Firewall ON", callback_data="fw_on"),
+        InlineKeyboardButton("🧱 Firewall OFF", callback_data="fw_off")
+    )
+    markup.add(
+        InlineKeyboardButton("📢 Add Channel", callback_data="fw_add"),
+        InlineKeyboardButton("❌ Remove Channel", callback_data="fw_remove")
+    )
+    markup.add(
+        InlineKeyboardButton("💎 Add VIP", callback_data="vip_add"),
+        InlineKeyboardButton("❌ Remove VIP", callback_data="vip_remove")
+    )
+    markup.add(
+        InlineKeyboardButton("📊 Firewall Status", callback_data="fw_status")
     )
 
     bot.send_message(
@@ -2894,6 +2964,69 @@ def check_join_callback(call):
     else:
         bot.answer_callback_query(call.id, "❌ Still not joined.")
         send_force_join_ui(user_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in {
+    "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status"
+})
+def firewall_ui_callbacks(call):
+    admin_chat_id = call.message.chat.id
+    if not is_admin(admin_chat_id):
+        return
+
+    if call.data == "fw_on":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    INSERT INTO settings(key, value)
+                    VALUES('force_join_enabled', 'true')
+                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                    """
+                )
+        _clear_force_join_cache()
+        bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
+        return
+
+    if call.data == "fw_off":
+        disable_force_join()
+        bot.answer_callback_query(call.id, "🧱 Firewall Disabled")
+        return
+
+    if call.data == "fw_add":
+        pending_fw_add.add(admin_chat_id)
+        bot.answer_callback_query(call.id, "Awaiting channel")
+        bot.send_message(admin_chat_id, "📢 Send channel (@username or ID)")
+        return
+
+    if call.data == "fw_remove":
+        pending_fw_remove.add(admin_chat_id)
+        bot.answer_callback_query(call.id, "Awaiting channel")
+        bot.send_message(admin_chat_id, "❌ Send channel to remove")
+        return
+
+    if call.data == "vip_add":
+        pending_vip_add.add(admin_chat_id)
+        bot.answer_callback_query(call.id, "Awaiting USER_ID")
+        bot.send_message(admin_chat_id, "💎 Send USER_ID to add VIP")
+        return
+
+    if call.data == "vip_remove":
+        pending_vip_remove.add(admin_chat_id)
+        bot.answer_callback_query(call.id, "Awaiting USER_ID")
+        bot.send_message(admin_chat_id, "❌ Send USER_ID to remove VIP")
+        return
+
+    if call.data == "fw_status":
+        enabled = is_force_join_enabled()
+        channels = get_force_join_channels()
+        channels_text = "\n".join(str(ch) for ch in channels) if channels else "None"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            admin_chat_id,
+            f"🧱 FIREWALL STATUS\n\nStatus: {'ON ✅' if enabled else 'OFF ❌'}\nChannels:\n{channels_text}"
+        )
+        return
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
