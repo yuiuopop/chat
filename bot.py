@@ -8,6 +8,7 @@ import threading
 import queue
 import json
 import tempfile
+import random
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,7 +47,7 @@ MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
 MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
 WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
 WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
-FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "45"))
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "120"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -174,6 +175,10 @@ def init_db():
                     warnings INTEGER DEFAULT 0,
                     last_warning_time BIGINT
                 )
+            """)
+            c.execute("""
+                ALTER TABLE user_warnings
+                ADD COLUMN IF NOT EXISTS last_reason TEXT
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS force_join_channels (
@@ -660,28 +665,32 @@ def unban_user(user_id):
 # ⚠ WARNING HELPERS
 # =========================
 
-def get_warnings(user_id):
+def get_warning_details(user_id):
     now = int(time.time())
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute(
-                "SELECT warnings, last_warning_time FROM user_warnings WHERE user_id=%s",
+                "SELECT warnings, last_warning_time, last_reason FROM user_warnings WHERE user_id=%s",
                 (user_id,),
             )
             row = c.fetchone()
             if not row:
-                return 0
-            warnings, last_warning_time = row
+                return 0, "No warning reason recorded."
+            warnings, last_warning_time, last_reason = row
             if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
                 c.execute(
                     "DELETE FROM user_warnings WHERE user_id=%s",
                     (user_id,),
                 )
-                return 0
-            return warnings
+                return 0, "No warning reason recorded."
+            return warnings, (last_reason or "No warning reason recorded.")
 
 
-def add_warning(user_id):
+def get_warnings(user_id):
+    return get_warning_details(user_id)[0]
+
+
+def add_warning(user_id, reason="No reason provided"):
     now = int(time.time())
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -696,15 +705,16 @@ def add_warning(user_id):
                 if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
                     c.execute(
                         """
-                        INSERT INTO user_warnings(user_id, warnings, last_warning_time)
-                        VALUES(%s, 1, %s)
+                        INSERT INTO user_warnings(user_id, warnings, last_warning_time, last_reason)
+                        VALUES(%s, 1, %s, %s)
                         ON CONFLICT (user_id)
                         DO UPDATE SET
                             warnings = 1,
-                            last_warning_time = EXCLUDED.last_warning_time
+                            last_warning_time = EXCLUDED.last_warning_time,
+                            last_reason = EXCLUDED.last_reason
                         RETURNING warnings
                         """,
-                        (user_id, now),
+                        (user_id, now, reason),
                     )
                     return c.fetchone()[0]
                 if last_warning_time and (now - last_warning_time) < WARNING_COOLDOWN:
@@ -712,15 +722,16 @@ def add_warning(user_id):
 
             c.execute(
                 """
-                INSERT INTO user_warnings(user_id, warnings, last_warning_time)
-                VALUES(%s, 1, %s)
+                INSERT INTO user_warnings(user_id, warnings, last_warning_time, last_reason)
+                VALUES(%s, 1, %s, %s)
                 ON CONFLICT (user_id)
                 DO UPDATE SET
                     warnings = user_warnings.warnings + 1,
-                    last_warning_time = EXCLUDED.last_warning_time
+                    last_warning_time = EXCLUDED.last_warning_time,
+                    last_reason = EXCLUDED.last_reason
                 RETURNING warnings
                 """,
-                (user_id, now),
+                (user_id, now, reason),
             )
             return c.fetchone()[0]
 
@@ -762,6 +773,13 @@ def whitelist_user(user_id):
                 "UPDATE users SET whitelisted=TRUE WHERE user_id=%s",
                 (user_id,)
             )
+    try:
+        bot.send_message(
+            user_id,
+            "⭐ You have been whitelisted!\nYou now have full access."
+        )
+    except Exception:
+        pass
 
 
 def remove_whitelist(user_id):
@@ -1038,14 +1056,13 @@ def send_force_join_ui(user_id):
     channels = get_force_join_channels()
 
     markup = InlineKeyboardMarkup()
-    button_index = 1
     for ch in channels:
         join_link = _force_join_link(ch)
         if join_link:
+            label = str(ch)
             markup.add(
-                InlineKeyboardButton(f"📢 Join Channel {button_index}", url=join_link)
+                InlineKeyboardButton(f"📢 Join {label}", url=join_link)
             )
-            button_index += 1
 
     markup.add(
         InlineKeyboardButton("✅ I Joined", callback_data="check_join")
@@ -1410,7 +1427,7 @@ def handle_restrictions(message):
     # 🚫 Word Filter (text only)
     if message.content_type == "text":
         if contains_banned_word(message.text):
-            warnings = add_warning(user_id)
+            warnings = add_warning(user_id, "Banned word detected")
             action = warning_action_for_count(warnings)
             if action == "ban" and not is_whitelisted(user_id):
                 ban_user(user_id)
@@ -1684,6 +1701,37 @@ def _send_text_with_retry(user_id, text):
                 continue
             return None
     return None
+
+
+def broadcast_warning_notice(sender_id, target_id, warnings, reason):
+    username = get_username(target_id) or "Unknown"
+    text = (
+        "⚠️ USER WARNING\n\n"
+        f"👤 {username}\n"
+        f"🆔 {target_id}\n"
+        f"📊 {warnings}/{MAX_WARNINGS}\n"
+        f"📝 Reason: {reason}"
+    )
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    if not targets:
+        return 0
+
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    sent_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(_send_text_with_retry, uid, text): uid
+            for uid in targets
+        }
+        for future in as_completed(future_to_uid):
+            try:
+                if future.result():
+                    sent_count += 1
+            except Exception:
+                pass
+    return sent_count
 # =========================
 # 🚀 BROADCAST WORKER
 # =========================
@@ -1945,11 +1993,18 @@ def force_join_enforcement_scheduler():
         try:
             if is_force_join_enabled():
                 users = get_active_receivers()
+                users = random.sample(users, min(len(users), 300))
                 for user_id in users:
                     if is_admin(user_id) or is_vip(user_id):
                         continue
                     if not is_user_joined(user_id):
-                        ban_user(user_id)
+                        try:
+                            bot.send_message(
+                                user_id,
+                                "🚫 Please rejoin required channels to continue using the bot."
+                            )
+                        except Exception:
+                            pass
         except Exception as e:
             print("Force join check error:", e)
 
@@ -2271,7 +2326,7 @@ def info_command(message):
         return
 
     username, banned, auto_banned, whitelisted, act_count, total_media, last_time = row
-    warnings = get_warnings(user_id)
+    warnings, last_reason = get_warning_details(user_id)
 
     bot.send_message(
         message.chat.id,
@@ -2283,6 +2338,7 @@ def info_command(message):
 📸 Activation Media: {act_count}
 📦 Total Media Sent: {total_media}
 ⚠️ Warnings: {warnings}/{MAX_WARNINGS}
+📝 Last Reason: {last_reason}
 
 🚫 Manual Ban: {banned}
 ⏳ Auto Ban: {auto_banned}
@@ -2300,6 +2356,9 @@ def warn_command(message):
         bot.send_message(message.chat.id, "Reply to a relayed message.")
         return
 
+    parts = message.text.split(maxsplit=1)
+    reason = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "No reason provided"
+
     target_id = get_original_sender(
         message.reply_to_message.message_id,
         message.chat.id
@@ -2313,16 +2372,18 @@ def warn_command(message):
         bot.send_message(message.chat.id, "You cannot warn another admin.")
         return
 
-    warnings = add_warning(target_id)
+    warnings = add_warning(target_id, reason)
     action = warning_action_for_count(warnings)
 
     try:
         bot.send_message(
             target_id,
-            f"⚠️ You received a warning ({warnings}/{MAX_WARNINGS})."
+            f"⚠️ You received a warning ({warnings}/{MAX_WARNINGS}).\nReason: {reason}"
         )
     except Exception:
         pass
+
+    broadcast_warning_notice(message.chat.id, target_id, warnings, reason)
 
     if action == "ban" and not is_whitelisted(target_id):
         ban_user(target_id)
@@ -2340,12 +2401,12 @@ def warn_command(message):
             pass
         bot.send_message(
             message.chat.id,
-            f"⏳ User {target_id} reached soft-punishment level ({warnings}/{MAX_WARNINGS})."
+            f"⏳ User {target_id} reached soft-punishment level ({warnings}/{MAX_WARNINGS}).\nReason: {reason}"
         )
     else:
         bot.send_message(
             message.chat.id,
-            f"⚠️ Warning added.\nUser now has {warnings}/{MAX_WARNINGS} warnings."
+            f"⚠️ Warning added.\nUser now has {warnings}/{MAX_WARNINGS} warnings.\nReason: {reason}"
         )
 
 
@@ -2368,10 +2429,10 @@ def warnings_command(message):
         bot.send_message(message.chat.id, "User not found.")
         return
 
-    warnings = get_warnings(target_id)
+    warnings, last_reason = get_warning_details(target_id)
     bot.send_message(
         message.chat.id,
-        f"⚠️ User has {warnings}/{MAX_WARNINGS} warnings."
+        f"⚠️ User has {warnings}/{MAX_WARNINGS} warnings.\n📝 Last Reason: {last_reason}"
     )
 
 
