@@ -2212,7 +2212,7 @@ def force_join_enforcement_scheduler():
                 for user_id in users:
                     if is_admin(user_id) or is_vip(user_id):
                         continue
-                    if not is_user_joined(user_id, force_refresh=True):
+                    if not is_user_joined(user_id):
                         if can_send_force_join_reminder(user_id):
                             try:
                                 bot.send_message(
@@ -2374,60 +2374,115 @@ def apurgeall_command(message):
         f"Purged all mapped user messages. Deleted: {deleted_count}"
     )
 
-@bot.message_handler(commands=['panel'])
-def admin_panel(message):
+def _panel_send_or_edit(chat_id, text, markup, message_id=None):
+    if message_id is not None:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
-    if not is_admin(message.chat.id):
-        return
 
+def _panel_main_markup():
     markup = InlineKeyboardMarkup(row_width=2)
-
     markup.add(
-        InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-        InlineKeyboardButton("👥 Users", callback_data="admin_users")
+        InlineKeyboardButton("📊 Stats", callback_data="panel_stats"),
+        InlineKeyboardButton("👥 Users", callback_data="panel_users"),
     )
+    markup.add(
+        InlineKeyboardButton("🧱 Firewall", callback_data="panel_firewall"),
+        InlineKeyboardButton("⚙ System", callback_data="panel_system"),
+    )
+    markup.add(
+        InlineKeyboardButton("🚫 Moderation", callback_data="panel_moderation"),
+        InlineKeyboardButton("💎 VIP", callback_data="panel_vip"),
+    )
+    return markup
 
+
+def _panel_firewall_markup():
+    status = "🟢 ON" if is_force_join_enabled() else "🔴 OFF"
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton(f"Status: {status}", callback_data="noop"))
+    markup.add(
+        InlineKeyboardButton("➕ Add Channel", callback_data="fw_add"),
+        InlineKeyboardButton("➖ Remove Channel", callback_data="fw_remove"),
+    )
+    markup.add(
+        InlineKeyboardButton("✏️ Edit Message", callback_data="fw_edit_msg"),
+        InlineKeyboardButton("📊 Channels", callback_data="fw_status"),
+    )
+    markup.add(
+        InlineKeyboardButton("🟢 Enable", callback_data="fw_on"),
+        InlineKeyboardButton("🔴 Disable", callback_data="fw_off"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+def _panel_system_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🚪 Open Join", callback_data="admin_open_join"),
-        InlineKeyboardButton("🔒 Close Join", callback_data="admin_close_join")
+        InlineKeyboardButton("🔒 Close Join", callback_data="admin_close_join"),
     )
-
     markup.add(
-        InlineKeyboardButton("⭐ Whitelist", callback_data="admin_whitelist"),
-        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap")
+        InlineKeyboardButton("📤 Export", callback_data="admin_export_recovery"),
+        InlineKeyboardButton("📥 Import", callback_data="admin_import_recovery"),
     )
+    markup.add(
+        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
+        InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
 
+
+def _panel_vip_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Add VIP", callback_data="vip_add"),
+        InlineKeyboardButton("➖ Remove VIP", callback_data="vip_remove"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+def _panel_users_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
-        InlineKeyboardButton("⚙ Settings", callback_data="admin_settings")
+        InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
     )
-    markup.add(
-        InlineKeyboardButton("📤Export Recovery", callback_data="admin_export_recovery"),
-        InlineKeyboardButton("📥Import Recovery", callback_data="admin_import_recovery")
-    )
-    markup.add(
-        InlineKeyboardButton("🧱 Firewall ON", callback_data="fw_on"),
-        InlineKeyboardButton("🧱 Firewall OFF", callback_data="fw_off")
-    )
-    markup.add(
-        InlineKeyboardButton("📢 Add Channel", callback_data="fw_add"),
-        InlineKeyboardButton("❌ Remove Channel", callback_data="fw_remove")
-    )
-    markup.add(
-        InlineKeyboardButton("💎 Add VIP", callback_data="vip_add"),
-        InlineKeyboardButton("❌ Remove VIP", callback_data="vip_remove")
-    )
-    markup.add(
-        InlineKeyboardButton("📊 Firewall Status", callback_data="fw_status")
-    )
-    markup.add(
-        InlineKeyboardButton("✏️ Edit Firewall Msg", callback_data="fw_edit_msg")
-    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
 
-    bot.send_message(
+
+def _panel_moderation_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
+        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+@bot.message_handler(commands=['panel'])
+def admin_panel(message):
+    if not is_admin(message.chat.id):
+        return
+    _panel_send_or_edit(
         message.chat.id,
-        "🛠 Admin Control Panel",
-        reply_markup=markup
+        "🛠 *Admin Dashboard*",
+        _panel_main_markup(),
     )
 @bot.message_handler(commands=['setwelcome'])
 def set_welcome_cmd(message):
@@ -3157,7 +3212,7 @@ def check_join_callback(call):
             last_fw_msg.pop(int(user_id), None)
         try:
             bot.edit_message_text(
-                "✅ VERIFIED!\n\n🎉 Access granted!",
+                "✅ You have joined all required channels.\n\n🎉 Access granted!",
                 chat_id=msg.chat.id,
                 message_id=msg.message_id
             )
@@ -3169,6 +3224,85 @@ def check_join_callback(call):
             bot.send_message(user_id, "🎉 You can now use the bot.")
     else:
         bot.answer_callback_query(call.id, "❌ You still haven't joined all channels.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "noop")
+def noop_callback(call):
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in {
+    "panel_back", "panel_stats", "panel_users", "panel_firewall", "panel_system", "panel_moderation", "panel_vip"
+})
+def panel_navigation_callbacks(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not admin.")
+        return
+
+    if call.data == "panel_back":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "🛠 *Admin Dashboard*",
+            _panel_main_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_stats":
+        bot.answer_callback_query(call.id)
+        stats_command(call.message)
+        return
+
+    if call.data == "panel_users":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "👥 *Users Panel*",
+            _panel_users_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_firewall":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "🧱 *Firewall Control Panel*",
+            _panel_firewall_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_system":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "⚙ *System Settings*",
+            _panel_system_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_moderation":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "🚫 *Moderation Panel*",
+            _panel_moderation_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_vip":
+        bot.answer_callback_query(call.id)
+        _panel_send_or_edit(
+            call.message.chat.id,
+            "💎 *VIP Management*",
+            _panel_vip_markup(),
+            message_id=call.message.message_id,
+        )
+        return
 
 
 @bot.callback_query_handler(func=lambda call: call.data in {
@@ -3227,17 +3361,11 @@ def firewall_ui_callbacks(call):
     if call.data == "fw_status":
         enabled = is_force_join_enabled()
         channels = get_force_join_channels()
-        channels_text = (
-            "\n".join(
-                f"- {ch['name']} | chat_id: {ch['chat_id']} | link: {ch.get('invite_link') or 'auto'}"
-                for ch in channels
-            )
-            if channels else "None"
-        )
+        channels_text = "\n".join(f"• {ch['name']}" for ch in channels) if channels else "None"
         bot.answer_callback_query(call.id)
         bot.send_message(
             admin_chat_id,
-            f"🧱 FIREWALL STATUS\n\nStatus: {'ON ✅' if enabled else 'OFF ❌'}\nChannels:\n{channels_text}"
+            f"🧱 FIREWALL STATUS\n\nStatus: {'ON ✅' if enabled else 'OFF ❌'}\n\nChannels:\n{channels_text}",
         )
         return
 
@@ -3307,32 +3435,7 @@ def admin_callbacks(call):
         bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
 
     bot.answer_callback_query(call.id)
-@bot.callback_query_handler(func=lambda call: call.data == "check_join")
-def check_join_callback(call):
 
-    user_id = call.from_user.id
-    msg = call.message
-
-    # 🔥 ALWAYS FORCE REFRESH
-    if is_user_joined(user_id, force_refresh=True):
-
-        bot.answer_callback_query(call.id, "✅ Verified!")
-
-        # ✅ DELETE FIREWALL UI (BEST UX)
-        clear_force_join_ui(user_id)
-
-        # Optional success message
-        try:
-            bot.send_message(user_id, "🎉 Access unlocked! You can now use the bot.")
-        except:
-            pass
-
-    else:
-        bot.answer_callback_query(
-            call.id,
-            "❌ You still haven't joined all channels.",
-            show_alert=True
-        )
 
 @bot.message_handler(content_types=['document'])
 def import_recovery_document(message):
