@@ -47,8 +47,9 @@ MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
 MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
 WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
 WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
-FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "0"))
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "120"))
 JOINED_STATUSES = ("member", "administrator", "creator", "owner", "restricted")
+FORCE_JOIN_REMINDER_COOLDOWN = int(os.getenv("FORCE_JOIN_REMINDER_COOLDOWN", "21600"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -73,6 +74,8 @@ pending_vip_add = set()
 pending_vip_remove = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
+force_join_reminder_lock = threading.Lock()
+force_join_reminder_at = {}
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -1086,6 +1089,7 @@ def is_user_joined(user_id, force_refresh=False):
                 return cached[0]
 
     joined = True
+    had_verifiable_channel = False
     for channel in channels:
         chat_id = str(channel.get("chat_id", "")).strip()
         if not chat_id:
@@ -1096,6 +1100,7 @@ def is_user_joined(user_id, force_refresh=False):
             continue
 
         chat_ref = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+        had_verifiable_channel = True
         try:
             member = bot.get_chat_member(chat_ref, user_id)
             status = getattr(member, "status", "")
@@ -1103,13 +1108,27 @@ def is_user_joined(user_id, force_refresh=False):
                 joined = False
                 break
         except Exception:
-            joined = False
-            break
+            # Fail-open on API/check errors to avoid locking legitimate users out.
+            print(f"Force join check skipped for chat {chat_id}: unable to verify membership right now.")
+            continue
+
+    if not had_verifiable_channel:
+        joined = True
 
     with force_join_cache_lock:
         force_join_cache[cache_key] = (joined, now)
 
     return joined
+
+
+def can_send_force_join_reminder(user_id):
+    now = time.time()
+    with force_join_reminder_lock:
+        last = force_join_reminder_at.get(int(user_id), 0.0)
+        if (now - last) < FORCE_JOIN_REMINDER_COOLDOWN:
+            return False
+        force_join_reminder_at[int(user_id)] = now
+        return True
 
 
 def send_force_join_ui(user_id):
@@ -2132,13 +2151,14 @@ def force_join_enforcement_scheduler():
                     if is_admin(user_id) or is_vip(user_id):
                         continue
                     if not is_user_joined(user_id):
-                        try:
-                            bot.send_message(
-                                user_id,
-                                "🚫 Please rejoin required channels to continue using the bot."
-                            )
-                        except Exception:
-                            pass
+                        if can_send_force_join_reminder(user_id):
+                            try:
+                                bot.send_message(
+                                    user_id,
+                                    "🚫 Please rejoin required channels to continue using the bot."
+                                )
+                            except Exception:
+                                pass
         except Exception as e:
             print("Force join check error:", e)
 
