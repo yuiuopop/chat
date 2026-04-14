@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
  # make sure to have this file for cross-instance forwarding
 import psycopg2
 from psycopg2 import pool as pg_pool
+from psycopg2.extras import execute_values
 import telebot
 from telebot.types import InputMediaPhoto, InputMediaVideo
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -40,7 +41,12 @@ DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "15"))
 MESSAGE_MAP_MODE = os.getenv("MESSAGE_MAP_MODE", "full").strip().lower()
 MAP_RETENTION_DAYS = int(os.getenv("MAP_RETENTION_DAYS", "2"))
 MAP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MAP_CLEANUP_INTERVAL_SECONDS", "300"))
-MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "100"))
+MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "1000"))
+MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
+MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
+WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
+WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "45"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -59,6 +65,8 @@ receiver_cache_lock = threading.Lock()
 receiver_cache = []
 receiver_cache_at = 0.0
 pending_recovery_import = set()
+force_join_cache_lock = threading.Lock()
+force_join_cache = {}
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -154,6 +162,19 @@ def init_db():
             c.execute("CREATE INDEX IF NOT EXISTS idx_original_msg ON message_map(original_message_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_original_pair ON message_map(original_user_id, original_message_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON message_map(created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_receiver_bot_msg ON message_map(receiver_id, bot_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_pair_receiver ON message_map(original_user_id, original_message_id, receiver_id)")
+
+            # =========================
+            # ⚠ USER WARNINGS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS user_warnings (
+                    user_id BIGINT PRIMARY KEY,
+                    warnings INTEGER DEFAULT 0,
+                    last_warning_time BIGINT
+                )
+            """)
 
             # =========================
             # BANNED WORDS TABLE
@@ -212,6 +233,21 @@ def init_db():
                 VALUES('maintenance_mode', 'false')
                 ON CONFLICT DO NOTHING
             """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_chat_id', '')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', '🚫 Please join our channel to use the bot.')
+                ON CONFLICT DO NOTHING
+            """)
             # =========================
             # FIRST ADMIN INIT
             # =========================
@@ -254,9 +290,9 @@ def delete_message_globally(receiver_id, bot_message_id):
                 original_user_id, original_message_id = key_row
                 c.execute(
                     """
-                    SELECT receiver_id, bot_message_id
-                    FROM message_map
+                    DELETE FROM message_map
                     WHERE original_user_id=%s AND original_message_id=%s
+                    RETURNING receiver_id, bot_message_id
                     """,
                     (original_user_id, original_message_id),
                 )
@@ -265,9 +301,9 @@ def delete_message_globally(receiver_id, bot_message_id):
                 # Fallback for very old rows saved before original_message_id existed.
                 c.execute(
                     """
-                    SELECT receiver_id, bot_message_id
-                    FROM message_map
+                    DELETE FROM message_map
                     WHERE bot_message_id=%s
+                    RETURNING receiver_id, bot_message_id
                     """,
                     (bot_message_id,),
                 )
@@ -281,83 +317,99 @@ def delete_message_globally(receiver_id, bot_message_id):
         except:
             pass
 
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            if key_row and key_row[1] is not None:
+    return deleted_count
+def purge_user_messages(user_id):
+
+    total_deleted = 0
+    while True:
+        with get_connection() as conn:
+            with conn.cursor() as c:
                 c.execute(
                     """
+                    WITH batch AS (
+                        SELECT ctid, bot_message_id, receiver_id
+                        FROM message_map
+                        WHERE original_user_id=%s
+                        LIMIT %s
+                    )
                     DELETE FROM message_map
-                    WHERE original_user_id=%s AND original_message_id=%s
+                    USING batch
+                    WHERE message_map.ctid = batch.ctid
+                    RETURNING batch.bot_message_id, batch.receiver_id
                     """,
-                    (key_row[0], key_row[1]),
+                    (user_id, MAP_DELETE_BATCH_SIZE),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            break
+
+        for bot_msg_id, target_receiver_id in rows:
+            try:
+                bot.delete_message(target_receiver_id, bot_msg_id)
+                total_deleted += 1
+            except:
+                pass
+    return total_deleted
+
+def purge_all_user_messages():
+
+    deleted_count = 0
+    while True:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    WITH batch AS (
+                        SELECT ctid, bot_message_id, receiver_id
+                        FROM message_map
+                        LIMIT %s
+                    )
+                    DELETE FROM message_map
+                    USING batch
+                    WHERE message_map.ctid = batch.ctid
+                    RETURNING batch.bot_message_id, batch.receiver_id
+                    """,
+                    (MAP_DELETE_BATCH_SIZE,),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            break
+
+        for bot_msg_id, receiver_id in rows:
+            try:
+                bot.delete_message(receiver_id, bot_msg_id)
+                deleted_count += 1
+            except:
+                pass
+
+    return deleted_count
+
+def get_original_sender(bot_message_id, receiver_id=None):
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if receiver_id is not None:
+                c.execute(
+                    """
+                    SELECT original_user_id
+                    FROM message_map
+                    WHERE bot_message_id=%s AND receiver_id=%s
+                    LIMIT 1
+                    """,
+                    (bot_message_id, receiver_id),
                 )
             else:
                 c.execute(
                     """
-                    DELETE FROM message_map
+                    SELECT original_user_id
+                    FROM message_map
                     WHERE bot_message_id=%s
+                    LIMIT 1
                     """,
                     (bot_message_id,),
                 )
-    return deleted_count
-def purge_user_messages(user_id):
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                SELECT bot_message_id, receiver_id
-                FROM message_map
-                WHERE original_user_id=%s
-            """, (user_id,))
-            rows = c.fetchall()
-
-    for bot_msg_id, receiver_id in rows:
-        try:
-            bot.delete_message(receiver_id, bot_msg_id)
-        except:
-            pass
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                DELETE FROM message_map
-                WHERE original_user_id=%s
-            """, (user_id,))
-
-def purge_all_user_messages():
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                SELECT bot_message_id, receiver_id
-                FROM message_map
-            """)
-            rows = c.fetchall()
-
-    deleted_count = 0
-    for bot_msg_id, receiver_id in rows:
-        try:
-            bot.delete_message(receiver_id, bot_msg_id)
-            deleted_count += 1
-        except:
-            pass
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("DELETE FROM message_map")
-
-    return deleted_count
-
-def get_original_sender(bot_message_id):
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                SELECT original_user_id
-                FROM message_map
-                WHERE bot_message_id=%s
-                LIMIT 1
-            """, (bot_message_id,))
             row = c.fetchone()
 
     return row[0] if row else None
@@ -595,6 +647,90 @@ def unban_user(user_id):
                 (user_id,)
             )
 # =========================
+# ⚠ WARNING HELPERS
+# =========================
+
+def get_warnings(user_id):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT warnings, last_warning_time FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+            row = c.fetchone()
+            if not row:
+                return 0
+            warnings, last_warning_time = row
+            if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
+                c.execute(
+                    "DELETE FROM user_warnings WHERE user_id=%s",
+                    (user_id,),
+                )
+                return 0
+            return warnings
+
+
+def add_warning(user_id):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT warnings, last_warning_time FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+            row = c.fetchone()
+
+            if row:
+                current_warnings, last_warning_time = row
+                if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
+                    c.execute(
+                        """
+                        INSERT INTO user_warnings(user_id, warnings, last_warning_time)
+                        VALUES(%s, 1, %s)
+                        ON CONFLICT (user_id)
+                        DO UPDATE SET
+                            warnings = 1,
+                            last_warning_time = EXCLUDED.last_warning_time
+                        RETURNING warnings
+                        """,
+                        (user_id, now),
+                    )
+                    return c.fetchone()[0]
+                if last_warning_time and (now - last_warning_time) < WARNING_COOLDOWN:
+                    return current_warnings
+
+            c.execute(
+                """
+                INSERT INTO user_warnings(user_id, warnings, last_warning_time)
+                VALUES(%s, 1, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    warnings = user_warnings.warnings + 1,
+                    last_warning_time = EXCLUDED.last_warning_time
+                RETURNING warnings
+                """,
+                (user_id, now),
+            )
+            return c.fetchone()[0]
+
+
+def reset_warnings(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+
+
+def warning_action_for_count(warnings):
+    if warnings >= MAX_WARNINGS:
+        return "ban"
+    if warnings == max(1, MAX_WARNINGS - 1):
+        return "restrict"
+    return "warn"
+# =========================
 # ⭐ WHITELIST HELPERS
 # =========================
 
@@ -668,6 +804,156 @@ def set_maintenance_mode(status: bool):
                 """,
                 ("true" if status else "false",),
             )
+
+
+def _normalize_force_join_chat(raw_value):
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    if value.startswith("@"):
+        return value
+    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
+        slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        if slug and not slug.startswith("+"):
+            return f"@{slug}"
+        return value
+    try:
+        return int(value)
+    except Exception:
+        return value
+
+
+def _clear_force_join_cache():
+    with force_join_cache_lock:
+        force_join_cache.clear()
+
+
+def is_force_join_enabled():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='force_join_enabled'")
+            row = c.fetchone()
+            return bool(row and row[0] == "true")
+
+
+def get_force_join_chat():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='force_join_chat_id'")
+            row = c.fetchone()
+            return _normalize_force_join_chat(row[0] if row else None)
+
+
+def get_force_join_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='force_join_message'")
+            row = c.fetchone()
+            return row[0] if row and row[0] else "🚫 Please join our channel to use the bot."
+
+
+def set_force_join(chat_id, message):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_chat_id', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (str(chat_id).strip(),),
+            )
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (message,),
+            )
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'true')
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """
+            )
+    _clear_force_join_cache()
+
+
+def disable_force_join():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'false')
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """
+            )
+    _clear_force_join_cache()
+
+
+def _force_join_link(chat_ref):
+    if isinstance(chat_ref, str):
+        clean = chat_ref.strip()
+        if clean.startswith("@"):
+            return f"https://t.me/{clean[1:]}"
+        if clean.startswith("https://t.me/") or clean.startswith("http://t.me/"):
+            return clean
+    return None
+
+
+def is_user_joined(user_id, force_refresh=False):
+    chat_ref = get_force_join_chat()
+    if not chat_ref:
+        return True
+
+    now = time.time()
+    cache_key = (str(chat_ref), int(user_id))
+
+    if not force_refresh:
+        with force_join_cache_lock:
+            cached = force_join_cache.get(cache_key)
+            if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
+                return cached[0]
+
+    try:
+        member = bot.get_chat_member(chat_ref, user_id)
+        status = getattr(member, "status", "")
+        joined = status in ("member", "administrator", "creator", "owner")
+    except Exception:
+        joined = False
+
+    with force_join_cache_lock:
+        force_join_cache[cache_key] = (joined, now)
+
+    return joined
+
+
+def send_force_join_ui(user_id):
+    chat_ref = get_force_join_chat()
+    message = get_force_join_message()
+
+    markup = InlineKeyboardMarkup()
+    join_link = _force_join_link(chat_ref)
+
+    if join_link:
+        markup.add(
+            InlineKeyboardButton("📢 Join Channel", url=join_link)
+        )
+
+    markup.add(
+        InlineKeyboardButton("✅ I Joined", callback_data="check_join")
+    )
+
+    bot.send_message(
+        user_id,
+        message,
+        reply_markup=markup
+    )
 # =========================
 # 🧠 USER STATE RESOLVER
 # =========================
@@ -883,6 +1169,10 @@ def start_command(message):
         bot.send_message(user_id, "Bot is under maintenance. Try again later.")
         return
 
+    if is_force_join_enabled() and not is_admin(user_id) and not is_user_joined(user_id):
+        send_force_join_ui(user_id)
+        return
+
     # 🚫 Manual Ban
     if is_banned(user_id):
         bot.send_message(user_id, "🚫 You are banned.")
@@ -1018,7 +1308,24 @@ def handle_restrictions(message):
     # 🚫 Word Filter (text only)
     if message.content_type == "text":
         if contains_banned_word(message.text):
-            bot.send_message(user_id, "🚫 Message contains banned word.")
+            warnings = add_warning(user_id)
+            action = warning_action_for_count(warnings)
+            if action == "ban" and not is_whitelisted(user_id):
+                ban_user(user_id)
+                bot.send_message(
+                    user_id,
+                    f"🚫 You are banned. Warning limit reached ({warnings}/{MAX_WARNINGS})."
+                )
+            elif action == "restrict":
+                bot.send_message(
+                    user_id,
+                    f"⏳ Temporary restriction warning ({warnings}/{MAX_WARNINGS}). One more violation may ban you."
+                )
+            else:
+                bot.send_message(
+                    user_id,
+                    f"⚠️ Warning {warnings}/{MAX_WARNINGS} - banned word detected."
+                )
             return True
 
     # ❌ No Username Yet
@@ -1202,13 +1509,15 @@ def save_mappings(rows):
         return
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.executemany(
+            execute_values(
+                c,
                 """
                 INSERT INTO message_map
                 (bot_message_id, original_user_id, original_message_id, receiver_id, created_at)
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES %s
                 """,
                 rows,
+                page_size=max(1, MAP_INSERT_BATCH_SIZE),
             )
 
 
@@ -1414,8 +1723,10 @@ def relay(message):
         bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
         return
 
-    if handle_restrictions(message):
+    if is_force_join_enabled() and not is_admin(message.chat.id) and not is_user_joined(message.chat.id):
+        send_force_join_ui(message.chat.id)
         return
+
     # =========================
     # ♻ DUPLICATE FILTER (EARLY)
     # =========================
@@ -1431,6 +1742,8 @@ def relay(message):
 
         if is_dup:
             return  # silently ignore and DO NOT count activation
+    if handle_restrictions(message):
+        return
     # =========================
     # 1️⃣ TELEGRAM ALBUM
     # =========================
@@ -1498,13 +1811,27 @@ def message_map_cleanup_scheduler():
     while True:
         try:
             cutoff = int(time.time()) - (MAP_RETENTION_DAYS * 86400)
-
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("""
-                        DELETE FROM message_map
-                        WHERE created_at < %s
-                    """, (cutoff,))
+            while True:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute(
+                            """
+                            WITH batch AS (
+                                SELECT ctid
+                                FROM message_map
+                                WHERE created_at < %s
+                                LIMIT %s
+                            )
+                            DELETE FROM message_map
+                            USING batch
+                            WHERE message_map.ctid = batch.ctid
+                            RETURNING 1
+                            """,
+                            (cutoff, MAP_DELETE_BATCH_SIZE),
+                        )
+                        removed = len(c.fetchall())
+                if removed < MAP_DELETE_BATCH_SIZE:
+                    break
         except Exception as e:
             print("Cleanup error:", e)
 
@@ -1563,9 +1890,6 @@ def duplicate_status(message):
 
     status = "ON" if is_duplicate_filter_enabled() else "OFF"
     bot.send_message(message.chat.id, f"♻ Duplicate filter is {status}")
-
-    set_duplicate_filter(False)
-    bot.send_message(message.chat.id, "❌ Duplicate filter disabled.")
     
 @bot.message_handler(commands=['del'])
 def delete_command(message):
@@ -1635,7 +1959,7 @@ def purge_command(message):
         return
 
     bot_msg_id = message.reply_to_message.message_id
-    user_id = get_original_sender(bot_msg_id)
+    user_id = get_original_sender(bot_msg_id, message.chat.id)
 
     if not user_id:
         bot.send_message(message.chat.id, "User not found.")
@@ -1797,7 +2121,7 @@ def info_command(message):
         return
 
     bot_msg_id = message.reply_to_message.message_id
-    user_id = get_original_sender(bot_msg_id)
+    user_id = get_original_sender(bot_msg_id, message.chat.id)
 
     if not user_id:
         bot.send_message(message.chat.id, "User not found.")
@@ -1823,6 +2147,7 @@ def info_command(message):
         return
 
     username, banned, auto_banned, whitelisted, act_count, total_media, last_time = row
+    warnings = get_warnings(user_id)
 
     bot.send_message(
         message.chat.id,
@@ -1833,11 +2158,122 @@ def info_command(message):
 🏷 Username: {username}
 📸 Activation Media: {act_count}
 📦 Total Media Sent: {total_media}
+⚠️ Warnings: {warnings}/{MAX_WARNINGS}
 
 🚫 Manual Ban: {banned}
 ⏳ Auto Ban: {auto_banned}
 ⭐ Whitelisted: {whitelisted}
         """
+    )
+
+@bot.message_handler(commands=['warn'])
+def warn_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    if is_admin(target_id):
+        bot.send_message(message.chat.id, "You cannot warn another admin.")
+        return
+
+    warnings = add_warning(target_id)
+    action = warning_action_for_count(warnings)
+
+    try:
+        bot.send_message(
+            target_id,
+            f"⚠️ You received a warning ({warnings}/{MAX_WARNINGS})."
+        )
+    except Exception:
+        pass
+
+    if action == "ban" and not is_whitelisted(target_id):
+        ban_user(target_id)
+        bot.send_message(
+            message.chat.id,
+            f"🚫 User {target_id} banned (warnings exceeded: {warnings}/{MAX_WARNINGS})."
+        )
+    elif action == "restrict":
+        try:
+            bot.send_message(
+                target_id,
+                "⏳ You are temporarily restricted. Next violation can lead to ban."
+            )
+        except Exception:
+            pass
+        bot.send_message(
+            message.chat.id,
+            f"⏳ User {target_id} reached soft-punishment level ({warnings}/{MAX_WARNINGS})."
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Warning added.\nUser now has {warnings}/{MAX_WARNINGS} warnings."
+        )
+
+
+@bot.message_handler(commands=['warnings'])
+def warnings_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    warnings = get_warnings(target_id)
+    bot.send_message(
+        message.chat.id,
+        f"⚠️ User has {warnings}/{MAX_WARNINGS} warnings."
+    )
+
+
+@bot.message_handler(commands=['resetwarn'])
+def resetwarn_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    reset_warnings(target_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Warnings reset for {target_id}."
     )
 
 @bot.message_handler(commands=['ban'])
@@ -1851,7 +2287,7 @@ def ban_command(message):
     # 🔹 1️⃣ If used as reply
     if message.reply_to_message:
         bot_msg_id = message.reply_to_message.message_id
-        target_id = get_original_sender(bot_msg_id)
+        target_id = get_original_sender(bot_msg_id, message.chat.id)
 
         if not target_id:
             bot.send_message(message.chat.id, "User not found.")
@@ -1897,7 +2333,7 @@ def unban_command(message):
     # 🔹 1️⃣ If used as reply
     if message.reply_to_message:
         bot_msg_id = message.reply_to_message.message_id
-        target_id = get_original_sender(bot_msg_id)
+        target_id = get_original_sender(bot_msg_id, message.chat.id)
 
         if not target_id:
             bot.send_message(message.chat.id, "User not found.")
@@ -1942,7 +2378,13 @@ def addadmin_command(message):
     if len(parts) < 2:
         return
 
-    add_admin(int(parts[1]))
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    add_admin(target_id)
     bot.send_message(message.chat.id, "Admin added.")
 @bot.message_handler(commands=['removeadmin'])
 def removeadmin_command(message):
@@ -1955,7 +2397,13 @@ def removeadmin_command(message):
     if len(parts) < 2:
         return
 
-    remove_admin(int(parts[1]))
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    remove_admin(target_id)
     bot.send_message(message.chat.id, "Admin removed.")
 @bot.message_handler(commands=['openjoin'])
 def openjoin_command(message):
@@ -2048,6 +2496,52 @@ def openbot_command(message):
     bot.send_message(message.chat.id, "Maintenance mode disabled. Bot is open now.")
 
 
+@bot.message_handler(commands=['setforcejoin'])
+def set_force_join_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage:\n/setforcejoin CHAT_ID_OR_@USERNAME [message]")
+        return
+
+    chat_ref = parts[1].strip()
+    custom_message = parts[2] if len(parts) > 2 else "🚫 Please join to continue."
+    set_force_join(chat_ref, custom_message)
+    if "t.me/+" in chat_ref:
+        bot.send_message(
+            message.chat.id,
+            "✅ Force join enabled, but invite-link based channels may fail membership verification. Prefer @username or numeric chat ID."
+        )
+    else:
+        bot.send_message(message.chat.id, f"✅ Force join enabled for: {chat_ref}")
+
+
+@bot.message_handler(commands=['disableforcejoin'])
+def disable_force_join_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    disable_force_join()
+    bot.send_message(message.chat.id, "❌ Force join disabled.")
+
+
+@bot.message_handler(commands=['forcejoinstatus'])
+def force_join_status(message):
+    if not is_admin(message.chat.id):
+        return
+
+    enabled = is_force_join_enabled()
+    chat_ref = get_force_join_chat()
+    custom_message = get_force_join_message()
+
+    bot.send_message(
+        message.chat.id,
+        f"Force Join: {'ON' if enabled else 'OFF'}\nChat: {chat_ref}\nMessage: {custom_message}"
+    )
+
+
 @bot.message_handler(commands=['adminmenu'])
 def admin_menu(message):
 
@@ -2065,6 +2559,15 @@ def admin_menu(message):
 🔎 /info USER_ID  
 → View user details
 
+⚠ /warn (reply)  
+→ Add warning to replied user
+
+📌 /warnings (reply)  
+→ View warnings for replied user
+
+♻ /resetwarn (reply)  
+→ Reset warnings for replied user
+
 🚫 /ban USER_ID  
 → Manually ban user
 
@@ -2076,6 +2579,15 @@ def admin_menu(message):
 
 ❌ /unwhitelist USER_ID  
 → Remove whitelist access
+
+📢 /setforcejoin CHAT [message]  
+→ Enable force join and set channel
+
+🚫 /disableforcejoin  
+→ Disable force join
+
+📋 /forcejoinstatus  
+→ Show force join configuration
 
 👑 /addadmin USER_ID  
 → Add new admin
@@ -2105,6 +2617,17 @@ def admin_menu(message):
 → Show banned words list
         """
     )
+@bot.callback_query_handler(func=lambda call: call.data == "check_join")
+def check_join_callback(call):
+    user_id = call.message.chat.id
+    if is_user_joined(user_id, force_refresh=True):
+        bot.answer_callback_query(call.id, "✅ Verified!")
+        bot.send_message(user_id, "🎉 You can now use the bot.")
+    else:
+        bot.answer_callback_query(call.id, "❌ Still not joined.")
+        send_force_join_ui(user_id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
 def admin_callbacks(call):
 
