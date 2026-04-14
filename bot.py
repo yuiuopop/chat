@@ -190,6 +190,10 @@ def init_db():
                 )
             """)
             c.execute("""
+                ALTER TABLE force_join_channels
+                ADD COLUMN IF NOT EXISTS button_name TEXT
+            """)
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS vip_users (
                     user_id BIGINT PRIMARY KEY
                 )
@@ -850,6 +854,8 @@ def _normalize_force_join_chat(raw_value):
         slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
         if slug and not slug.startswith("+"):
             return f"@{slug}"
+        if slug.startswith("+"):
+            return f"https://t.me/{slug}"
         return value
     return value
 
@@ -870,13 +876,16 @@ def is_force_join_enabled():
 def get_force_join_channels():
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("SELECT chat_id FROM force_join_channels ORDER BY chat_id")
-            rows = [r[0] for r in c.fetchall()]
+            c.execute("SELECT chat_id, button_name FROM force_join_channels ORDER BY chat_id")
+            rows = c.fetchall()
             channels = []
-            for raw in rows:
-                normalized = _normalize_force_join_chat(raw)
+            for raw_chat_id, raw_button_name in rows:
+                normalized = _normalize_force_join_chat(raw_chat_id)
                 if normalized:
-                    channels.append(normalized)
+                    channels.append({
+                        "chat_id": str(normalized),
+                        "name": (raw_button_name or str(normalized)),
+                    })
 
             # Backward compatibility with legacy single-channel setting.
             if not channels:
@@ -884,28 +893,34 @@ def get_force_join_channels():
                 legacy = c.fetchone()
                 legacy_chat = _normalize_force_join_chat(legacy[0] if legacy else None)
                 if legacy_chat:
-                    channels.append(legacy_chat)
+                    channels.append({
+                        "chat_id": str(legacy_chat),
+                        "name": str(legacy_chat),
+                    })
             return channels
 
 
 def get_force_join_chat():
     channels = get_force_join_channels()
-    return channels[0] if channels else None
+    return channels[0]["chat_id"] if channels else None
 
 
-def add_force_channel(chat_id):
+def add_force_channel(chat_id, button_name=None):
     normalized = _normalize_force_join_chat(chat_id)
     if not normalized:
         return False
+    if not button_name:
+        button_name = normalized
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute(
                 """
-                INSERT INTO force_join_channels(chat_id)
-                VALUES(%s)
-                ON CONFLICT DO NOTHING
+                INSERT INTO force_join_channels(chat_id, button_name)
+                VALUES(%s, %s)
+                ON CONFLICT (chat_id)
+                DO UPDATE SET button_name=EXCLUDED.button_name
                 """,
-                (str(normalized),),
+                (str(normalized), button_name),
             )
     _clear_force_join_cache()
     return True
@@ -1028,7 +1043,7 @@ def is_user_joined(user_id, force_refresh=False):
         return True
 
     now = time.time()
-    channels_key = tuple(str(ch) for ch in channels)
+    channels_key = tuple(str(ch.get("chat_id")) for ch in channels)
     cache_key = (channels_key, int(user_id))
 
     if not force_refresh:
@@ -1038,9 +1053,17 @@ def is_user_joined(user_id, force_refresh=False):
                 return cached[0]
 
     joined = True
-    for chat_ref in channels:
+    for channel in channels:
+        chat_id = str(channel.get("chat_id", "")).strip()
+        if not chat_id:
+            continue
+
+        # Private invite links cannot be verified with get_chat_member.
+        if chat_id.startswith("https://t.me/+") or chat_id.startswith("http://t.me/+"):
+            continue
+
         try:
-            member = bot.get_chat_member(chat_ref, user_id)
+            member = bot.get_chat_member(chat_id, user_id)
             status = getattr(member, "status", "")
             if status not in ("member", "administrator", "creator", "owner"):
                 joined = False
@@ -1061,11 +1084,11 @@ def send_force_join_ui(user_id):
 
     markup = InlineKeyboardMarkup()
     for ch in channels:
-        join_link = _force_join_link(ch)
+        join_link = _force_join_link(ch.get("chat_id"))
         if join_link:
-            label = str(ch)
+            label = str(ch.get("name") or ch.get("chat_id"))
             markup.add(
-                InlineKeyboardButton(f"📢 Join {label}", url=join_link)
+                InlineKeyboardButton(f"📢 {label}", url=join_link)
             )
 
     markup.add(
@@ -1881,15 +1904,24 @@ def handle_admin_pending_inputs(message):
     text = (message.text or "").strip()
 
     if message.chat.id in pending_fw_add:
-        if add_force_channel(text):
-            bot.send_message(message.chat.id, "✅ Channel added.")
+        if " - " in text:
+            name, link = text.split(" - ", 1)
         else:
-            bot.send_message(message.chat.id, "Invalid channel.")
+            name = text
+            link = text
+        if add_force_channel(link.strip(), name.strip()):
+            bot.send_message(
+                message.chat.id,
+                f"✅ Added:\n📢 {name.strip()}\n🔗 {link.strip()}"
+            )
+        else:
+            bot.send_message(message.chat.id, "Invalid format. Use: Button Name - @channel_or_link")
         pending_fw_add.discard(message.chat.id)
         return
 
     if message.chat.id in pending_fw_remove:
-        remove_force_channel(text)
+        target = text.split(" - ", 1)[1].strip() if " - " in text else text
+        remove_force_channel(target)
         bot.send_message(message.chat.id, "❌ Channel removed.")
         pending_fw_remove.discard(message.chat.id)
         return
@@ -2778,12 +2810,19 @@ def add_fw_channel(message):
     if not is_admin(message.chat.id):
         return
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Usage: /addfw @channel_or_chat_id")
+    payload = message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        bot.send_message(message.chat.id, "Usage: /addfw Button Name - @channel_or_link\nor /addfw @channel_or_link")
         return
 
-    if add_force_channel(parts[1]):
+    text = payload[1].strip()
+    if " - " in text:
+        name, link = text.split(" - ", 1)
+    else:
+        name = text
+        link = text
+
+    if add_force_channel(link.strip(), name.strip()):
         bot.send_message(message.chat.id, "✅ Force-join channel added.")
     else:
         bot.send_message(message.chat.id, "Invalid channel reference.")
@@ -2860,7 +2899,10 @@ def force_join_status(message):
     enabled = is_force_join_enabled()
     channels = get_force_join_channels()
     custom_message = get_force_join_message()
-    channels_text = ", ".join(str(ch) for ch in channels) if channels else "None"
+    channels_text = (
+        "\n".join(f"- {ch['name']} ({ch['chat_id']})" for ch in channels)
+        if channels else "None"
+    )
 
     bot.send_message(
         message.chat.id,
@@ -2970,8 +3012,10 @@ def check_join_callback(call):
     "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status"
 })
 def firewall_ui_callbacks(call):
+    actor_id = call.from_user.id
     admin_chat_id = call.message.chat.id
-    if not is_admin(admin_chat_id):
+    if not is_admin(actor_id):
+        bot.answer_callback_query(call.id, "Not admin.")
         return
 
     if call.data == "fw_on":
@@ -2994,33 +3038,36 @@ def firewall_ui_callbacks(call):
         return
 
     if call.data == "fw_add":
-        pending_fw_add.add(admin_chat_id)
+        pending_fw_add.add(actor_id)
         bot.answer_callback_query(call.id, "Awaiting channel")
-        bot.send_message(admin_chat_id, "📢 Send channel (@username or ID)")
+        bot.send_message(actor_id, "📢 Send channel as:\nButton Name - @username_or_link")
         return
 
     if call.data == "fw_remove":
-        pending_fw_remove.add(admin_chat_id)
+        pending_fw_remove.add(actor_id)
         bot.answer_callback_query(call.id, "Awaiting channel")
-        bot.send_message(admin_chat_id, "❌ Send channel to remove")
+        bot.send_message(actor_id, "❌ Send channel to remove")
         return
 
     if call.data == "vip_add":
-        pending_vip_add.add(admin_chat_id)
+        pending_vip_add.add(actor_id)
         bot.answer_callback_query(call.id, "Awaiting USER_ID")
-        bot.send_message(admin_chat_id, "💎 Send USER_ID to add VIP")
+        bot.send_message(actor_id, "💎 Send USER_ID to add VIP")
         return
 
     if call.data == "vip_remove":
-        pending_vip_remove.add(admin_chat_id)
+        pending_vip_remove.add(actor_id)
         bot.answer_callback_query(call.id, "Awaiting USER_ID")
-        bot.send_message(admin_chat_id, "❌ Send USER_ID to remove VIP")
+        bot.send_message(actor_id, "❌ Send USER_ID to remove VIP")
         return
 
     if call.data == "fw_status":
         enabled = is_force_join_enabled()
         channels = get_force_join_channels()
-        channels_text = "\n".join(str(ch) for ch in channels) if channels else "None"
+        channels_text = (
+            "\n".join(f"- {ch['name']} ({ch['chat_id']})" for ch in channels)
+            if channels else "None"
+        )
         bot.answer_callback_query(call.id)
         bot.send_message(
             admin_chat_id,
@@ -3029,96 +3076,66 @@ def firewall_ui_callbacks(call):
         return
 
 
-@bot.callback_query_handler(func=lambda call: True)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
 def admin_callbacks(call):
 
-    if not is_admin(call.message.chat.id):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not admin.")
         return
 
     data = call.data
 
-    # =========================
-    # 🧱 FIREWALL ON
-    # =========================
-    if data == "fw_on":
+    if data == "admin_stats":
+        stats_command(call.message)
+
+    elif data == "admin_open_join":
+        set_join_status(True)
+        bot.answer_callback_query(call.id, "Join opened.")
+
+    elif data == "admin_close_join":
+        set_join_status(False)
+        bot.answer_callback_query(call.id, "Join closed.")
+
+    elif data == "admin_clearmap":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("DELETE FROM message_map")
+        bot.answer_callback_query(call.id, "Message map cleared.")
+
+    elif data == "admin_banned":
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    UPDATE settings
-                    SET value='true'
-                    WHERE key='force_join_enabled'
+                    SELECT user_id FROM users WHERE banned=TRUE
                 """)
-        bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
+                rows = c.fetchall()
 
-    # =========================
-    # 🔴 FIREWALL OFF
-    # =========================
-    elif data == "fw_off":
-        disable_force_join()
-        bot.answer_callback_query(call.id, "🧱 Firewall Disabled")
-
-    # =========================
-    # 📢 ADD CHANNEL
-    # =========================
-    elif data == "fw_add":
-        pending_fw_add.add(call.message.chat.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            "📢 Send channel (@username or link)"
-        )
-
-    # =========================
-    # ❌ REMOVE CHANNEL
-    # =========================
-    elif data == "fw_remove":
-        pending_fw_remove.add(call.message.chat.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            "❌ Send channel to remove"
-        )
-
-    # =========================
-    # 💎 ADD VIP
-    # =========================
-    elif data == "vip_add":
-        pending_vip_add.add(call.message.chat.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            "💎 Send USER_ID"
-        )
-
-    # =========================
-    # ❌ REMOVE VIP
-    # =========================
-    elif data == "vip_remove":
-        pending_vip_remove.add(call.message.chat.id)
-
-        bot.send_message(
-            call.message.chat.id,
-            "❌ Send USER_ID to remove"
-        )
-
-    # =========================
-    # 📊 STATUS
-    # =========================
-    elif data == "fw_status":
-
-        enabled = is_force_join_enabled()
-        channels = get_force_join_channels()
-
-        text = f"""
-🧱 FIREWALL STATUS
-
-Status: {'ON ✅' if enabled else 'OFF ❌'}
-
-Channels:
-{chr(10).join(channels) if channels else 'None'}
-        """
+        if rows:
+            text = "\n".join(str(r[0]) for r in rows)
+        else:
+            text = "No banned users."
 
         bot.send_message(call.message.chat.id, text)
+
+    elif data == "admin_export_recovery":
+        payload = export_recovery_payload()
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                temp_path = f.name
+            with open(temp_path, "rb") as doc:
+                bot.send_document(call.message.chat.id, doc, caption="Recovery export (username+banned+banned_words)")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    elif data == "admin_import_recovery":
+        pending_recovery_import.add(call.message.chat.id)
+        bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
+
+    bot.answer_callback_query(call.id)
+
 
 @bot.message_handler(content_types=['document'])
 def import_recovery_document(message):
