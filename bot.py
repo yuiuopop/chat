@@ -3029,7 +3029,7 @@ def firewall_ui_callbacks(call):
         return
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
+@bot.callback_query_handler(func=lambda call: True)
 def admin_callbacks(call):
 
     if not is_admin(call.message.chat.id):
@@ -3037,57 +3037,88 @@ def admin_callbacks(call):
 
     data = call.data
 
-    if data == "admin_stats":
-        stats_command(call.message)
-
-    elif data == "admin_open_join":
-        set_join_status(True)
-        bot.answer_callback_query(call.id, "Join opened.")
-
-    elif data == "admin_close_join":
-        set_join_status(False)
-        bot.answer_callback_query(call.id, "Join closed.")
-
-    elif data == "admin_clearmap":
-        with get_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("DELETE FROM message_map")
-        bot.answer_callback_query(call.id, "Message map cleared.")
-
-    elif data == "admin_banned":
+    # =========================
+    # 🧱 FIREWALL ON
+    # =========================
+    if data == "fw_on":
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    SELECT user_id FROM users WHERE banned=TRUE
+                    UPDATE settings
+                    SET value='true'
+                    WHERE key='force_join_enabled'
                 """)
-                rows = c.fetchall()
+        bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
 
-        if rows:
-            text = "\n".join(str(r[0]) for r in rows)
-        else:
-            text = "No banned users."
+    # =========================
+    # 🔴 FIREWALL OFF
+    # =========================
+    elif data == "fw_off":
+        disable_force_join()
+        bot.answer_callback_query(call.id, "🧱 Firewall Disabled")
+
+    # =========================
+    # 📢 ADD CHANNEL
+    # =========================
+    elif data == "fw_add":
+        pending_fw_add.add(call.message.chat.id)
+
+        bot.send_message(
+            call.message.chat.id,
+            "📢 Send channel (@username or link)"
+        )
+
+    # =========================
+    # ❌ REMOVE CHANNEL
+    # =========================
+    elif data == "fw_remove":
+        pending_fw_remove.add(call.message.chat.id)
+
+        bot.send_message(
+            call.message.chat.id,
+            "❌ Send channel to remove"
+        )
+
+    # =========================
+    # 💎 ADD VIP
+    # =========================
+    elif data == "vip_add":
+        pending_vip_add.add(call.message.chat.id)
+
+        bot.send_message(
+            call.message.chat.id,
+            "💎 Send USER_ID"
+        )
+
+    # =========================
+    # ❌ REMOVE VIP
+    # =========================
+    elif data == "vip_remove":
+        pending_vip_remove.add(call.message.chat.id)
+
+        bot.send_message(
+            call.message.chat.id,
+            "❌ Send USER_ID to remove"
+        )
+
+    # =========================
+    # 📊 STATUS
+    # =========================
+    elif data == "fw_status":
+
+        enabled = is_force_join_enabled()
+        channels = get_force_join_channels()
+
+        text = f"""
+🧱 FIREWALL STATUS
+
+Status: {'ON ✅' if enabled else 'OFF ❌'}
+
+Channels:
+{chr(10).join(channels) if channels else 'None'}
+        """
 
         bot.send_message(call.message.chat.id, text)
-
-    elif data == "admin_export_recovery":
-        payload = export_recovery_payload()
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                temp_path = f.name
-            with open(temp_path, "rb") as doc:
-                bot.send_document(call.message.chat.id, doc, caption="Recovery export (username+banned+banned_words)")
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    elif data == "admin_import_recovery":
-        pending_recovery_import.add(call.message.chat.id)
-        bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
-
-    bot.answer_callback_query(call.id)
-
 
 @bot.message_handler(content_types=['document'])
 def import_recovery_document(message):
