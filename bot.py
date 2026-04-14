@@ -48,6 +48,7 @@ MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
 WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
 WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
 FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "120"))
+JOINED_STATUSES = ("member", "administrator", "creator", "owner", "restricted")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -192,6 +193,10 @@ def init_db():
             c.execute("""
                 ALTER TABLE force_join_channels
                 ADD COLUMN IF NOT EXISTS button_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE force_join_channels
+                ADD COLUMN IF NOT EXISTS invite_link TEXT
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS vip_users (
@@ -848,15 +853,20 @@ def _normalize_force_join_chat(raw_value):
     value = str(raw_value).strip()
     if not value:
         return None
+
+    # Keep private invite links exactly as provided.
+    if "t.me/+" in value:
+        return value
+
+    # Public link -> convert to @username.
+    if "t.me/" in value:
+        slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        if slug:
+            return f"@{slug}"
+
     if value.startswith("@"):
         return value
-    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
-        slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
-        if slug and not slug.startswith("+"):
-            return f"@{slug}"
-        if slug.startswith("+"):
-            return f"https://t.me/{slug}"
-        return value
+
     return value
 
 
@@ -876,15 +886,16 @@ def is_force_join_enabled():
 def get_force_join_channels():
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("SELECT chat_id, button_name FROM force_join_channels ORDER BY chat_id")
+            c.execute("SELECT chat_id, button_name, invite_link FROM force_join_channels ORDER BY chat_id")
             rows = c.fetchall()
             channels = []
-            for raw_chat_id, raw_button_name in rows:
+            for raw_chat_id, raw_button_name, raw_invite_link in rows:
                 normalized = _normalize_force_join_chat(raw_chat_id)
                 if normalized:
                     channels.append({
                         "chat_id": str(normalized),
-                        "name": (raw_button_name or str(normalized)),
+                        "name": (raw_button_name.strip() if raw_button_name else str(normalized)),
+                        "invite_link": (raw_invite_link.strip() if raw_invite_link else None),
                     })
 
             # Backward compatibility with legacy single-channel setting.
@@ -896,6 +907,7 @@ def get_force_join_channels():
                     channels.append({
                         "chat_id": str(legacy_chat),
                         "name": str(legacy_chat),
+                        "invite_link": None,
                     })
             return channels
 
@@ -905,22 +917,25 @@ def get_force_join_chat():
     return channels[0]["chat_id"] if channels else None
 
 
-def add_force_channel(chat_id, button_name=None):
+def add_force_channel(chat_id, button_name=None, invite_link=None):
     normalized = _normalize_force_join_chat(chat_id)
     if not normalized:
         return False
     if not button_name:
-        button_name = normalized
+        button_name = str(chat_id)
+    invite_link = invite_link.strip() if isinstance(invite_link, str) and invite_link.strip() else None
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute(
                 """
-                INSERT INTO force_join_channels(chat_id, button_name)
-                VALUES(%s, %s)
+                INSERT INTO force_join_channels(chat_id, button_name, invite_link)
+                VALUES(%s, %s, %s)
                 ON CONFLICT (chat_id)
-                DO UPDATE SET button_name=EXCLUDED.button_name
+                DO UPDATE SET
+                    button_name=EXCLUDED.button_name,
+                    invite_link=COALESCE(EXCLUDED.invite_link, force_join_channels.invite_link)
                 """,
-                (str(normalized), button_name),
+                (str(normalized), button_name, invite_link),
             )
     _clear_force_join_cache()
     return True
@@ -1034,6 +1049,24 @@ def _force_join_link(chat_ref):
     return None
 
 
+def parse_force_channel_input(text):
+    parts = [p.strip() for p in str(text).split(" - ")]
+    parts = [p for p in parts if p]
+    if len(parts) >= 3:
+        name = parts[0]
+        chat_id = parts[1]
+        invite_link = parts[2]
+        return name, chat_id, invite_link
+    if len(parts) == 2:
+        name = parts[0]
+        chat_id = parts[1]
+        return name, chat_id, None
+    if len(parts) == 1:
+        token = parts[0]
+        return token, token, None
+    return None, None, None
+
+
 def is_user_joined(user_id, force_refresh=False):
     if is_vip(user_id):
         return True
@@ -1062,10 +1095,11 @@ def is_user_joined(user_id, force_refresh=False):
         if chat_id.startswith("https://t.me/+") or chat_id.startswith("http://t.me/+"):
             continue
 
+        chat_ref = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
         try:
-            member = bot.get_chat_member(chat_id, user_id)
+            member = bot.get_chat_member(chat_ref, user_id)
             status = getattr(member, "status", "")
-            if status not in ("member", "administrator", "creator", "owner"):
+            if status not in JOINED_STATUSES:
                 joined = False
                 break
         except Exception:
@@ -1084,7 +1118,7 @@ def send_force_join_ui(user_id):
 
     markup = InlineKeyboardMarkup()
     for ch in channels:
-        join_link = _force_join_link(ch.get("chat_id"))
+        join_link = ch.get("invite_link") or _force_join_link(ch.get("chat_id"))
         if join_link:
             label = str(ch.get("name") or ch.get("chat_id"))
             markup.add(
@@ -1315,9 +1349,14 @@ def start_command(message):
         bot.send_message(user_id, "Bot is under maintenance. Try again later.")
         return
 
-    if is_force_join_enabled() and not is_admin(user_id) and not is_user_joined(user_id):
-        send_force_join_ui(user_id)
-        return
+    if is_force_join_enabled() and not is_admin(user_id):
+        joined = is_user_joined(user_id)
+        # Re-check once with fresh API data to avoid stale negative-cache blocking.
+        if not joined:
+            joined = is_user_joined(user_id, force_refresh=True)
+        if not joined:
+            send_force_join_ui(user_id)
+            return
 
     # 🚫 Manual Ban
     if is_banned(user_id):
@@ -1789,6 +1828,11 @@ def _process_single(message):
 
     sender_id = message.chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    if is_force_join_enabled():
+        receivers = [
+            uid for uid in receivers
+            if is_admin(uid) or is_vip(uid) or is_user_joined(uid)
+        ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
     store_mapping = should_store_mapping(sender_id, targets)
@@ -1831,6 +1875,11 @@ def _process_album(messages):
 
     sender_id = messages[0].chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    if is_force_join_enabled():
+        receivers = [
+            uid for uid in receivers
+            if is_admin(uid) or is_vip(uid) or is_user_joined(uid)
+        ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
     store_mapping = should_store_mapping(sender_id, targets)
@@ -1904,18 +1953,11 @@ def handle_admin_pending_inputs(message):
     text = (message.text or "").strip()
 
     if message.chat.id in pending_fw_add:
-        if " - " in text:
-            name, link = text.split(" - ", 1)
+        name, chat_id, invite_link = parse_force_channel_input(text)
+        if chat_id and add_force_channel(chat_id, name, invite_link):
+            bot.send_message(message.chat.id, "✅ Channel added.")
         else:
-            name = text
-            link = text
-        if add_force_channel(link.strip(), name.strip()):
-            bot.send_message(
-                message.chat.id,
-                f"✅ Added:\n📢 {name.strip()}\n🔗 {link.strip()}"
-            )
-        else:
-            bot.send_message(message.chat.id, "Invalid format. Use: Button Name - @channel_or_link")
+            bot.send_message(message.chat.id, "Invalid format. Use: Name - CHAT_ID - InviteLink")
         pending_fw_add.discard(message.chat.id)
         return
 
@@ -1960,9 +2002,14 @@ def relay(message):
         bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
         return
 
-    if is_force_join_enabled() and not is_admin(message.chat.id) and not is_user_joined(message.chat.id):
-        send_force_join_ui(message.chat.id)
-        return
+    if is_force_join_enabled() and not is_admin(message.chat.id):
+        joined = is_user_joined(message.chat.id)
+        # Re-check once with fresh API data to avoid stale negative-cache blocking.
+        if not joined:
+            joined = is_user_joined(message.chat.id, force_refresh=True)
+        if not joined:
+            send_force_join_ui(message.chat.id)
+            return
 
     # =========================
     # ♻ DUPLICATE FILTER (EARLY)
@@ -2812,17 +2859,11 @@ def add_fw_channel(message):
 
     payload = message.text.split(maxsplit=1)
     if len(payload) < 2:
-        bot.send_message(message.chat.id, "Usage: /addfw Button Name - @channel_or_link\nor /addfw @channel_or_link")
+        bot.send_message(message.chat.id, "Usage: /addfw Name - CHAT_ID - InviteLink\nor /addfw Name - CHAT_ID")
         return
 
-    text = payload[1].strip()
-    if " - " in text:
-        name, link = text.split(" - ", 1)
-    else:
-        name = text
-        link = text
-
-    if add_force_channel(link.strip(), name.strip()):
+    name, chat_id, invite_link = parse_force_channel_input(payload[1].strip())
+    if chat_id and add_force_channel(chat_id, name, invite_link):
         bot.send_message(message.chat.id, "✅ Force-join channel added.")
     else:
         bot.send_message(message.chat.id, "Invalid channel reference.")
@@ -2833,12 +2874,16 @@ def remove_fw_channel(message):
     if not is_admin(message.chat.id):
         return
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Usage: /removefw @channel_or_chat_id")
+    payload = message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        bot.send_message(message.chat.id, "Usage: /removefw CHAT_ID\nor /removefw Name - CHAT_ID")
         return
 
-    remove_force_channel(parts[1])
+    _, chat_id, _ = parse_force_channel_input(payload[1].strip())
+    if not chat_id:
+        bot.send_message(message.chat.id, "Invalid format.")
+        return
+    remove_force_channel(chat_id)
     bot.send_message(message.chat.id, "❌ Force-join channel removed.")
 
 
@@ -2900,7 +2945,10 @@ def force_join_status(message):
     channels = get_force_join_channels()
     custom_message = get_force_join_message()
     channels_text = (
-        "\n".join(f"- {ch['name']} ({ch['chat_id']})" for ch in channels)
+        "\n".join(
+            f"- {ch['name']} | chat_id: {ch['chat_id']} | link: {ch.get('invite_link') or 'auto'}"
+            for ch in channels
+        )
         if channels else "None"
     )
 
@@ -3040,7 +3088,7 @@ def firewall_ui_callbacks(call):
     if call.data == "fw_add":
         pending_fw_add.add(actor_id)
         bot.answer_callback_query(call.id, "Awaiting channel")
-        bot.send_message(actor_id, "📢 Send channel as:\nButton Name - @username_or_link")
+        bot.send_message(actor_id, "📢 Send channel as:\nName - CHAT_ID - InviteLink")
         return
 
     if call.data == "fw_remove":
@@ -3065,7 +3113,10 @@ def firewall_ui_callbacks(call):
         enabled = is_force_join_enabled()
         channels = get_force_join_channels()
         channels_text = (
-            "\n".join(f"- {ch['name']} ({ch['chat_id']})" for ch in channels)
+            "\n".join(
+                f"- {ch['name']} | chat_id: {ch['chat_id']} | link: {ch.get('invite_link') or 'auto'}"
+                for ch in channels
+            )
             if channels else "None"
         )
         bot.answer_callback_query(call.id)
