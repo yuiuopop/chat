@@ -72,10 +72,13 @@ pending_fw_add = set()
 pending_fw_remove = set()
 pending_vip_add = set()
 pending_vip_remove = set()
+pending_fw_msg = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 force_join_reminder_lock = threading.Lock()
 force_join_reminder_at = {}
+last_fw_msg_lock = threading.Lock()
+last_fw_msg = {}
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -965,6 +968,19 @@ def get_force_join_message():
             return row[0] if row and row[0] else "🚫 Please join our channel to use the bot."
 
 
+def set_force_join_message(message):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (message,),
+            )
+
+
 def set_force_join(chat_id, message):
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -1148,11 +1164,40 @@ def send_force_join_ui(user_id):
         InlineKeyboardButton("✅ I Joined", callback_data="check_join")
     )
 
-    bot.send_message(
+    with last_fw_msg_lock:
+        previous_id = last_fw_msg.get(int(user_id))
+
+    if previous_id:
+        try:
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=previous_id,
+                reply_markup=markup
+            )
+            return
+        except Exception:
+            with last_fw_msg_lock:
+                last_fw_msg.pop(int(user_id), None)
+
+    sent = bot.send_message(
         user_id,
         message,
         reply_markup=markup
     )
+    with last_fw_msg_lock:
+        last_fw_msg[int(user_id)] = sent.message_id
+
+
+def clear_force_join_ui(user_id):
+    with last_fw_msg_lock:
+        msg_id = last_fw_msg.pop(int(user_id), None)
+    if not msg_id:
+        return
+    try:
+        bot.delete_message(user_id, msg_id)
+    except Exception:
+        pass
 # =========================
 # 🧠 USER STATE RESOLVER
 # =========================
@@ -1376,6 +1421,7 @@ def start_command(message):
         if not joined:
             send_force_join_ui(user_id)
             return
+        clear_force_join_ui(user_id)
 
     # 🚫 Manual Ban
     if is_banned(user_id):
@@ -1957,7 +2003,7 @@ def _process_album(messages):
 
 @bot.message_handler(
     func=lambda m: m.content_type == "text" and m.chat.id in (
-        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg
     ),
     content_types=['text']
 )
@@ -1967,6 +2013,7 @@ def handle_admin_pending_inputs(message):
         pending_fw_remove.discard(message.chat.id)
         pending_vip_add.discard(message.chat.id)
         pending_vip_remove.discard(message.chat.id)
+        pending_fw_msg.discard(message.chat.id)
         return
 
     text = (message.text or "").strip()
@@ -2007,6 +2054,16 @@ def handle_admin_pending_inputs(message):
         pending_vip_remove.discard(message.chat.id)
         return
 
+    if message.chat.id in pending_fw_msg:
+        new_msg = text
+        if not new_msg:
+            bot.send_message(message.chat.id, "Message cannot be empty.")
+        else:
+            set_force_join_message(new_msg)
+            bot.send_message(message.chat.id, "✅ Firewall message updated.")
+        pending_fw_msg.discard(message.chat.id)
+        return
+
 # =========================
 # 🔁 RELAY HANDLER
 # =========================
@@ -2028,7 +2085,12 @@ def relay(message):
             joined = is_user_joined(message.chat.id, force_refresh=True)
         if not joined:
             send_force_join_ui(message.chat.id)
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception:
+                pass
             return
+        clear_force_join_ui(message.chat.id)
 
     # =========================
     # ♻ DUPLICATE FILTER (EARLY)
@@ -2357,6 +2419,9 @@ def admin_panel(message):
     )
     markup.add(
         InlineKeyboardButton("📊 Firewall Status", callback_data="fw_status")
+    )
+    markup.add(
+        InlineKeyboardButton("✏️ Edit Firewall Msg", callback_data="fw_edit_msg")
     )
 
     bot.send_message(
@@ -2978,6 +3043,20 @@ def force_join_status(message):
     )
 
 
+@bot.message_handler(commands=['setfwmsg'])
+def set_firewall_message_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(message.chat.id, "Usage: /setfwmsg Your new firewall message")
+        return
+
+    set_force_join_message(parts[1].strip())
+    bot.send_message(message.chat.id, "✅ Firewall message updated.")
+
+
 @bot.message_handler(commands=['adminmenu'])
 def admin_menu(message):
 
@@ -3031,6 +3110,9 @@ def admin_menu(message):
 📋 /forcejoinstatus  
 → Show force join configuration
 
+✏️ /setfwmsg TEXT  
+→ Update firewall message text
+
 💎 /addvip USER_ID  
 → Add VIP bypass user
 
@@ -3067,17 +3149,30 @@ def admin_menu(message):
     )
 @bot.callback_query_handler(func=lambda call: call.data == "check_join")
 def check_join_callback(call):
-    user_id = call.message.chat.id
+    user_id = call.from_user.id
+    msg = call.message
     if is_user_joined(user_id, force_refresh=True):
         bot.answer_callback_query(call.id, "✅ Verified!")
-        bot.send_message(user_id, "🎉 You can now use the bot.")
+        with last_fw_msg_lock:
+            last_fw_msg.pop(int(user_id), None)
+        try:
+            bot.edit_message_text(
+                "✅ You have joined all required channels.\n\n🎉 Access granted!",
+                chat_id=msg.chat.id,
+                message_id=msg.message_id
+            )
+        except Exception:
+            try:
+                bot.delete_message(msg.chat.id, msg.message_id)
+            except Exception:
+                pass
+            bot.send_message(user_id, "🎉 You can now use the bot.")
     else:
-        bot.answer_callback_query(call.id, "❌ Still not joined.")
-        send_force_join_ui(user_id)
+        bot.answer_callback_query(call.id, "❌ You still haven't joined all channels.", show_alert=True)
 
 
 @bot.callback_query_handler(func=lambda call: call.data in {
-    "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status"
+    "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status", "fw_edit_msg"
 })
 def firewall_ui_callbacks(call):
     actor_id = call.from_user.id
@@ -3144,6 +3239,12 @@ def firewall_ui_callbacks(call):
             admin_chat_id,
             f"🧱 FIREWALL STATUS\n\nStatus: {'ON ✅' if enabled else 'OFF ❌'}\nChannels:\n{channels_text}"
         )
+        return
+
+    if call.data == "fw_edit_msg":
+        pending_fw_msg.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting message")
+        bot.send_message(actor_id, "✏️ Send new firewall message:")
         return
 
 
