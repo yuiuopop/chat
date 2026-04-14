@@ -2212,7 +2212,7 @@ def force_join_enforcement_scheduler():
                 for user_id in users:
                     if is_admin(user_id) or is_vip(user_id):
                         continue
-                    if not is_user_joined(user_id):
+                    if not is_user_joined(user_id, force_refresh=True):
                         if can_send_force_join_reminder(user_id):
                             try:
                                 bot.send_message(
@@ -3157,7 +3157,7 @@ def check_join_callback(call):
             last_fw_msg.pop(int(user_id), None)
         try:
             bot.edit_message_text(
-                "✅ You have joined all required channels.\n\n🎉 Access granted!",
+                "✅ VERIFIED!\n\n🎉 Access granted!",
                 chat_id=msg.chat.id,
                 message_id=msg.message_id
             )
@@ -3307,7 +3307,32 @@ def admin_callbacks(call):
         bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
 
     bot.answer_callback_query(call.id)
+@bot.callback_query_handler(func=lambda call: call.data == "check_join")
+def check_join_callback(call):
 
+    user_id = call.from_user.id
+    msg = call.message
+
+    # 🔥 ALWAYS FORCE REFRESH
+    if is_user_joined(user_id, force_refresh=True):
+
+        bot.answer_callback_query(call.id, "✅ Verified!")
+
+        # ✅ DELETE FIREWALL UI (BEST UX)
+        clear_force_join_ui(user_id)
+
+        # Optional success message
+        try:
+            bot.send_message(user_id, "🎉 Access unlocked! You can now use the bot.")
+        except:
+            pass
+
+    else:
+        bot.answer_callback_query(
+            call.id,
+            "❌ You still haven't joined all channels.",
+            show_alert=True
+        )
 
 @bot.message_handler(content_types=['document'])
 def import_recovery_document(message):
