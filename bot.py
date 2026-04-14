@@ -175,6 +175,16 @@ def init_db():
                     last_warning_time BIGINT
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS force_join_channels (
+                    chat_id TEXT PRIMARY KEY
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS vip_users (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
 
             # =========================
             # BANNED WORDS TABLE
@@ -819,10 +829,7 @@ def _normalize_force_join_chat(raw_value):
         if slug and not slug.startswith("+"):
             return f"@{slug}"
         return value
-    try:
-        return int(value)
-    except Exception:
-        return value
+    return value
 
 
 def _clear_force_join_cache():
@@ -838,12 +845,61 @@ def is_force_join_enabled():
             return bool(row and row[0] == "true")
 
 
-def get_force_join_chat():
+def get_force_join_channels():
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("SELECT value FROM settings WHERE key='force_join_chat_id'")
-            row = c.fetchone()
-            return _normalize_force_join_chat(row[0] if row else None)
+            c.execute("SELECT chat_id FROM force_join_channels ORDER BY chat_id")
+            rows = [r[0] for r in c.fetchall()]
+            channels = []
+            for raw in rows:
+                normalized = _normalize_force_join_chat(raw)
+                if normalized:
+                    channels.append(normalized)
+
+            # Backward compatibility with legacy single-channel setting.
+            if not channels:
+                c.execute("SELECT value FROM settings WHERE key='force_join_chat_id'")
+                legacy = c.fetchone()
+                legacy_chat = _normalize_force_join_chat(legacy[0] if legacy else None)
+                if legacy_chat:
+                    channels.append(legacy_chat)
+            return channels
+
+
+def get_force_join_chat():
+    channels = get_force_join_channels()
+    return channels[0] if channels else None
+
+
+def add_force_channel(chat_id):
+    normalized = _normalize_force_join_chat(chat_id)
+    if not normalized:
+        return False
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO force_join_channels(chat_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (str(normalized),),
+            )
+    _clear_force_join_cache()
+    return True
+
+
+def remove_force_channel(chat_id):
+    normalized = _normalize_force_join_chat(chat_id)
+    if not normalized:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM force_join_channels WHERE chat_id=%s",
+                (str(normalized),),
+            )
+    _clear_force_join_cache()
 
 
 def get_force_join_message():
@@ -881,6 +937,7 @@ def set_force_join(chat_id, message):
                 """
             )
     _clear_force_join_cache()
+    add_force_channel(chat_id)
 
 
 def disable_force_join():
@@ -896,6 +953,40 @@ def disable_force_join():
     _clear_force_join_cache()
 
 
+def is_vip(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT 1 FROM vip_users WHERE user_id=%s",
+                (user_id,),
+            )
+            return c.fetchone() is not None
+
+
+def add_vip(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO vip_users(user_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (user_id,),
+            )
+    _clear_force_join_cache()
+
+
+def remove_vip(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM vip_users WHERE user_id=%s",
+                (user_id,),
+            )
+    _clear_force_join_cache()
+
+
 def _force_join_link(chat_ref):
     if isinstance(chat_ref, str):
         clean = chat_ref.strip()
@@ -907,12 +998,16 @@ def _force_join_link(chat_ref):
 
 
 def is_user_joined(user_id, force_refresh=False):
-    chat_ref = get_force_join_chat()
-    if not chat_ref:
+    if is_vip(user_id):
+        return True
+
+    channels = get_force_join_channels()
+    if not channels:
         return True
 
     now = time.time()
-    cache_key = (str(chat_ref), int(user_id))
+    channels_key = tuple(str(ch) for ch in channels)
+    cache_key = (channels_key, int(user_id))
 
     if not force_refresh:
         with force_join_cache_lock:
@@ -920,12 +1015,17 @@ def is_user_joined(user_id, force_refresh=False):
             if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
                 return cached[0]
 
-    try:
-        member = bot.get_chat_member(chat_ref, user_id)
-        status = getattr(member, "status", "")
-        joined = status in ("member", "administrator", "creator", "owner")
-    except Exception:
-        joined = False
+    joined = True
+    for chat_ref in channels:
+        try:
+            member = bot.get_chat_member(chat_ref, user_id)
+            status = getattr(member, "status", "")
+            if status not in ("member", "administrator", "creator", "owner"):
+                joined = False
+                break
+        except Exception:
+            joined = False
+            break
 
     with force_join_cache_lock:
         force_join_cache[cache_key] = (joined, now)
@@ -934,16 +1034,18 @@ def is_user_joined(user_id, force_refresh=False):
 
 
 def send_force_join_ui(user_id):
-    chat_ref = get_force_join_chat()
     message = get_force_join_message()
+    channels = get_force_join_channels()
 
     markup = InlineKeyboardMarkup()
-    join_link = _force_join_link(chat_ref)
-
-    if join_link:
-        markup.add(
-            InlineKeyboardButton("📢 Join Channel", url=join_link)
-        )
+    button_index = 1
+    for ch in channels:
+        join_link = _force_join_link(ch)
+        if join_link:
+            markup.add(
+                InlineKeyboardButton(f"📢 Join Channel {button_index}", url=join_link)
+            )
+            button_index += 1
 
     markup.add(
         InlineKeyboardButton("✅ I Joined", callback_data="check_join")
@@ -1836,6 +1938,22 @@ def message_map_cleanup_scheduler():
             print("Cleanup error:", e)
 
         time.sleep(MAP_CLEANUP_INTERVAL_SECONDS)
+
+
+def force_join_enforcement_scheduler():
+    while True:
+        try:
+            if is_force_join_enabled():
+                users = get_active_receivers()
+                for user_id in users:
+                    if is_admin(user_id) or is_vip(user_id):
+                        continue
+                    if not is_user_joined(user_id):
+                        ban_user(user_id)
+        except Exception as e:
+            print("Force join check error:", e)
+
+        time.sleep(300)
 # =========================
 # 🚀 START BACKGROUND WORKERS
 # =========================
@@ -1857,6 +1975,12 @@ def start_background_workers():
     # Cleanup Scheduler
     threading.Thread(
         target=message_map_cleanup_scheduler,
+        daemon=True
+    ).start()
+
+    # Force Join Enforcement Scheduler
+    threading.Thread(
+        target=force_join_enforcement_scheduler,
         daemon=True
     ).start()
     
@@ -2518,6 +2642,76 @@ def set_force_join_cmd(message):
         bot.send_message(message.chat.id, f"✅ Force join enabled for: {chat_ref}")
 
 
+@bot.message_handler(commands=['addfw'])
+def add_fw_channel(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /addfw @channel_or_chat_id")
+        return
+
+    if add_force_channel(parts[1]):
+        bot.send_message(message.chat.id, "✅ Force-join channel added.")
+    else:
+        bot.send_message(message.chat.id, "Invalid channel reference.")
+
+
+@bot.message_handler(commands=['removefw'])
+def remove_fw_channel(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /removefw @channel_or_chat_id")
+        return
+
+    remove_force_channel(parts[1])
+    bot.send_message(message.chat.id, "❌ Force-join channel removed.")
+
+
+@bot.message_handler(commands=['addvip'])
+def add_vip_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /addvip USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    add_vip(target_id)
+    bot.send_message(message.chat.id, f"💎 VIP added: {target_id}")
+
+
+@bot.message_handler(commands=['removevip'])
+def remove_vip_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /removevip USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    remove_vip(target_id)
+    bot.send_message(message.chat.id, f"❌ VIP removed: {target_id}")
+
+
 @bot.message_handler(commands=['disableforcejoin'])
 def disable_force_join_cmd(message):
     if not is_admin(message.chat.id):
@@ -2533,12 +2727,13 @@ def force_join_status(message):
         return
 
     enabled = is_force_join_enabled()
-    chat_ref = get_force_join_chat()
+    channels = get_force_join_channels()
     custom_message = get_force_join_message()
+    channels_text = ", ".join(str(ch) for ch in channels) if channels else "None"
 
     bot.send_message(
         message.chat.id,
-        f"Force Join: {'ON' if enabled else 'OFF'}\nChat: {chat_ref}\nMessage: {custom_message}"
+        f"Force Join: {'ON' if enabled else 'OFF'}\nChannels: {channels_text}\nMessage: {custom_message}"
     )
 
 
@@ -2583,11 +2778,23 @@ def admin_menu(message):
 📢 /setforcejoin CHAT [message]  
 → Enable force join and set channel
 
+➕ /addfw CHAT  
+→ Add extra force-join channel
+
+➖ /removefw CHAT  
+→ Remove force-join channel
+
 🚫 /disableforcejoin  
 → Disable force join
 
 📋 /forcejoinstatus  
 → Show force join configuration
+
+💎 /addvip USER_ID  
+→ Add VIP bypass user
+
+❌ /removevip USER_ID  
+→ Remove VIP bypass user
 
 👑 /addadmin USER_ID  
 → Add new admin
