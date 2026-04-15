@@ -73,6 +73,7 @@ pending_fw_remove = set()
 pending_vip_add = set()
 pending_vip_remove = set()
 pending_fw_msg = set()
+pending_admin_broadcast = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 force_join_reminder_lock = threading.Lock()
@@ -1863,6 +1864,35 @@ def broadcast_warning_notice(sender_id, target_id, warnings, reason):
             except Exception:
                 pass
     return sent_count
+
+
+def admin_broadcast_text(sender_id, text):
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    if is_force_join_enabled():
+        receivers = [
+            uid for uid in receivers
+            if is_admin(uid) or is_vip(uid) or is_user_joined(uid)
+        ]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    if not targets:
+        return 0
+
+    payload = f"📣 ADMIN BROADCAST\n\n{text}"
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    sent_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(_send_text_with_retry, uid, payload): uid
+            for uid in targets
+        }
+        for future in as_completed(future_to_uid):
+            try:
+                if future.result():
+                    sent_count += 1
+            except Exception:
+                pass
+    return sent_count
 # =========================
 # 🚀 BROADCAST WORKER
 # =========================
@@ -2003,7 +2033,7 @@ def _process_album(messages):
 
 @bot.message_handler(
     func=lambda m: m.content_type == "text" and m.chat.id in (
-        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast
     ),
     content_types=['text']
 )
@@ -2014,6 +2044,7 @@ def handle_admin_pending_inputs(message):
         pending_vip_add.discard(message.chat.id)
         pending_vip_remove.discard(message.chat.id)
         pending_fw_msg.discard(message.chat.id)
+        pending_admin_broadcast.discard(message.chat.id)
         return
 
     text = (message.text or "").strip()
@@ -2062,6 +2093,19 @@ def handle_admin_pending_inputs(message):
             set_force_join_message(new_msg)
             bot.send_message(message.chat.id, "✅ Firewall message updated.")
         pending_fw_msg.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_broadcast:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Broadcast cancelled.")
+            pending_admin_broadcast.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Broadcast text cannot be empty.")
+            return
+        sent = admin_broadcast_text(message.chat.id, text)
+        bot.send_message(message.chat.id, f"📣 Broadcast sent to {sent} targets.")
+        pending_admin_broadcast.discard(message.chat.id)
         return
 
 # =========================
@@ -2440,6 +2484,9 @@ def _panel_system_markup():
     markup.add(
         InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
         InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
+    )
+    markup.add(
+        InlineKeyboardButton("📣 Broadcast", callback_data="panel_broadcast"),
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
     return markup
@@ -3112,6 +3159,21 @@ def set_firewall_message_cmd(message):
     bot.send_message(message.chat.id, "✅ Firewall message updated.")
 
 
+@bot.message_handler(commands=['broadcast'])
+def broadcast_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        pending_admin_broadcast.add(message.chat.id)
+        bot.send_message(message.chat.id, "📣 Send broadcast text. Type /cancel to stop.")
+        return
+
+    sent = admin_broadcast_text(message.chat.id, parts[1].strip())
+    bot.send_message(message.chat.id, f"📣 Broadcast sent to {sent} targets.")
+
+
 @bot.message_handler(commands=['adminmenu'])
 def admin_menu(message):
 
@@ -3167,6 +3229,9 @@ def admin_menu(message):
 
 ✏️ /setfwmsg TEXT  
 → Update firewall message text
+
+📣 /broadcast TEXT  
+→ Send admin broadcast to active users
 
 💎 /addvip USER_ID  
 → Add VIP bypass user
@@ -3232,7 +3297,7 @@ def noop_callback(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data in {
-    "panel_back", "panel_stats", "panel_users", "panel_firewall", "panel_system", "panel_moderation", "panel_vip"
+    "panel_back", "panel_stats", "panel_users", "panel_firewall", "panel_system", "panel_moderation", "panel_vip", "panel_broadcast"
 })
 def panel_navigation_callbacks(call):
     if not is_admin(call.from_user.id):
@@ -3302,6 +3367,12 @@ def panel_navigation_callbacks(call):
             _panel_vip_markup(),
             message_id=call.message.message_id,
         )
+        return
+
+    if call.data == "panel_broadcast":
+        pending_admin_broadcast.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting broadcast text")
+        bot.send_message(call.from_user.id, "📣 Send broadcast text. Type /cancel to stop.")
         return
 
 
