@@ -31,7 +31,19 @@ FIRST_ADMIN_ID = os.getenv("ADMIN_ID") # replace with your Telegram ID for initi
 
 
 REQUIRED_MEDIA = 12
-INACTIVITY_LIMIT = 6 * 60 * 60  # 6 hours
+
+def get_inactivity_limit():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM settings WHERE key='inactivity_limit_hours'")
+                row = c.fetchone()
+                if row and row[0].isdigit():
+                    return int(row[0]) * 3600
+    except Exception:
+        pass
+    return 6 * 3600  # 6 hours base fallback
+
 FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.01"))
 SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "8"))
 SEND_RETRIES = int(os.getenv("SEND_RETRIES", "2"))
@@ -76,6 +88,7 @@ pending_fw_msg = set()
 pending_admin_broadcast = set()
 pending_admin_setcaption = set()
 pending_admin_setwelcome = set()
+pending_admin_setinactive = set()
 pending_admin_addforward = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
@@ -262,10 +275,15 @@ def init_db():
                     duplicate_count INTEGER DEFAULT 0
                 )
             """)
-            # Default Welcome Message
             c.execute("""
                 INSERT INTO settings(key, value)
                 VALUES('welcome_message', '👋 Welcome!\n\nPlease drop your username:')
+                ON CONFLICT DO NOTHING
+            """)
+            
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('inactive_message', '⏳ You have been marked inactive.\nSend 12 media to reactivate.')
                 ON CONFLICT DO NOTHING
             """)
 
@@ -487,8 +505,8 @@ def add_referral_bonus(user_id):
                 return
             last_time = row[0]
             
-            if last_time is None or last_time < now - INACTIVITY_LIMIT:
-                new_last_time = now - INACTIVITY_LIMIT + 3600
+            if last_time is None or last_time < now - get_inactivity_limit():
+                new_last_time = now - get_inactivity_limit() + 3600
             else:
                 new_last_time = last_time + 3600
                 
@@ -500,7 +518,7 @@ def add_referral_bonus(user_id):
             """, (new_last_time, user_id))
 def add_user(user_id):
     now = int(time.time())
-    free_activation_time = now - INACTIVITY_LIMIT + 3600
+    free_activation_time = now - get_inactivity_limit() + 3600
     
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -1301,7 +1319,7 @@ def get_user_state(user_id):
     if last_activation_time is None:
         return "JOINING"
 
-    if last_activation_time < int(time.time()) - INACTIVITY_LIMIT:
+    if last_activation_time < int(time.time()) - get_inactivity_limit():
         return "INACTIVE"
 
     return "ACTIVE"
@@ -1363,6 +1381,24 @@ def set_welcome_message(text):
                 SET value=%s
                 WHERE key='welcome_message'
             """, (text,))
+
+def get_inactive_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='inactive_message'"
+            )
+            row = c.fetchone()
+            return row[0] if row else "⏳ You have been marked inactive.\nSend 12 media to reactivate."
+
+def set_inactive_message(text):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='inactive_message'
+            """, (text,))
 # =========================
 # 🔄 ACTIVATE USER
 # =========================
@@ -1404,7 +1440,7 @@ def check_activation(user_id):
 
 def auto_ban_inactive_users():
 
-    limit = int(time.time()) - INACTIVITY_LIMIT
+    limit = int(time.time()) - get_inactivity_limit()
 
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -1415,7 +1451,18 @@ def auto_ban_inactive_users():
                 WHERE auto_banned = FALSE
                   AND last_activation_time IS NOT NULL
                   AND last_activation_time < %s
+                RETURNING user_id
             """, (limit,))
+            rows = c.fetchall()
+            
+    if rows:
+        msg = get_inactive_message()
+        for r in rows:
+            user_id = r[0]
+            try:
+                bot.send_message(user_id, msg)
+            except Exception:
+                pass
             
 def is_duplicate_filter_enabled():
     with get_connection() as conn:
@@ -1624,7 +1671,7 @@ def capture_username(message):
 
     bot.send_message(
         user_id,
-        f"✅ {username} set.\n\nNow send {REQUIRED_MEDIA} media to join."
+        f"✅ {username} set."
     )
 # =========================
 # 🚫 BANNED WORD CHECK
@@ -1817,7 +1864,7 @@ def handle_restrictions(message):
 
 def get_active_receivers():
 
-    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
+    active_cutoff = int(time.time()) - get_inactivity_limit()
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -2211,10 +2258,10 @@ def _process_album(messages):
 
 
 @bot.message_handler(
-    func=lambda m: m.content_type == "text" and m.chat.id in (
-        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast | pending_admin_setcaption | pending_admin_setwelcome | pending_admin_addforward
+    func=lambda m: m.chat.id in (
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast | pending_admin_setcaption | pending_admin_setwelcome | pending_admin_setinactive | pending_admin_addforward
     ),
-    content_types=['text']
+    content_types=['text', 'photo', 'video', 'document', 'audio', 'voice']
 )
 def handle_admin_pending_inputs(message):
     if not is_admin(message.chat.id):
@@ -2226,7 +2273,12 @@ def handle_admin_pending_inputs(message):
         pending_admin_broadcast.discard(message.chat.id)
         pending_admin_setcaption.discard(message.chat.id)
         pending_admin_setwelcome.discard(message.chat.id)
+        pending_admin_setinactive.discard(message.chat.id)
         pending_admin_addforward.discard(message.chat.id)
+        return
+
+    if message.content_type != 'text':
+        bot.send_message(message.chat.id, "⚠️ Please send text only for this input, or type /cancel to abort.")
         return
 
     text = (message.text or "").strip()
@@ -2313,13 +2365,23 @@ def handle_admin_pending_inputs(message):
             bot.send_message(message.chat.id, "Text cannot be empty.")
             return
         val = "" if text.lower() == 'none' else text
-        from media_bot import set_welcome_message
-        try:
-            set_welcome_message(val)
-        except NameError:
-            pass # Failsafe if not defined in outer scope but it is
+        set_welcome_message(val)
         bot.send_message(message.chat.id, "✅ Welcome message updated.")
         pending_admin_setwelcome.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_setinactive:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Set inactive message cancelled.")
+            pending_admin_setinactive.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Text cannot be empty.")
+            return
+        val = "" if text.lower() == 'none' else text
+        set_inactive_message(val)
+        bot.send_message(message.chat.id, "✅ Inactive message updated.")
+        pending_admin_setinactive.discard(message.chat.id)
         return
 
     if message.chat.id in pending_admin_addforward:
@@ -2339,11 +2401,7 @@ def handle_admin_pending_inputs(message):
                 bot.send_message(message.chat.id, "Invalid CHAT_ID. Send a numeric ID or forward a text from the target channel.")
                 return
         if chat_id:
-            from media_bot import add_forward_target
-            try:
-                add_forward_target(chat_id)
-            except NameError:
-                pass
+            add_forward_target(chat_id)
             name_str = f" {target_name}" if target_name else ""
             bot.send_message(message.chat.id, f"✅ Forward target added:{name_str} ({chat_id})")
             pending_admin_addforward.discard(message.chat.id)
@@ -2535,10 +2593,10 @@ def start_background_workers():
     ).start()
 
     # Force Join Enforcement Scheduler
-    threading.Thread(
-        target=force_join_enforcement_scheduler,
-        daemon=True
-    ).start()
+    # threading.Thread(
+    #     target=force_join_enforcement_scheduler,
+    #     daemon=True
+    # ).start()
     
 # =========================
 # ADMIN COMMANDS
@@ -2767,11 +2825,41 @@ def _panel_moderation_markup():
         InlineKeyboardButton("👋 Set Welcome", callback_data="admin_setwelcome")
     )
     markup.add(
-        InlineKeyboardButton("➕ Add Forward", callback_data="admin_addforward")
+        InlineKeyboardButton("➕ Add Forward", callback_data="admin_addforward"),
+        InlineKeyboardButton("⏳ Set Inactive", callback_data="admin_setinactive")
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
     return markup
 
+
+@bot.message_handler(commands=['setinactivemsg'])
+def set_inactive_message_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+        
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        if message.reply_to_message and message.reply_to_message.text:
+            new_text = message.reply_to_message.text
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Usage: /setinactivemsg [Your inactive message here]\nOr reply to a text message with /setinactivemsg.\nType 'none' to remove it."
+            )
+            return
+    else:
+        new_text = parts[1].strip()
+
+    if new_text.lower() == 'none':
+        new_text = ""
+
+    set_inactive_message(new_text)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Inactive message updated."
+    )
 
 @bot.message_handler(commands=['panel'])
 def admin_panel(message):
@@ -2788,18 +2876,23 @@ def set_welcome_cmd(message):
     if not is_admin(message.chat.id):
         return
 
-    if not message.reply_to_message:
-        bot.send_message(
-            message.chat.id,
-            "Reply to a message to set it as welcome message."
-        )
-        return
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        # Fallback to checking reply for backwards compatibility or if they prefer replies
+        if message.reply_to_message and message.reply_to_message.text:
+            new_text = message.reply_to_message.text
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Usage: /setwelcome [Your welcome message here]\nOr reply to a text message with /setwelcome.\nType 'none' to remove it."
+            )
+            return
+    else:
+        new_text = parts[1].strip()
 
-    new_text = message.reply_to_message.text
-
-    if not new_text:
-        bot.send_message(message.chat.id, "Text only.")
-        return
+    if new_text.lower() == 'none':
+        new_text = ""
 
     set_welcome_message(new_text)
 
@@ -2808,13 +2901,41 @@ def set_welcome_cmd(message):
         "✅ Welcome message updated."
     )
 
+
+@bot.message_handler(commands=['setlimit'])
+def set_limit_command(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: /setlimit <hours>")
+        return
+    
+    hours = int(parts[1])
+    if hours < 1:
+        bot.send_message(message.chat.id, "❌ Limit must be at least 1 hour.")
+        return
+        
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('inactivity_limit_hours', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """, (str(hours),)
+            )
+            
+    bot.send_message(message.chat.id, f"✅ Inactivity limit updated to {hours} hours.")
+
+
 @bot.message_handler(commands=['stats'])
 def stats_command(message):
 
     if not is_admin(message.chat.id):
         return
 
-    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
+    active_cutoff = int(time.time()) - get_inactivity_limit()
     with get_connection() as conn:
         with conn.cursor() as c:
 
@@ -2869,6 +2990,7 @@ def stats_command(message):
 👥 Total: {total}
 🟢 Active: {active}
 🔴 Inactive: {inactive}
+⏳ Activity Limit: {get_inactivity_limit() // 3600} hours
 🚫 Banned: {banned}
 ⭐ Whitelisted: {whitelisted}
 ♻ Duplicate Media: {duplicate_total}
@@ -3439,6 +3561,9 @@ def admin_menu(message):
 📊 /stats  
 → Show bot statistics
 
+⏳ /setlimit HOURS  
+→ Set inactivity limit (hours)
+
 🔎 /info USER_ID  
 → View user details
 
@@ -3734,6 +3859,11 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Awaiting welcome message")
         bot.send_message(call.from_user.id, "👋 Send the new welcome message text. Type /cancel to abort.\nType 'none' to remove it.")
 
+    elif data == "admin_setinactive":
+        pending_admin_setinactive.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting inactive message")
+        bot.send_message(call.from_user.id, "⏳ Send the new inactive message text. Type /cancel to abort.\nType 'none' to remove it.")
+
     elif data == "admin_addforward":
         pending_admin_addforward.add(call.from_user.id)
         bot.answer_callback_query(call.id, "Awaiting forward target")
@@ -3754,25 +3884,52 @@ def admin_callbacks(call):
 
         bot.send_message(call.message.chat.id, text)
 
-    elif data == "admin_userlist":
-        bot.send_message(call.message.chat.id, "🔄 Fetching user data...")
+    elif data.startswith("admin_userlist"):
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text("🔄 Fetching user data (this may take a few seconds)...", call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        
+        parts = data.split(":")
+        page = int(parts[1]) if len(parts) > 1 else 0
+        limit = 10
+        offset = page * limit
+        
+        import math
         with get_connection() as conn:
             with conn.cursor() as c:
+                c.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL")
+                total_users = c.fetchone()[0]
+                
                 c.execute("""
-                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id)
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.username IS NOT NULL
-                    GROUP BY u.user_id, u.username, u.total_media_sent
+                    GROUP BY u.user_id, u.username, u.total_media_sent, u.last_activation_time
                     ORDER BY u.total_media_sent DESC
-                    LIMIT 30
-                """)
+                    LIMIT %s OFFSET %s
+                """, (limit, offset))
                 rows = c.fetchall()
         
         if rows:
-            lines = ["👥 *User List (Top 30)*", ""]
+            lines = [f"👥 *User List (Page {page + 1})*", ""]
+            import time
+            now = int(time.time())
             for row in rows:
-                uid, fallback, media, refs = row[0], row[1], row[2], row[3]
+                uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
+                
+                if last_active:
+                    time_passed = now - last_active
+                    time_left = max(0, get_inactivity_limit() - time_passed)
+                    if time_left > 0:
+                        status = f"🟢 {time_left // 3600}h {(time_left % 3600) // 60}m"
+                    else:
+                        status = "🔴 Inactive"
+                else:
+                    status = "🔴 Inactive"
+                    
                 display_name = f"@{fallback}"
                 try:
                     chat = bot.get_chat(uid)
@@ -3783,12 +3940,33 @@ def admin_callbacks(call):
                         if full: display_name = full
                 except Exception:
                     pass
-                lines.append(f"• {display_name} | 📸 {media} | 🎁 {refs} referrals")
+                lines.append(f"• {display_name} | {status} | 📸 {media} | 🎁 {refs} refs")
             text = "\n".join(lines)
         else:
             text = "No users found."
+            
+        markup = InlineKeyboardMarkup(row_width=3)
+        buttons = []
+        if page > 0:
+            buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_userlist:{page - 1}"))
+            
+        total_pages = math.ceil(total_users / limit) if total_users > 0 else 1
+        buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore_pagination"))
         
-        bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
+        if offset + limit < total_users:
+            buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_userlist:{page + 1}"))
+            
+        if buttons:
+            markup.add(*buttons)
+            
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            try:
+                bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
+            except Exception:
+                pass
+        return
 
     elif data == "admin_leaderboard":
         bot.send_message(call.message.chat.id, "🔄 Fetching leaderboard...")
@@ -3911,7 +4089,7 @@ def add_referral_bonus(referrer_id):
                     auto_banned = FALSE,
                     activation_media_count = 0
                 WHERE user_id=%s
-            """, (now, INACTIVITY_LIMIT, referrer_id))
+            """, (now, get_inactivity_limit(), referrer_id))
 
 @bot.message_handler(commands=['menu'])
 def menu_command(message):
@@ -3931,7 +4109,7 @@ def menu_command(message):
             
     if row and row[0]:
         last_act = row[0]
-        time_left = max(0, (last_act + INACTIVITY_LIMIT) - now)
+        time_left = max(0, (last_act + get_inactivity_limit()) - now)
     else:
         time_left = 0
 
