@@ -90,6 +90,7 @@ pending_admin_setcaption = set()
 pending_admin_setwelcome = set()
 pending_admin_setinactive = set()
 pending_admin_addforward = set()
+pending_admin_search_user = set()
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 force_join_reminder_lock = threading.Lock()
@@ -157,6 +158,10 @@ def init_db():
             c.execute("""
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS referred_by BIGINT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS joined_at BIGINT
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS recovery_users (
@@ -523,10 +528,11 @@ def add_user(user_id):
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
-                INSERT INTO users(user_id, last_activation_time)
-                VALUES(%s, %s)
-                ON CONFLICT DO NOTHING
-            """, (user_id, free_activation_time))
+                INSERT INTO users(user_id, last_activation_time, joined_at)
+                VALUES(%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    joined_at = COALESCE(users.joined_at, EXCLUDED.joined_at)
+            """, (user_id, free_activation_time, now))
 
 # =========================
 # 🏷 USERNAME HELPERS
@@ -2804,13 +2810,21 @@ def _panel_vip_markup():
 def _panel_users_markup():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
-        InlineKeyboardButton("👥 User List", callback_data="admin_userlist"),
+        InlineKeyboardButton("👥 All Users", callback_data="admin_userlist:0:all"),
+        InlineKeyboardButton("🟢 Active Only", callback_data="admin_userlist:0:active"),
     )
     markup.add(
+        InlineKeyboardButton("🎁 Refs > 0", callback_data="admin_userlist:0:refs"),
+        InlineKeyboardButton("☠️ 0 Uploads", callback_data="admin_userlist:0:dead"),
+    )
+    markup.add(
+        InlineKeyboardButton("🔍 Search User", callback_data="admin_search_user"),
         InlineKeyboardButton("🏆 Leaderboard", callback_data="admin_leaderboard"),
     )
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    markup.add(
+        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
+        InlineKeyboardButton("🔙 Back", callback_data="panel_back")
+    )
     return markup
 
 
@@ -3893,42 +3907,69 @@ def admin_callbacks(call):
         
         parts = data.split(":")
         page = int(parts[1]) if len(parts) > 1 else 0
+        filter_type = parts[2] if len(parts) > 2 else "all"
         limit = 10
         offset = page * limit
         
         import math
+        import time
+        now = int(time.time())
+        
+        query_condition = "u.username IS NOT NULL"
+        query_params = []
+        having_clause = ""
+        
+        if filter_type == "active":
+            query_condition += " AND last_activation_time >= %s"
+            query_params.append(now - get_inactivity_limit())
+        elif filter_type == "dead":
+            query_condition += " AND u.total_media_sent = 0"
+        elif filter_type == "refs":
+            having_clause = "HAVING COUNT(r.user_id) > 0"
+            
         with get_connection() as conn:
             with conn.cursor() as c:
-                c.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL")
+                if filter_type == "refs":
+                    c.execute(f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT u.user_id FROM users u
+                            LEFT JOIN users r ON r.referred_by = u.user_id
+                            WHERE {query_condition}
+                            GROUP BY u.user_id
+                            {having_clause}
+                        ) sub
+                    """, tuple(query_params))
+                else:
+                    c.execute(f"SELECT COUNT(*) FROM users u WHERE {query_condition}", tuple(query_params))
                 total_users = c.fetchone()[0]
                 
-                c.execute("""
+                query_params.extend([limit, offset])
+                c.execute(f"""
                     SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
-                    WHERE u.username IS NOT NULL
+                    WHERE {query_condition}
                     GROUP BY u.user_id, u.username, u.total_media_sent, u.last_activation_time
+                    {having_clause}
                     ORDER BY u.total_media_sent DESC
                     LIMIT %s OFFSET %s
-                """, (limit, offset))
+                """, tuple(query_params))
                 rows = c.fetchall()
         
+        filter_labels = {"all": "All Users", "active": "Active Only", "dead": "0 Uploads", "refs": "Refs > 0"}
+        text = f"👥 *User List ({filter_labels.get(filter_type, 'All')})*\nSelect a user to view details."
+            
+        markup = InlineKeyboardMarkup(row_width=1)
         if rows:
-            lines = [f"👥 *User List (Page {page + 1})*", ""]
-            import time
-            now = int(time.time())
             for row in rows:
                 uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
                 
                 if last_active:
                     time_passed = now - last_active
                     time_left = max(0, get_inactivity_limit() - time_passed)
-                    if time_left > 0:
-                        status = f"🟢 {time_left // 3600}h {(time_left % 3600) // 60}m"
-                    else:
-                        status = "🔴 Inactive"
+                    status = f"🟢 {time_left // 3600}h" if time_left > 0 else "🔴"
                 else:
-                    status = "🔴 Inactive"
+                    status = "🔴"
                     
                 display_name = f"@{fallback}"
                 try:
@@ -3940,25 +3981,27 @@ def admin_callbacks(call):
                         if full: display_name = full
                 except Exception:
                     pass
-                lines.append(f"• {display_name} | {status} | 📸 {media} | 🎁 {refs} refs")
-            text = "\n".join(lines)
+                
+                btn_text = f"{display_name} | {status} | 📸 {media}"
+                markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:{page}:{filter_type}"))
         else:
-            text = "No users found."
+            text = "No users found matching this filter."
             
-        markup = InlineKeyboardMarkup(row_width=3)
-        buttons = []
+        nav_buttons = []
         if page > 0:
-            buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_userlist:{page - 1}"))
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_userlist:{page - 1}:{filter_type}"))
             
         total_pages = math.ceil(total_users / limit) if total_users > 0 else 1
-        buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore_pagination"))
+        nav_buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore_pagination"))
         
         if offset + limit < total_users:
-            buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_userlist:{page + 1}"))
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_userlist:{page + 1}:{filter_type}"))
             
-        if buttons:
-            markup.add(*buttons)
+        if nav_buttons:
+            markup.row(*nav_buttons)
             
+        markup.add(InlineKeyboardButton("🔙 Back to Tools", callback_data="panel_users"))
+        
         try:
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
         except Exception:
@@ -3966,6 +4009,93 @@ def admin_callbacks(call):
                 bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
             except Exception:
                 pass
+        return
+
+    elif data.startswith("admin_user_info:"):
+        bot.answer_callback_query(call.id)
+        parts = data.split(":")
+        uid = int(parts[1])
+        page = parts[2] if len(parts) > 2 else "0"
+        filter_type = parts[3] if len(parts) > 3 else "all"
+        
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id)
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.user_id = %s
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent
+                """, (uid,))
+                row = c.fetchone()
+        
+        if not row:
+            bot.answer_callback_query(call.id, "User not found.", show_alert=True)
+            return
+            
+        username, joined_at, last_active, media, refs = row
+        import datetime, time
+        now = int(time.time())
+        joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
+        
+        status_str = "Inactive"
+        if last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            status_str = f"{time_left // 3600}h {(time_left % 3600) // 60}m remaining" if time_left > 0 else "Inactive"
+            
+        text = f"👤 *@{username}*\n🆔 ID: `{uid}`\n📅 Joined: {joined_str}\n⏱ Status: {status_str}\n📸 Total Uploads: {media}\n🎁 Referrals: {refs}"
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{uid}"),
+            InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{uid}")
+        )
+        markup.add(
+            InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}"),
+            InlineKeyboardButton("🔙 Back to List", callback_data=f"admin_userlist:{page}:{filter_type}")
+        )
+        
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    elif data == "admin_search_user":
+        pending_admin_search_user.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting query")
+        bot.send_message(call.message.chat.id, "🔍 Send username or exact User ID to search:\n(Type /cancel to abort)")
+        return
+
+    elif data.startswith("admin_ban_user:"):
+        uid = int(data.split(":")[1])
+        ban_user(uid)
+        bot.answer_callback_query(call.id, "🚫 User Banned!", show_alert=True)
+        return
+
+    elif data.startswith("admin_msg_user:"):
+        uid = int(data.split(":")[1])
+        bot.send_message(call.from_user.id, f"📝 To message this user directly, use:\n`/msg {uid} Your Message Here`", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    elif data.startswith("admin_view_files:"):
+        uid = int(data.split(":")[1])
+        bot.answer_callback_query(call.id, "Fetching files...")
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s LIMIT 5", (uid,))
+                files = c.fetchall()
+        if not files:
+            bot.send_message(call.message.chat.id, "❌ No files found for this user.")
+        else:
+            bot.send_message(call.message.chat.id, f"📂 Showing up to 5 recently tracked files for `{uid}`:")
+            for rec_id, msg_id in files:
+                try:
+                    bot.forward_message(call.message.chat.id, rec_id, msg_id)
+                except Exception:
+                    pass
         return
 
     elif data == "admin_leaderboard":
@@ -4024,6 +4154,85 @@ def admin_callbacks(call):
 
     bot.answer_callback_query(call.id)
 
+
+@bot.message_handler(func=lambda m: m.from_user.id in pending_admin_search_user)
+def handle_admin_search_user(message):
+    if not is_admin(message.chat.id):
+        pending_admin_search_user.discard(message.from_user.id)
+        return
+        
+    query = message.text.strip()
+    if query.lower() == "/cancel":
+        pending_admin_search_user.discard(message.from_user.id)
+        bot.send_message(message.chat.id, "❌ Search cancelled.")
+        return
+        
+    pending_admin_search_user.discard(message.from_user.id)
+    bot.send_message(message.chat.id, "🔍 Searching...")
+    
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if query.isdigit():
+                c.execute("""
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.user_id = %s
+                    GROUP BY u.user_id
+                """, (int(query),))
+            else:
+                clean_query = query.replace('@', '')
+                c.execute("""
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.username ILIKE %s
+                    GROUP BY u.user_id
+                    LIMIT 20
+                """, (f"%{clean_query}%",))
+            rows = c.fetchall()
+            
+    if not rows:
+        bot.send_message(message.chat.id, "❌ No users found matching your query.")
+        return
+        
+    import time
+    now = int(time.time())
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    for row in rows:
+        uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
+        if last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            status = f"🟢 {time_left // 3600}h" if time_left > 0 else "🔴"
+        else:
+            status = "🔴"
+            
+        display_name = f"@{fallback}" if fallback else f"ID:{uid}"
+        btn_text = f"{display_name} | {status} | 📸 {media}"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:0:all"))
+        
+    markup.add(InlineKeyboardButton("🔙 Back to Panel", callback_data="panel_users"))
+    bot.send_message(message.chat.id, f"🔍 Search Results for `{query}`:", parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.message_handler(commands=['msg'])
+def admin_direct_message(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: `/msg USER_ID Your Message Here`", parse_mode="Markdown")
+        return
+    
+    uid = int(parts[1])
+    text = parts[2]
+    try:
+        bot.send_message(uid, f"✉️ *Message from Admin:*\n\n{text}", parse_mode="Markdown")
+        bot.send_message(message.chat.id, f"✅ Message sent to `{uid}`.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
 
 @bot.message_handler(content_types=['document'])
 def import_recovery_document(message):
