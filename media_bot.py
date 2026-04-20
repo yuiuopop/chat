@@ -2822,9 +2822,10 @@ def _panel_users_markup():
         InlineKeyboardButton("🏆 Leaderboard", callback_data="admin_leaderboard"),
     )
     markup.add(
-        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
-        InlineKeyboardButton("🔙 Back", callback_data="panel_back")
+        InlineKeyboardButton("⏳ Set Limit", callback_data="admin_setlimit"),
+        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned")
     )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
     return markup
 
 
@@ -4096,6 +4097,12 @@ def admin_callbacks(call):
                     bot.forward_message(call.message.chat.id, rec_id, msg_id)
                 except Exception:
                     pass
+        return
+
+    elif data == "admin_setlimit":
+        curr = get_inactivity_limit() // 3600
+        bot.send_message(call.message.chat.id, f"📝 The current inactivity limit is *{curr} hours*.\n\nTo change it, type:\n`/setlimit HOURS`\n\nExample: `/setlimit 12`", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
         return
 
     elif data == "admin_leaderboard":
