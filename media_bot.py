@@ -1144,6 +1144,24 @@ def set_force_join_message(message):
             )
 
 
+def get_view_files_chat_id():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='view_files_chat_id'")
+            row = c.fetchone()
+            return row[0] if row else None
+
+
+def set_view_files_chat_id(chat_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('view_files_chat_id', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """, (str(chat_id) if chat_id else None,))
+
+
 def set_force_join(chat_id, message):
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -4628,13 +4646,19 @@ def admin_callbacks(call):
             with conn.cursor() as c:
                 c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s ORDER BY created_at DESC LIMIT 15", (uid,))
                 files = c.fetchall()
+        
+        target_chat = get_view_files_chat_id() or call.message.chat.id
+        
         if not files:
             bot.send_message(call.message.chat.id, "❌ No files found for this user.")
         else:
-            bot.send_message(call.message.chat.id, f"📂 Showing up to 15 recently tracked files for `{uid}`:")
+            if str(target_chat) != str(call.message.chat.id):
+                 bot.send_message(call.message.chat.id, "📂 Sending files to the designated log group...")
+            
+            bot.send_message(target_chat, f"📂 Recently tracked files for User ID: `{uid}`")
             for rec_id, msg_id in files:
                 try:
-                    bot.forward_message(call.message.chat.id, rec_id, msg_id)
+                    bot.forward_message(target_chat, rec_id, msg_id)
                 except Exception:
                     pass
         return
@@ -4761,6 +4785,23 @@ def admin_callbacks(call):
 
 
 
+
+
+@bot.message_handler(commands=['setviewchat'])
+def set_view_chat_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /setviewchat CHAT_ID\nType 'none' to show files here in the bot instead.")
+        return
+    val = parts[1].strip()
+    if val.lower() == 'none':
+        set_view_files_chat_id(None)
+        bot.send_message(message.chat.id, "✅ Log group cleared. Files will now be shown here.")
+    else:
+        set_view_files_chat_id(val)
+        bot.send_message(message.chat.id, f"✅ Log group for viewing files updated to: `{val}`", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=['msg'])
