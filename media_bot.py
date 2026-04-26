@@ -4647,13 +4647,13 @@ def admin_callbacks(call):
         
         if target_chat:
             markup.add(
-                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot"),
-                InlineKeyboardButton("📁 Send to Group", callback_data=f"admin_view_files_dest:{uid}:group")
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot:0"),
+                InlineKeyboardButton("📁 Send to Group", callback_data=f"admin_view_files_dest:{uid}:group:0")
             )
             text = "📂 *Where would you like to view the files?*"
         else:
             markup.add(
-                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot"),
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot:0"),
                 InlineKeyboardButton("⚙️ Set Log Group", callback_data="admin_setviewchat_prompt")
             )
             text = "📂 *Log group not set.*\nWould you like to view them here or configure a group to avoid spam?"
@@ -4666,15 +4666,25 @@ def admin_callbacks(call):
         parts = data.split(":")
         uid = int(parts[1])
         dest = parts[2] # "bot" or "group"
+        offset = int(parts[3]) if len(parts) > 3 else 0
         
-        bot.answer_callback_query(call.id, "Processing...")
+        bot.answer_callback_query(call.id, "Fetching batch...")
         
         with get_connection() as conn:
             with conn.cursor() as c:
-                c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s ORDER BY created_at DESC LIMIT 15", (uid,))
+                c.execute("""
+                    SELECT receiver_id, bot_message_id 
+                    FROM message_map 
+                    WHERE original_user_id=%s 
+                    ORDER BY created_at DESC 
+                    LIMIT 15 OFFSET %s
+                """, (uid, offset))
                 files = c.fetchall()
                 
-        if not files:
+                c.execute("SELECT COUNT(*) FROM message_map WHERE original_user_id=%s", (uid,))
+                total_files = c.fetchone()[0]
+                
+        if not files and offset == 0:
             bot.send_message(call.message.chat.id, "❌ No files found for this user.")
             return
 
@@ -4685,24 +4695,32 @@ def admin_callbacks(call):
                 bot.send_message(call.message.chat.id, "❌ Log group not found. Reverting to bot.")
                 target_chat_id = call.message.chat.id
             else:
-                # 🛡️ VALIDATE GROUP ACCESS
                 try:
                     bot.get_chat(target_chat_id)
                 except Exception:
-                    # Auto-remove invalid group
                     set_view_files_chat_id(None)
-                    bot.send_message(call.message.chat.id, "⚠️ *Log group is no longer accessible or was deleted.*\nSetting removed. Please set a new one using /setviewchat.", parse_mode="Markdown")
+                    bot.send_message(call.message.chat.id, "⚠️ Log group inaccessible. Setting removed.")
                     return
 
-        if str(target_chat_id) != str(call.message.chat.id):
-             bot.send_message(call.message.chat.id, "✅ Files are being sent to your log group.")
-        
-        bot.send_message(target_chat_id, f"📂 Recently tracked files for User ID: `{uid}`")
+        if offset == 0:
+            bot.send_message(target_chat_id, f"📂 *Batch 1* (Most Recent) for User ID: `{uid}`", parse_mode="Markdown")
+        else:
+            bot.send_message(target_chat_id, f"📂 *Next Batch* (Offset: {offset}) for User ID: `{uid}`", parse_mode="Markdown")
+
         for rec_id, msg_id in files:
             try:
                 bot.forward_message(target_chat_id, rec_id, msg_id)
             except Exception:
                 pass
+        
+        # Add "Load More" button if there are more files
+        if offset + 15 < total_files:
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("➕ Load More Files", callback_data=f"admin_view_files_dest:{uid}:{dest}:{offset+15}"))
+            bot.send_message(target_chat_id, f"✅ Showed {offset + len(files)} / {total_files} files.", reply_markup=markup)
+        else:
+            bot.send_message(target_chat_id, f"🏁 All {total_files} files have been displayed.")
+            
         return
 
     elif data == "admin_setviewchat_prompt":
