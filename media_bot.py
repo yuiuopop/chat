@@ -4502,11 +4502,11 @@ def admin_callbacks(call):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
-                           u.first_name, u.last_name, u.admin_notes, u.reputation
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.user_id = %s
-                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
                 """, (uid,))
                 row = c.fetchone()
         
@@ -4514,30 +4514,35 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "User not found.", show_alert=True)
             return
             
-        username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation = row
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username = row
         import datetime, time
         now = int(time.time())
         joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
         
-        status_str = "Inactive"
+        status_str = "🔴 Inactive"
         if last_active:
             time_passed = now - last_active
             time_left = max(0, get_inactivity_limit() - time_passed)
-            status_str = f"{time_left // 3600}h {(time_left % 3600) // 60}m remaining" if time_left > 0 else "Inactive"
+            if time_left > 0:
+                status_str = f"🟢 {time_left // 3600}h {(time_left % 3600) // 60}m"
             
-        rep_emoji = {"Trusted": "🟢", "Neutral": "⚪", "Suspicious": "🟡", "Scammer": "🔴"}.get(reputation, "⚪")
-        full_name = f"{first_name or ''} {last_name or ''}".strip() or "Not set"
+        rep_emoji = {"Trusted": "✅", "Neutral": "⚪", "Suspicious": "🟡", "Scammer": "🚫"}.get(reputation, "⚪")
+        full_name = f"{first_name or ''} {last_name or ''}".strip() or "N/A"
+        display_tg_user = f"@{tg_username}" if tg_username else "N/A"
         
         text = (
-            f"👤 *@{username}*\n"
-            f"📛 *Name:* {full_name}\n"
-            f"🆔 ID: `{uid}`\n"
+            f"💎 *USER PROFILE*\n\n"
+            f"👤 *Name:* {escape_markdown(full_name)}\n"
+            f"🌐 *Username:* {escape_markdown(display_tg_user)}\n"
+            f"🤖 *Bot Name:* {escape_markdown(bot_username or 'N/A')}\n"
+            f"🆔 *ID:* `{uid}`\n\n"
+            f"📊 *STATISTICS*\n"
+            f"📸 *Uploads:* `{media}`\n"
+            f"🎁 *Referrals:* `{refs}`\n"
+            f"⏱ *Status:* {status_str}\n\n"
             f"🏷 *Reputation:* {rep_emoji} {reputation}\n"
-            f"📅 Joined: {joined_str}\n"
-            f"⏱ Status: {status_str}\n"
-            f"📸 Total Uploads: {media}\n"
-            f"🎁 Referrals: {refs}\n\n"
-            f"📝 *Admin Notes:* {notes or 'No notes yet.'}"
+            f"📅 *Joined:* {joined_str}\n\n"
+            f"📝 *ADMIN NOTES:*\n{notes or '_No notes yet._'}"
         )
         
         markup = InlineKeyboardMarkup(row_width=2)
@@ -4550,8 +4555,11 @@ def admin_callbacks(call):
             InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}")
         )
         
-        if username and username != "None" and username != "admin":
-            markup.add(InlineKeyboardButton("🌐 Profile Link", url=f"t.me/{username}"))
+        if tg_username and tg_username != "None":
+            markup.add(InlineKeyboardButton("🌐 Profile Link", url=f"t.me/{tg_username}"))
+        elif bot_username and bot_username != "None" and bot_username != "admin":
+            # Fallback to bot username if they happened to use their real one there
+            markup.add(InlineKeyboardButton("🌐 Bot Name Link", url=f"t.me/{bot_username}"))
 
         markup.add(
             InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}"),
