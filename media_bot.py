@@ -4267,7 +4267,21 @@ def firewall_ui_callbacks(call):
         
         markup = InlineKeyboardMarkup(row_width=1)
         for ch in channels:
-            markup.add(InlineKeyboardButton(f"📡 {ch['name']}", callback_data=f"fw_view:{ch['chat_id']}"))
+            chat_id = ch['chat_id']
+            # Default to admin name
+            display_name = ch['name']
+            
+            # Try to fetch real channel title for a more professional look
+            if not any(x in chat_id for x in ["t.me/+", "t.me/joinchat/"]):
+                try:
+                    chat_ref = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+                    chat_info = bot.get_chat(chat_ref)
+                    if chat_info and chat_info.title:
+                        display_name = chat_info.title
+                except Exception:
+                    pass
+            
+            markup.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"fw_view:{ch['chat_id']}"))
         
         markup.add(InlineKeyboardButton("🔙 Back to Firewall", callback_data="panel_firewall"))
         
