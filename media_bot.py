@@ -2246,7 +2246,7 @@ def admin_broadcast_text(sender_id, text):
     if not targets:
         return 0
 
-    payload = f"📣 \n\n{text}"
+    payload = f"📢 {text}"
     workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
     sent_count = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
