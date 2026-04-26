@@ -208,7 +208,8 @@ def init_db():
             """)
             c.execute("""
                 ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS reputation TEXT DEFAULT 'Neutral'
+                ADD COLUMN IF NOT EXISTS reputation TEXT DEFAULT 'Neutral',
+                ADD COLUMN IF NOT EXISTS tg_username TEXT
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS recovery_users (
@@ -573,7 +574,7 @@ def add_referral_bonus(user_id):
                     auto_banned = FALSE
                 WHERE user_id=%s
             """, (new_last_time, user_id))
-def add_user(user_id, first_name=None, last_name=None):
+def add_user(user_id, first_name=None, last_name=None, tg_username=None):
     now = int(time.time())
     grace_seconds = get_new_user_grace_hours() * 3600
     free_activation_time = now - get_inactivity_limit() + grace_seconds
@@ -581,13 +582,14 @@ def add_user(user_id, first_name=None, last_name=None):
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
-                INSERT INTO users(user_id, last_activation_time, joined_at, first_name, last_name)
-                VALUES(%s, %s, %s, %s, %s)
+                INSERT INTO users(user_id, last_activation_time, joined_at, first_name, last_name, tg_username)
+                VALUES(%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     joined_at = COALESCE(users.joined_at, EXCLUDED.joined_at),
                     first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name
-            """, (user_id, free_activation_time, now, first_name, last_name))
+                    last_name = EXCLUDED.last_name,
+                    tg_username = EXCLUDED.tg_username
+            """, (user_id, free_activation_time, now, first_name, last_name, tg_username))
 
 # =========================
 # 🏷 USERNAME HELPERS
@@ -1659,12 +1661,9 @@ def start_command(message):
 
     # 👑 Admin Auto Registration
     if is_admin(user_id):
-        if not user_exists(user_id):
-            add_user(user_id, message.from_user.first_name, message.from_user.last_name)
-
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
         if get_username(user_id) is None:
             set_username(user_id, "admin")
-
         bot.send_message(user_id, "👑 Admin access granted.")
         return
 
@@ -1699,6 +1698,12 @@ def start_command(message):
                 )
             except:
                 pass
+
+    # Update TG Username if changed
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE users SET tg_username=%s, first_name=%s, last_name=%s WHERE user_id=%s", 
+                      (message.from_user.username, message.from_user.first_name, message.from_user.last_name, user_id))
 
     # 🏷 Ask Username If Not Set
     if get_username(user_id) is None:
@@ -4654,7 +4659,7 @@ def admin_callbacks(call):
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    SELECT u.user_id, u.username, u.first_name, u.last_name, COUNT(r.user_id) as refs
+                    SELECT u.user_id, u.username, u.tg_username, u.first_name, u.last_name, COUNT(r.user_id) as refs
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.username IS NOT NULL OR u.first_name IS NOT NULL
@@ -4668,10 +4673,12 @@ def admin_callbacks(call):
         if rows:
             lines = ["🏆 *Top Referrers Leaderboard*", ""]
             for i, row in enumerate(rows, 1):
-                uid, username, fname, lname, refs = row
+                uid, bot_username, tg_username, fname, lname, refs = row
                 
-                if username:
-                    display_name = f"@{escape_markdown(username)}"
+                if tg_username:
+                    display_name = f"@{escape_markdown(tg_username)}"
+                elif bot_username:
+                    display_name = escape_markdown(bot_username)
                 else:
                     full = f"{fname or ''} {lname or ''}".strip()
                     display_name = escape_markdown(full) or f"User {uid}"
@@ -4692,7 +4699,7 @@ def admin_callbacks(call):
             with get_connection() as conn:
                 with conn.cursor() as c:
                     c.execute("""
-                        SELECT user_id, username, first_name, last_name, total_media_sent
+                        SELECT user_id, username, tg_username, first_name, last_name, total_media_sent
                         FROM users
                         WHERE total_media_sent IS NOT NULL AND total_media_sent > 0
                         ORDER BY total_media_sent DESC
@@ -4703,10 +4710,12 @@ def admin_callbacks(call):
             if rows:
                 lines = ["📸 *Top Uploaders Leaderboard*", ""]
                 for i, row in enumerate(rows, 1):
-                    uid, username, fname, lname, uploads = row
+                    uid, bot_username, tg_username, fname, lname, uploads = row
                     
-                    if username:
-                        display_name = f"@{escape_markdown(username)}"
+                    if tg_username:
+                        display_name = f"@{escape_markdown(tg_username)}"
+                    elif bot_username:
+                        display_name = escape_markdown(bot_username)
                     else:
                         full = f"{fname or ''} {lname or ''}".strip()
                         display_name = escape_markdown(full) or f"User {uid}"
