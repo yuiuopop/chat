@@ -79,7 +79,7 @@ MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
 MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
 WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
 WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
-FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "120"))
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "30"))
 JOINED_STATUSES = ("member", "administrator", "creator", "owner", "restricted")
 FORCE_JOIN_REMINDER_COOLDOWN = int(os.getenv("FORCE_JOIN_REMINDER_COOLDOWN", "21600"))
 
@@ -176,6 +176,13 @@ def init_db():
                     activation_media_count INTEGER DEFAULT 0,
                     total_media_sent INTEGER DEFAULT 0,
                     last_activation_time BIGINT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_join_requests (
+                    user_id BIGINT,
+                    chat_id TEXT,
+                    PRIMARY KEY (user_id, chat_id)
                 )
             """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_users_total_media ON users(total_media_sent DESC)")
@@ -1268,6 +1275,13 @@ def is_user_joined_detailed(user_id, force_refresh=False):
         if not chat_id:
             continue
 
+        # Check if user has a pending join request for this channel
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT 1 FROM pending_join_requests WHERE user_id=%s AND chat_id=%s", (user_id, chat_id))
+                if c.fetchone():
+                    continue # Treat as joined if request is pending
+
         # Skip non-verifiable links
         if any(x in chat_id for x in ["t.me/+", "t.me/joinchat/", "/joinchat/", "t.me/c/"]):
             continue
@@ -1314,8 +1328,11 @@ def can_send_force_join_reminder(user_id):
         return True
 
 
-def send_force_join_ui(user_id):
+def send_force_join_ui(user_id, prefix_text=None):
     message = get_force_join_message()
+    if prefix_text:
+        message = f"{prefix_text}\n\n{message}"
+    
     channels = get_force_join_channels()
 
     markup = InlineKeyboardMarkup()
@@ -1813,6 +1830,13 @@ def handle_restrictions(message):
 
     user_id = message.chat.id
     state = get_user_state(user_id)
+
+    # 🛡️ Force Join Check (Firewall)
+    if is_force_join_enabled():
+        if not is_user_joined(user_id):
+            if can_send_force_join_reminder(user_id):
+                send_force_join_ui(user_id)
+            return True
 
     # 🚫 Manual Ban
     if state == "BANNED":
@@ -4021,14 +4045,21 @@ def check_join_callback(call):
             bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
     else:
         missing_str = "\n".join([f"• {name}" for name in missing])
+        prefix = f"⚠️ *Still missing membership in:*\n{missing_str}\n\nPlease join them and try again."
         bot.answer_callback_query(call.id, "❌ You still need to join some channels.", show_alert=True)
-        try:
-            # Re-send UI to keep buttons accessible
-            send_force_join_ui(user_id)
-            if missing:
-                bot.send_message(user_id, f"⚠️ *Still missing membership in:*\n{missing_str}\n\nPlease join them and click '✅ I Joined' again.", parse_mode="Markdown")
-        except Exception:
-            pass
+        send_force_join_ui(user_id, prefix_text=prefix)
+
+@bot.chat_join_request_handler()
+def handle_join_request(request):
+    user_id = request.from_user.id
+    chat_id = str(request.chat.id)
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO pending_join_requests(user_id, chat_id)
+                VALUES(%s, %s)
+                ON CONFLICT (user_id, chat_id) DO NOTHING
+            """, (user_id, chat_id))
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "noop")
