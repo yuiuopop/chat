@@ -4641,26 +4641,73 @@ def admin_callbacks(call):
 
     elif data.startswith("admin_view_files:"):
         uid = int(data.split(":")[1])
-        bot.answer_callback_query(call.id, "Fetching files...")
+        target_chat = get_view_files_chat_id()
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        
+        if target_chat:
+            markup.add(
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot"),
+                InlineKeyboardButton("📁 Send to Group", callback_data=f"admin_view_files_dest:{uid}:group")
+            )
+            text = "📂 *Where would you like to view the files?*"
+        else:
+            markup.add(
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot"),
+                InlineKeyboardButton("⚙️ Set Log Group", callback_data="admin_setviewchat_prompt")
+            )
+            text = "📂 *Log group not set.*\nWould you like to view them here or configure a group to avoid spam?"
+            
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_info:{uid}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    elif data.startswith("admin_view_files_dest:"):
+        parts = data.split(":")
+        uid = int(parts[1])
+        dest = parts[2] # "bot" or "group"
+        
+        bot.answer_callback_query(call.id, "Processing...")
+        
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s ORDER BY created_at DESC LIMIT 15", (uid,))
                 files = c.fetchall()
-        
-        target_chat = get_view_files_chat_id() or call.message.chat.id
-        
+                
         if not files:
             bot.send_message(call.message.chat.id, "❌ No files found for this user.")
-        else:
-            if str(target_chat) != str(call.message.chat.id):
-                 bot.send_message(call.message.chat.id, "📂 Sending files to the designated log group...")
-            
-            bot.send_message(target_chat, f"📂 Recently tracked files for User ID: `{uid}`")
-            for rec_id, msg_id in files:
+            return
+
+        target_chat_id = call.message.chat.id
+        if dest == "group":
+            target_chat_id = get_view_files_chat_id()
+            if not target_chat_id:
+                bot.send_message(call.message.chat.id, "❌ Log group not found. Reverting to bot.")
+                target_chat_id = call.message.chat.id
+            else:
+                # 🛡️ VALIDATE GROUP ACCESS
                 try:
-                    bot.forward_message(target_chat, rec_id, msg_id)
+                    bot.get_chat(target_chat_id)
                 except Exception:
-                    pass
+                    # Auto-remove invalid group
+                    set_view_files_chat_id(None)
+                    bot.send_message(call.message.chat.id, "⚠️ *Log group is no longer accessible or was deleted.*\nSetting removed. Please set a new one using /setviewchat.", parse_mode="Markdown")
+                    return
+
+        if str(target_chat_id) != str(call.message.chat.id):
+             bot.send_message(call.message.chat.id, "✅ Files are being sent to your log group.")
+        
+        bot.send_message(target_chat_id, f"📂 Recently tracked files for User ID: `{uid}`")
+        for rec_id, msg_id in files:
+            try:
+                bot.forward_message(target_chat_id, rec_id, msg_id)
+            except Exception:
+                pass
+        return
+
+    elif data == "admin_setviewchat_prompt":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "⚙️ *To set a log group:* \n\n1. Go to the group/channel.\n2. Forward any message from it to this bot.\n3. Type `/setviewchat [Chat ID]` using the ID provided by the bot.", parse_mode="Markdown")
         return
 
     elif data == "admin_setlimit":
