@@ -1013,15 +1013,16 @@ def _normalize_force_join_chat(raw_value):
     if not value:
         return None
 
-    # Keep private invite links exactly as provided.
-    if "t.me/+" in value:
+    # Handle private invite links and internal links that shouldn't be normalized to @usernames
+    if any(x in value for x in ["t.me/+", "t.me/joinchat/", "t.me/c/", "/joinchat/"]):
         return value
 
     # Public link -> convert to @username.
     if "t.me/" in value:
         slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
-        if slug:
+        if slug and "/" not in slug: # only @username if it's a simple slug
             return f"@{slug}"
+        return value
 
     if value.startswith("@"):
         return value
@@ -1239,13 +1240,13 @@ def parse_force_channel_input(text):
     return None, None, None
 
 
-def is_user_joined(user_id, force_refresh=False):
+def is_user_joined_detailed(user_id, force_refresh=False):
     if is_vip(user_id):
-        return True
+        return True, []
 
     channels = get_force_join_channels()
     if not channels:
-        return True
+        return True, []
 
     now = time.time()
     channels_key = tuple(str(ch.get("chat_id")) for ch in channels)
@@ -1255,17 +1256,20 @@ def is_user_joined(user_id, force_refresh=False):
         with force_join_cache_lock:
             cached = force_join_cache.get(cache_key)
             if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
-                return cached[0]
+                return cached[0], []
 
     joined = True
+    missing_channels = []
     had_verifiable_channel = False
+
     for channel in channels:
         chat_id = str(channel.get("chat_id", "")).strip()
+        name = str(channel.get("name") or chat_id)
         if not chat_id:
             continue
 
-        # Private invite links cannot be verified with get_chat_member.
-        if chat_id.startswith("https://t.me/+") or chat_id.startswith("http://t.me/+"):
+        # Skip non-verifiable links
+        if any(x in chat_id for x in ["t.me/+", "t.me/joinchat/", "/joinchat/", "t.me/c/"]):
             continue
 
         chat_ref = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
@@ -1275,12 +1279,18 @@ def is_user_joined(user_id, force_refresh=False):
             status = getattr(member, "status", "")
             if status not in JOINED_STATUSES:
                 joined = False
-                break
+                missing_channels.append(name)
         except Exception as e:
-            # Fail-close on API/check errors to enforce the firewall policy strictly.
-            print(f"Force join check failed for chat {chat_id}: {e}")
+            # If the bot itself has an error (e.g. Chat Not Found, or Bot not admin), 
+            # we should log it but NOT block the user based on a channel the bot can't see.
+            err_msg = str(e).lower()
+            if "chat not found" in err_msg or "bot was kicked" in err_msg or "user not found" in err_msg:
+                print(f"Skipping join check for {name} due to bot permission/config error: {e}")
+                continue 
+            
+            print(f"Force join check error for {name}: {e}")
             joined = False
-            break
+            missing_channels.append(name)
 
     if not had_verifiable_channel:
         joined = True
@@ -1288,7 +1298,10 @@ def is_user_joined(user_id, force_refresh=False):
     with force_join_cache_lock:
         force_join_cache[cache_key] = (joined, now)
 
-    return joined
+    return joined, missing_channels
+
+def is_user_joined(user_id, force_refresh=False):
+    return is_user_joined_detailed(user_id, force_refresh)[0]
 
 
 def can_send_force_join_reminder(user_id):
@@ -3989,7 +4002,8 @@ def admin_menu(message):
 def check_join_callback(call):
     user_id = call.from_user.id
     msg = call.message
-    if is_user_joined(user_id, force_refresh=True):
+    joined, missing = is_user_joined_detailed(user_id, force_refresh=True)
+    if joined:
         bot.answer_callback_query(call.id, "✅ Verified!")
         with last_fw_msg_lock:
             last_fw_msg.pop(int(user_id), None)
@@ -4004,9 +4018,17 @@ def check_join_callback(call):
                 bot.delete_message(msg.chat.id, msg.message_id)
             except Exception:
                 pass
-            bot.send_message(user_id, "🎉 You can now use the bot.")
+            bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
     else:
-        bot.answer_callback_query(call.id, "❌ You still haven't joined all channels.", show_alert=True)
+        missing_str = "\n".join([f"• {name}" for name in missing])
+        bot.answer_callback_query(call.id, "❌ You still need to join some channels.", show_alert=True)
+        try:
+            # Re-send UI to keep buttons accessible
+            send_force_join_ui(user_id)
+            if missing:
+                bot.send_message(user_id, f"⚠️ *Still missing membership in:*\n{missing_str}\n\nPlease join them and click '✅ I Joined' again.", parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "noop")
