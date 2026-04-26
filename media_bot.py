@@ -12,10 +12,18 @@ import random
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def escape_markdown(text):
+    if not text:
+        return ""
+    # Escaping for Markdown V1
+    return text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
  # make sure to have this file for cross-instance forwarding
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import execute_values
+import requests
 import telebot
 from telebot.types import InputMediaPhoto, InputMediaVideo
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -43,6 +51,18 @@ def get_inactivity_limit():
     except Exception:
         pass
     return 6 * 3600  # 6 hours base fallback
+
+def get_new_user_grace_hours():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM settings WHERE key='new_user_grace_hours'")
+                row = c.fetchone()
+                if row and row[0].isdigit():
+                    return int(row[0])
+    except Exception:
+        pass
+    return 1  # 1 hour base fallback
 
 FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.01"))
 SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "8"))
@@ -89,8 +109,11 @@ pending_admin_broadcast = set()
 pending_admin_setcaption = set()
 pending_admin_setwelcome = set()
 pending_admin_setinactive = set()
+pending_admin_setcontact = set()
 pending_admin_addforward = set()
 pending_admin_search_user = set()
+pending_admin_msg_target = {} # admin_id -> target_user_id
+pending_admin_set_note = {}   # admin_id -> target_user_id
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 force_join_reminder_lock = threading.Lock()
@@ -155,6 +178,7 @@ def init_db():
                     last_activation_time BIGINT
                 )
             """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_users_total_media ON users(total_media_sent DESC)")
             c.execute("""
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS referred_by BIGINT
@@ -162,6 +186,22 @@ def init_db():
             c.execute("""
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS joined_at BIGINT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS first_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS last_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS admin_notes TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS reputation TEXT DEFAULT 'Neutral'
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS recovery_users (
@@ -289,6 +329,11 @@ def init_db():
             c.execute("""
                 INSERT INTO settings(key, value)
                 VALUES('inactive_message', '⏳ You have been marked inactive.\nSend 12 media to reactivate.')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('contact_message', 'For support, please contact an administrator.')
                 ON CONFLICT DO NOTHING
             """)
 
@@ -521,18 +566,21 @@ def add_referral_bonus(user_id):
                     auto_banned = FALSE
                 WHERE user_id=%s
             """, (new_last_time, user_id))
-def add_user(user_id):
+def add_user(user_id, first_name=None, last_name=None):
     now = int(time.time())
-    free_activation_time = now - get_inactivity_limit() + 3600
+    grace_seconds = get_new_user_grace_hours() * 3600
+    free_activation_time = now - get_inactivity_limit() + grace_seconds
     
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
-                INSERT INTO users(user_id, last_activation_time, joined_at)
-                VALUES(%s, %s, %s)
+                INSERT INTO users(user_id, last_activation_time, joined_at, first_name, last_name)
+                VALUES(%s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
-                    joined_at = COALESCE(users.joined_at, EXCLUDED.joined_at)
-            """, (user_id, free_activation_time, now))
+                    joined_at = COALESCE(users.joined_at, EXCLUDED.joined_at),
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name
+            """, (user_id, free_activation_time, now, first_name, last_name))
 
 # =========================
 # 🏷 USERNAME HELPERS
@@ -585,13 +633,20 @@ def export_recovery_payload():
         with conn.cursor() as c:
             c.execute(
                 """
-                SELECT username, banned
+                SELECT username, banned, first_name, last_name, admin_notes, reputation
                 FROM users
                 WHERE username IS NOT NULL
                 ORDER BY username
                 """
             )
-            users = [{"username": r[0], "banned": bool(r[1])} for r in c.fetchall()]
+            users = [{
+                "username": r[0],
+                "banned": bool(r[1]),
+                "first_name": r[2],
+                "last_name": r[3],
+                "admin_notes": r[4],
+                "reputation": r[5]
+            } for r in c.fetchall()]
             c.execute("SELECT word FROM banned_words ORDER BY word")
             words = [r[0] for r in c.fetchall()]
     return {
@@ -612,17 +667,25 @@ def import_recovery_payload(payload):
         with conn.cursor() as c:
             for item in users:
                 username = str(item.get("username", "")).strip().lower()
-                if not username:
-                    continue
+                if not username: continue
                 banned = bool(item.get("banned", False))
-                c.execute(
-                    """
-                    INSERT INTO recovery_users(username, banned)
-                    VALUES(%s, %s)
-                    ON CONFLICT (username) DO UPDATE SET banned=EXCLUDED.banned
-                    """,
-                    (username, banned),
-                )
+                fname = item.get("first_name")
+                lname = item.get("last_name")
+                notes = item.get("admin_notes")
+                rep = item.get("reputation", "Neutral")
+
+                c.execute("""
+                    INSERT INTO recovery_users (username, banned)
+                    VALUES (%s, %s)
+                    ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                """, (username, banned))
+
+                # Update main users table if they exist
+                c.execute("""
+                    UPDATE users
+                    SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
+                    WHERE username = %s
+                """, (banned, fname, lname, notes, rep, username))
                 imported_users += 1
 
             for word in words:
@@ -1213,10 +1276,11 @@ def is_user_joined(user_id, force_refresh=False):
             if status not in JOINED_STATUSES:
                 joined = False
                 break
-        except Exception:
-            # Fail-open on API/check errors to avoid locking legitimate users out.
-            print(f"Force join check skipped for chat {chat_id}: unable to verify membership right now.")
-            continue
+        except Exception as e:
+            # Fail-close on API/check errors to enforce the firewall policy strictly.
+            print(f"Force join check failed for chat {chat_id}: {e}")
+            joined = False
+            break
 
     if not had_verifiable_channel:
         joined = True
@@ -1388,6 +1452,24 @@ def set_welcome_message(text):
                 WHERE key='welcome_message'
             """, (text,))
 
+def get_contact_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='contact_message'"
+            )
+            row = c.fetchone()
+            return row[0] if row else "For support, please contact an administrator."
+
+def set_contact_message(text):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='contact_message'
+            """, (text,))
+
 def get_inactive_message():
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -1548,13 +1630,22 @@ def start_command(message):
     # 👑 Admin Auto Registration
     if is_admin(user_id):
         if not user_exists(user_id):
-            add_user(user_id)
+            add_user(user_id, message.from_user.first_name, message.from_user.last_name)
 
         if get_username(user_id) is None:
             set_username(user_id, "admin")
 
         bot.send_message(user_id, "👑 Admin access granted.")
         return
+
+    # 🛡️ Force Join Check (Firewall)
+    if is_force_join_enabled():
+        joined = is_user_joined(user_id)
+        if not joined:
+            joined = is_user_joined(user_id, force_refresh=True)
+        if not joined:
+            send_force_join_ui(user_id)
+            return
 
     # 🆕 New User
     if not user_exists(user_id):
@@ -1566,7 +1657,7 @@ def start_command(message):
             )
             return
 
-        add_user(user_id)
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name)
 
         if referrer_id and referrer_id != user_id and user_exists(referrer_id):
             set_referred_by(user_id, referrer_id)
@@ -1677,7 +1768,8 @@ def capture_username(message):
 
     bot.send_message(
         user_id,
-        f"✅ {username} set."
+        f"✅ {username} set.\nnow you can use this bot.."
+
     )
 # =========================
 # 🚫 BANNED WORD CHECK
@@ -1783,7 +1875,7 @@ def handle_restrictions(message):
                     if activated:
                         bot.send_message(
                             user_id,
-                            "🎉 You are now active for 6 hours!"
+                            f"🎉 You are now active for {get_inactivity_limit() // 3600} hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
@@ -1833,7 +1925,7 @@ def handle_restrictions(message):
                     if activated:
                         bot.send_message(
                             user_id,
-                            "🎉 You are reactivated for 6 hours!"
+                            f"🎉 You are reactivated for {get_inactivity_limit() // 3600} hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
@@ -1980,6 +2072,54 @@ def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id
                     time.sleep(0.15 * (i + 1))
                 continue
             return None
+    return None
+
+
+def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=sender_id,
+                message_id=message_id,
+                **kwargs
+            )
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def _forward_messages_manual(chat_id, from_chat_id, message_ids):
+    """
+    Manual call to forwardMessages API to preserve album grouping.
+    Required because local telebot version < 4.14 doesn't support it.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/forwardMessages"
+    payload = {
+        "chat_id": chat_id,
+        "from_chat_id": from_chat_id,
+        "message_ids": message_ids
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        res = resp.json()
+        if res.get("ok"):
+            return res.get("result")
+        else:
+            print(f"Manual forwardMessages failed: {res.get('description')}")
+    except Exception as e:
+        print(f"Manual forwardMessages error: {e}")
     return None
 
 
@@ -2153,9 +2293,18 @@ def _process_single(message):
             caption=new_caption
         )
     workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    
+    def dispatch_send(uid):
+        if uid in extra_targets:
+            # Only forward media to forward targets, skip text messages
+            if message.content_type != "text":
+                return _forward_message_with_retry(uid, sender_id, message.message_id)
+            return None
+        return send_fn(uid)
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uid = {
-            executor.submit(send_fn, user_id): user_id
+            executor.submit(dispatch_send, user_id): user_id
             for user_id in targets
         }
         for future in as_completed(future_to_uid):
@@ -2194,6 +2343,7 @@ def _process_album(messages):
     if not targets:
         return
     media_caption = get_media_caption()
+    username = get_username(sender_id) or 'Unknown'
     media_items = []
     
     for index, msg in enumerate(messages):
@@ -2233,16 +2383,31 @@ def _process_album(messages):
                 ),
                 msg.message_id,
             ))
+
     chunks = [media_items[i:i+10] for i in range(0, len(media_items), 10)]
 
     def send_album_to_user(user_id):
         rows = []
+        
+        if user_id in extra_targets:
+            # Use forwardMessages API to preserve album grouping and forward tags
+            message_ids = [msg.message_id for msg in messages]
+            sent_msgs = _forward_messages_manual(user_id, sender_id, message_ids)
+            if store_mapping and sent_msgs:
+                for sent, original_msg in zip(sent_msgs, messages):
+                    rows.append((sent['message_id'], sender_id, original_msg.message_id, user_id, now))
+            return rows
+
+        # For normal users, send as anonymous relay (copy)
         for chunk in chunks:
             chunk_media = [item[0] for item in chunk]
-            sent_msgs = bot.send_media_group(user_id, chunk_media)
-            if store_mapping:
-                for sent, original_message_id in zip(sent_msgs, [item[1] for item in chunk]):
-                    rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
+            try:
+                sent_msgs = bot.send_media_group(user_id, chunk_media)
+                if store_mapping and sent_msgs:
+                    for sent, original_message_id in zip(sent_msgs, [item[1] for item in chunk]):
+                        rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
+            except Exception as e:
+                print("Album send_media_group error:", e)
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
         return rows
@@ -2263,10 +2428,72 @@ def _process_album(messages):
     # external_forward.forward_album(bot, messages)
 
 
+@bot.message_handler(func=lambda m: m.from_user.id in pending_admin_search_user)
+def handle_admin_search_user(message):
+    if not is_admin(message.chat.id):
+        pending_admin_search_user.discard(message.from_user.id)
+        return
+        
+    query = message.text.strip()
+    if query.lower() == "/cancel":
+        pending_admin_search_user.discard(message.from_user.id)
+        bot.send_message(message.chat.id, "❌ Search cancelled.")
+        return
+        
+    pending_admin_search_user.discard(message.from_user.id)
+    bot.send_message(message.chat.id, "🔍 Searching...")
+    
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if query.isdigit():
+                c.execute("""
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.user_id = %s
+                    GROUP BY u.user_id
+                """, (int(query),))
+            else:
+                clean_query = query.replace('@', '')
+                c.execute("""
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.username ILIKE %s
+                    GROUP BY u.user_id
+                    LIMIT 20
+                """, (f"%{clean_query}%",))
+            rows = c.fetchall()
+            
+    if not rows:
+        bot.send_message(message.chat.id, "❌ No users found matching your query.")
+        return
+        
+    import time
+    now = int(time.time())
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    for row in rows:
+        uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
+        if last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            status = f"🟢 {time_left // 3600}h" if time_left > 0 else "🔴"
+        else:
+            status = "🔴"
+            
+        display_name = f"@{fallback}" if fallback else f"ID:{uid}"
+        btn_text = f"{display_name} | {status} | 📸 {media}"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:0:all"))
+        
+    markup.add(InlineKeyboardButton("🔙 Back to Panel", callback_data="panel_users"))
+    bot.send_message(message.chat.id, f"🔍 Search Results for `{query}`:", parse_mode="Markdown", reply_markup=markup)
+
+
 @bot.message_handler(
     func=lambda m: m.chat.id in (
-        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast | pending_admin_setcaption | pending_admin_setwelcome | pending_admin_setinactive | pending_admin_addforward
-    ),
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast | pending_admin_setcaption | pending_admin_setwelcome | pending_admin_setinactive | pending_admin_setcontact | pending_admin_addforward
+    ) or m.chat.id in pending_admin_msg_target or m.chat.id in pending_admin_set_note,
     content_types=['text', 'photo', 'video', 'document', 'audio', 'voice']
 )
 def handle_admin_pending_inputs(message):
@@ -2280,6 +2507,7 @@ def handle_admin_pending_inputs(message):
         pending_admin_setcaption.discard(message.chat.id)
         pending_admin_setwelcome.discard(message.chat.id)
         pending_admin_setinactive.discard(message.chat.id)
+        pending_admin_setcontact.discard(message.chat.id)
         pending_admin_addforward.discard(message.chat.id)
         return
 
@@ -2376,6 +2604,20 @@ def handle_admin_pending_inputs(message):
         pending_admin_setwelcome.discard(message.chat.id)
         return
 
+    if message.chat.id in pending_admin_setcontact:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Set contact message cancelled.")
+            pending_admin_setcontact.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Text cannot be empty.")
+            return
+        val = "" if text.lower() == 'none' else text
+        set_contact_message(val)
+        bot.send_message(message.chat.id, "✅ Contact info updated.")
+        pending_admin_setcontact.discard(message.chat.id)
+        return
+
     if message.chat.id in pending_admin_setinactive:
         if text.lower() == "/cancel":
             bot.send_message(message.chat.id, "Set inactive message cancelled.")
@@ -2388,6 +2630,29 @@ def handle_admin_pending_inputs(message):
         set_inactive_message(val)
         bot.send_message(message.chat.id, "✅ Inactive message updated.")
         pending_admin_setinactive.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_msg_target:
+        uid = pending_admin_msg_target.pop(message.chat.id)
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Message cancelled.")
+            return
+        try:
+            bot.send_message(uid, f"📩 *Message from Admin:*\n\n{text}", parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"✅ Message sent to `{uid}`.")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
+        return
+
+    if message.chat.id in pending_admin_set_note:
+        uid = pending_admin_set_note.pop(message.chat.id)
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Note update cancelled.")
+            return
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE users SET admin_notes = %s WHERE user_id = %s", (text, uid))
+        bot.send_message(message.chat.id, f"✅ Note updated for user `{uid}`.")
         return
 
     if message.chat.id in pending_admin_addforward:
@@ -2819,10 +3084,13 @@ def _panel_users_markup():
     )
     markup.add(
         InlineKeyboardButton("🔍 Search User", callback_data="admin_search_user"),
-        InlineKeyboardButton("🏆 Leaderboard", callback_data="admin_leaderboard"),
+        InlineKeyboardButton("🏆 Leaderboards", callback_data="admin_leaderboards_menu")
     )
     markup.add(
         InlineKeyboardButton("⏳ Set Limit", callback_data="admin_setlimit"),
+        InlineKeyboardButton("🎁 Set Grace", callback_data="admin_setgrace")
+    )
+    markup.add(
         InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned")
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
@@ -2846,6 +3114,20 @@ def _panel_moderation_markup():
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
     return markup
 
+
+@bot.message_handler(commands=['contact', 'admininfo'])
+def contact_command(message):
+    bot.send_message(message.chat.id, get_contact_message())
+
+@bot.message_handler(commands=['setcontact'])
+def set_contact_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    pending_admin_setcontact.add(message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        "✉️ Send the new contact/admin info message text. Type /cancel to abort.\nType 'none' to remove it."
+    )
 
 @bot.message_handler(commands=['setinactivemsg'])
 def set_inactive_message_cmd(message):
@@ -2931,6 +3213,10 @@ def set_limit_command(message):
         bot.send_message(message.chat.id, "❌ Limit must be at least 1 hour.")
         return
         
+    import time
+    now = int(time.time())
+    new_limit_seconds = hours * 3600
+
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -2940,8 +3226,42 @@ def set_limit_command(message):
                 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
                 """, (str(hours),)
             )
+            c.execute(
+                """
+                UPDATE users
+                SET auto_banned = FALSE
+                WHERE auto_banned = TRUE
+                  AND last_activation_time IS NOT NULL
+                  AND last_activation_time >= %s
+                """, (now - new_limit_seconds,)
+            )
+            unbanned_count = c.rowcount
             
-    bot.send_message(message.chat.id, f"✅ Inactivity limit updated to {hours} hours.")
+    revived_msg = f"\n\n♻️ Automatically revived {unbanned_count} users who fell back into the new active time window!" if unbanned_count > 0 else ""
+    bot.send_message(message.chat.id, f"✅ Inactivity limit updated to {hours} hours.{revived_msg}")
+
+
+@bot.message_handler(commands=['setgrace'])
+def set_grace_command(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: /setgrace <hours>\n(Set to 0 to require 12 media immediately)")
+        return
+    
+    hours = int(parts[1])
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('new_user_grace_hours', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """, (str(hours),)
+            )
+            
+    bot.send_message(message.chat.id, f"✅ New user grace period updated to {hours} hours.")
 
 
 @bot.message_handler(commands=['stats'])
@@ -2995,23 +3315,27 @@ def stats_command(message):
             map_count = c.fetchone()[0]
             c.execute("SELECT COALESCE(SUM(duplicate_count), 0) FROM media_duplicates")
             duplicate_total = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM users WHERE total_media_sent = 0")
+            zero_media_users = c.fetchone()[0]
     join_status = "OPEN" if is_join_open() else "CLOSED"
 
     bot.send_message(
         message.chat.id,
         f"""
-📊 BOT STATS
+💎 *BOT STATISTICS* 💎
 
-👥 Total: {total}
-🟢 Active: {active}
-🔴 Inactive: {inactive}
-⏳ Activity Limit: {get_inactivity_limit() // 3600} hours
-🚫 Banned: {banned}
-⭐ Whitelisted: {whitelisted}
-♻ Duplicate Media: {duplicate_total}
-📦 Message Map Rows: {map_count}
-🚪 Join: {join_status}
-        """
+👥 *Total Users:* {total}
+🟢 *Active Users:* {active}
+⏳ *Inactive:* {inactive}
+⏰ *Activity Window:* {get_inactivity_limit() // 3600}h
+🚫 *Banned:* {banned}
+🌟 *VIP / Whitelist:* {whitelisted}
+🆕 *0-Media Users:* {zero_media_users}
+♻️ *Duplicates Prevented:* {duplicate_total}
+📂 *Mapped Messages:* {map_count}
+🚪 *Join Status:* {join_status}
+        """,
+        parse_mode="Markdown"
     )
 @bot.message_handler(commands=['info'])
 def info_command(message):
@@ -3579,6 +3903,9 @@ def admin_menu(message):
 ⏳ /setlimit HOURS  
 → Set inactivity limit (hours)
 
+🎁 /setgrace HOURS  
+→ Set new user grace period (0 = none)
+
 🔎 /info USER_ID  
 → View user details
 
@@ -3712,9 +4039,23 @@ def panel_navigation_callbacks(call):
 
     if call.data == "panel_users":
         bot.answer_callback_query(call.id)
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT COUNT(*) FROM users")
+                total_users = c.fetchone()[0]
+                c.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL")
+                invited_users = c.fetchone()[0]
+
+        panel_text = (
+            "👥 *Users Panel*\n\n"
+            f"📈 *Total Users:* `{total_users}`\n"
+            f"✉️ *Invited Users:* `{invited_users}`\n\n"
+            "Manage all users, view activity, or check the leaderboard."
+        )
+        
         _panel_send_or_edit(
             call.message.chat.id,
-            "👥 *Users Panel*",
+            panel_text,
             _panel_users_markup(),
             message_id=call.message.message_id,
         )
@@ -4022,11 +4363,12 @@ def admin_callbacks(call):
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id)
+                    SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
+                           u.first_name, u.last_name, u.admin_notes, u.reputation
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.user_id = %s
-                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation
                 """, (uid,))
                 row = c.fetchone()
         
@@ -4034,7 +4376,7 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "User not found.", show_alert=True)
             return
             
-        username, joined_at, last_active, media, refs = row
+        username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation = row
         import datetime, time
         now = int(time.time())
         joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
@@ -4045,13 +4387,34 @@ def admin_callbacks(call):
             time_left = max(0, get_inactivity_limit() - time_passed)
             status_str = f"{time_left // 3600}h {(time_left % 3600) // 60}m remaining" if time_left > 0 else "Inactive"
             
-        text = f"👤 *@{username}*\n🆔 ID: `{uid}`\n📅 Joined: {joined_str}\n⏱ Status: {status_str}\n📸 Total Uploads: {media}\n🎁 Referrals: {refs}"
+        rep_emoji = {"Trusted": "🟢", "Neutral": "⚪", "Suspicious": "🟡", "Scammer": "🔴"}.get(reputation, "⚪")
+        full_name = f"{first_name or ''} {last_name or ''}".strip() or "Not set"
+        
+        text = (
+            f"👤 *@{username}*\n"
+            f"📛 *Name:* {full_name}\n"
+            f"🆔 ID: `{uid}`\n"
+            f"🏷 *Reputation:* {rep_emoji} {reputation}\n"
+            f"📅 Joined: {joined_str}\n"
+            f"⏱ Status: {status_str}\n"
+            f"📸 Total Uploads: {media}\n"
+            f"🎁 Referrals: {refs}\n\n"
+            f"📝 *Admin Notes:* {notes or 'No notes yet.'}"
+        )
         
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
             InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{uid}"),
             InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{uid}")
         )
+        markup.add(
+            InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}"),
+            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}")
+        )
+        
+        if username and username != "None" and username != "admin":
+            markup.add(InlineKeyboardButton("🌐 Profile Link", url=f"t.me/{username}"))
+
         markup.add(
             InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}"),
             InlineKeyboardButton("🔙 Back to List", callback_data=f"admin_userlist:{page}:{filter_type}")
@@ -4075,10 +4438,41 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "🚫 User Banned!", show_alert=True)
         return
 
+    elif data.startswith("admin_show_reps:"):
+        uid = int(data.split(":")[1])
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🟢 Trusted", callback_data=f"admin_set_rep:{uid}:Trusted"),
+            InlineKeyboardButton("⚪ Neutral", callback_data=f"admin_set_rep:{uid}:Neutral")
+        )
+        markup.add(
+            InlineKeyboardButton("🟡 Suspicious", callback_data=f"admin_set_rep:{uid}:Suspicious"),
+            InlineKeyboardButton("🔴 Scammer", callback_data=f"admin_set_rep:{uid}:Scammer")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_info:{uid}"))
+        bot.edit_message_text("Select user reputation label:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("admin_set_rep:"):
+        _, _, uid, label = data.split(":")
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE users SET reputation = %s WHERE user_id = %s", (label, int(uid)))
+        bot.answer_callback_query(call.id, f"Reputation set to {label}")
+        return
+
+    elif data.startswith("admin_start_note:"):
+        uid = int(data.split(":")[1])
+        pending_admin_set_note[call.from_user.id] = uid
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "📝 Send the private note for this user:\n(Type /cancel to abort)")
+        return
+
     elif data.startswith("admin_msg_user:"):
         uid = int(data.split(":")[1])
-        bot.send_message(call.from_user.id, f"📝 To message this user directly, use:\n`/msg {uid} Your Message Here`", parse_mode="Markdown")
+        pending_admin_msg_target[call.from_user.id] = uid
         bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "✉️ Send the message you want to deliver to this user:\n(Type /cancel to abort)")
         return
 
     elif data.startswith("admin_view_files:"):
@@ -4086,12 +4480,12 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Fetching files...")
         with get_connection() as conn:
             with conn.cursor() as c:
-                c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s LIMIT 5", (uid,))
+                c.execute("SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s ORDER BY created_at DESC LIMIT 15", (uid,))
                 files = c.fetchall()
         if not files:
             bot.send_message(call.message.chat.id, "❌ No files found for this user.")
         else:
-            bot.send_message(call.message.chat.id, f"📂 Showing up to 5 recently tracked files for `{uid}`:")
+            bot.send_message(call.message.chat.id, f"📂 Showing up to 15 recently tracked files for `{uid}`:")
             for rec_id, msg_id in files:
                 try:
                     bot.forward_message(call.message.chat.id, rec_id, msg_id)
@@ -4105,16 +4499,33 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id)
         return
 
+    elif data == "admin_setgrace":
+        curr = get_new_user_grace_hours()
+        bot.send_message(call.message.chat.id, f"🎁 The current new user grace period is *{curr} hours*.\n\nTo change it, type:\n`/setgrace HOURS`\n\nSet to 0 to make users send 12 media immediately upon joining.", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    elif data == "admin_leaderboards_menu":
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🏆 Referral Leaderboard", callback_data="admin_leaderboard"),
+            InlineKeyboardButton("📸 Upload Leaderboard", callback_data="admin_uploader_leaderboard"),
+            InlineKeyboardButton("🔙 Back to Users", callback_data="panel_users")
+        )
+        bot.edit_message_text("🏆 *Select Leaderboard Type*", call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        return
+
     elif data == "admin_leaderboard":
-        bot.send_message(call.message.chat.id, "🔄 Fetching leaderboard...")
+        bot.answer_callback_query(call.id, "Fetching leaderboard...")
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    SELECT u.user_id, u.username, COUNT(r.user_id) as refs
+                    SELECT u.user_id, u.username, u.first_name, u.last_name, COUNT(r.user_id) as refs
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
-                    WHERE u.username IS NOT NULL
-                    GROUP BY u.user_id, u.username
+                    WHERE u.username IS NOT NULL OR u.first_name IS NOT NULL
+                    GROUP BY u.user_id, u.username, u.first_name, u.last_name
                     HAVING COUNT(r.user_id) > 0
                     ORDER BY refs DESC
                     LIMIT 20
@@ -4124,23 +4535,60 @@ def admin_callbacks(call):
         if rows:
             lines = ["🏆 *Top Referrers Leaderboard*", ""]
             for i, row in enumerate(rows, 1):
-                uid, fallback, refs = row[0], row[1], row[2]
-                display_name = f"@{fallback}"
-                try:
-                    chat = bot.get_chat(uid)
-                    if chat.username:
-                        display_name = f"@{chat.username}"
-                    else:
-                        full = f"{chat.first_name or ''} {chat.last_name or ''}".strip()
-                        if full: display_name = full
-                except Exception:
-                    pass
-                lines.append(f"{i}. {display_name} - {refs} invites")
+                uid, username, fname, lname, refs = row
+                
+                if username:
+                    display_name = f"@{escape_markdown(username)}"
+                else:
+                    full = f"{fname or ''} {lname or ''}".strip()
+                    display_name = escape_markdown(full) or f"User {uid}"
+                    
+                lines.append(f"{i}. {display_name} - *{refs}* invites")
             text = "\n".join(lines)
         else:
             text = "No referrals yet."
             
-        bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 Back to Leaderboards", callback_data="admin_leaderboards_menu"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    elif data == "admin_uploader_leaderboard":
+        bot.answer_callback_query(call.id, "Fetching upload leaderboard...")
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("""
+                        SELECT user_id, username, first_name, last_name, total_media_sent
+                        FROM users
+                        WHERE total_media_sent IS NOT NULL AND total_media_sent > 0
+                        ORDER BY total_media_sent DESC
+                        LIMIT 20
+                    """)
+                    rows = c.fetchall()
+            
+            if rows:
+                lines = ["📸 *Top Uploaders Leaderboard*", ""]
+                for i, row in enumerate(rows, 1):
+                    uid, username, fname, lname, uploads = row
+                    
+                    if username:
+                        display_name = f"@{escape_markdown(username)}"
+                    else:
+                        full = f"{fname or ''} {lname or ''}".strip()
+                        display_name = escape_markdown(full) or f"User {uid}"
+                        
+                    lines.append(f"{i}. {display_name} - *{uploads}* uploads")
+                text = "\n".join(lines)
+            else:
+                text = "No uploads yet."
+                
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Leaderboards", callback_data="admin_leaderboards_menu"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Error loading uploader leaderboard: {e}")
+        return
 
     elif data == "admin_export_recovery":
         payload = export_recovery_payload()
@@ -4162,66 +4610,7 @@ def admin_callbacks(call):
     bot.answer_callback_query(call.id)
 
 
-@bot.message_handler(func=lambda m: m.from_user.id in pending_admin_search_user)
-def handle_admin_search_user(message):
-    if not is_admin(message.chat.id):
-        pending_admin_search_user.discard(message.from_user.id)
-        return
-        
-    query = message.text.strip()
-    if query.lower() == "/cancel":
-        pending_admin_search_user.discard(message.from_user.id)
-        bot.send_message(message.chat.id, "❌ Search cancelled.")
-        return
-        
-    pending_admin_search_user.discard(message.from_user.id)
-    bot.send_message(message.chat.id, "🔍 Searching...")
-    
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            if query.isdigit():
-                c.execute("""
-                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
-                    FROM users u
-                    LEFT JOIN users r ON r.referred_by = u.user_id
-                    WHERE u.user_id = %s
-                    GROUP BY u.user_id
-                """, (int(query),))
-            else:
-                clean_query = query.replace('@', '')
-                c.execute("""
-                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
-                    FROM users u
-                    LEFT JOIN users r ON r.referred_by = u.user_id
-                    WHERE u.username ILIKE %s
-                    GROUP BY u.user_id
-                    LIMIT 20
-                """, (f"%{clean_query}%",))
-            rows = c.fetchall()
-            
-    if not rows:
-        bot.send_message(message.chat.id, "❌ No users found matching your query.")
-        return
-        
-    import time
-    now = int(time.time())
-    markup = InlineKeyboardMarkup(row_width=1)
-    
-    for row in rows:
-        uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
-        if last_active:
-            time_passed = now - last_active
-            time_left = max(0, get_inactivity_limit() - time_passed)
-            status = f"🟢 {time_left // 3600}h" if time_left > 0 else "🔴"
-        else:
-            status = "🔴"
-            
-        display_name = f"@{fallback}" if fallback else f"ID:{uid}"
-        btn_text = f"{display_name} | {status} | 📸 {media}"
-        markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:0:all"))
-        
-    markup.add(InlineKeyboardButton("🔙 Back to Panel", callback_data="panel_users"))
-    bot.send_message(message.chat.id, f"🔍 Search Results for `{query}`:", parse_mode="Markdown", reply_markup=markup)
+
 
 
 @bot.message_handler(commands=['msg'])
@@ -4320,21 +4709,28 @@ def menu_command(message):
             c.execute("SELECT COUNT(*) FROM users WHERE referred_by=%s", (user_id,))
             invites = c.fetchone()[0]
             
-            c.execute("SELECT last_activation_time FROM users WHERE user_id=%s", (user_id,))
+            c.execute("SELECT last_activation_time, joined_at, total_media_sent, username FROM users WHERE user_id=%s", (user_id,))
             row = c.fetchone()
             
-    if row and row[0]:
-        last_act = row[0]
-        time_left = max(0, (last_act + get_inactivity_limit()) - now)
+    if row:
+        last_act, joined_at, total_media_sent, db_username = row
+        time_left = max(0, (last_act + get_inactivity_limit()) - now) if last_act else 0
     else:
-        time_left = 0
+        joined_at, total_media_sent, db_username, time_left = None, 0, None, 0
 
     hours = time_left // 3600
     minutes = (time_left % 3600) // 60
     
+    import datetime
+    join_date_str = datetime.datetime.fromtimestamp(joined_at).strftime('%Y-%m-%d %H:%M') if joined_at else "N/A"
+    display_name = f"@{db_username}" if db_username else (message.from_user.username or message.from_user.first_name)
+
     bot.send_message(
         user_id,
         f"📊 *Your Dashboard*\n\n"
+        f"👤 *User:* {display_name}\n"
+        f"📅 *Joined:* {join_date_str}\n"
+        f"📸 *Media Shared:* {total_media_sent}\n"
         f"👥 *Users Invited:* {invites}\n"
         f"⏳ *Activity Time Left:* {hours}h {minutes}m\n\n"
         f"Use /referral to get your invite link and earn more time (1 invite = +1 hour)!",
