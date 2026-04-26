@@ -4053,13 +4053,26 @@ def check_join_callback(call):
 def handle_join_request(request):
     user_id = request.from_user.id
     chat_id = str(request.chat.id)
+    username = f"@{request.chat.username}" if request.chat.username else None
+    
     with get_connection() as conn:
         with conn.cursor() as c:
+            # Always store by numeric ID
             c.execute("""
                 INSERT INTO pending_join_requests(user_id, chat_id)
                 VALUES(%s, %s)
                 ON CONFLICT (user_id, chat_id) DO NOTHING
             """, (user_id, chat_id))
+            
+            # Also store by username if the channel has one (helps with matching)
+            if username:
+                c.execute("""
+                    INSERT INTO pending_join_requests(user_id, chat_id)
+                    VALUES(%s, %s)
+                    ON CONFLICT (user_id, chat_id) DO NOTHING
+                """, (user_id, username))
+    
+    print(f"Recorded join request from {user_id} for {chat_id} ({username or 'private'})")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "noop")
@@ -4163,12 +4176,46 @@ def panel_navigation_callbacks(call):
 
 @bot.callback_query_handler(func=lambda call: call.data in {
     "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status", "fw_edit_msg"
-})
+} or call.data.startswith("fw_view:") or call.data.startswith("fw_del:"))
 def firewall_ui_callbacks(call):
     actor_id = call.from_user.id
     admin_chat_id = call.message.chat.id
     if not is_admin(actor_id):
         bot.answer_callback_query(call.id, "Not admin.")
+        return
+
+    data = call.data
+
+    if data.startswith("fw_view:"):
+        target_id = data.split(":", 1)[1]
+        channels = get_force_join_channels()
+        target = next((ch for ch in channels if ch['chat_id'] == target_id), None)
+        
+        if not target:
+            bot.answer_callback_query(call.id, "Channel not found.")
+            return
+
+        bot.answer_callback_query(call.id)
+        text = (
+            f"📡 *Channel Details*\n\n"
+            f"📛 *Name:* {target['name']}\n"
+            f"🆔 *Chat ID:* `{target['chat_id']}`\n"
+            f"🔗 *Link:* {target['invite_link'] or 'Auto'}"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🗑 Remove Channel", callback_data=f"fw_del:{target_id}"))
+        markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="fw_status"))
+        
+        bot.edit_message_text(text, admin_chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    if data.startswith("fw_del:"):
+        target_id = data.split(":", 1)[1]
+        remove_force_channel(target_id)
+        bot.answer_callback_query(call.id, "✅ Channel removed.")
+        # Go back to status list
+        call.data = "fw_status"
+        firewall_ui_callbacks(call)
         return
 
     if call.data == "fw_on":
@@ -4217,12 +4264,31 @@ def firewall_ui_callbacks(call):
     if call.data == "fw_status":
         enabled = is_force_join_enabled()
         channels = get_force_join_channels()
-        channels_text = "\n".join(f"• {ch['name']}" for ch in channels) if channels else "None"
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        for ch in channels:
+            markup.add(InlineKeyboardButton(f"📡 {ch['name']}", callback_data=f"fw_view:{ch['chat_id']}"))
+        
+        markup.add(InlineKeyboardButton("🔙 Back to Firewall", callback_data="panel_firewall"))
+        
+        status_txt = "🟢 ON" if enabled else "🔴 OFF"
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            admin_chat_id,
-            f"🧱 FIREWALL STATUS\n\nStatus: {'ON ✅' if enabled else 'OFF ❌'}\n\nChannels:\n{channels_text}",
-        )
+        
+        try:
+            bot.edit_message_text(
+                f"🧱 *Firewall Status:* {status_txt}\n\nSelect a channel below to view details or remove it:",
+                chat_id=admin_chat_id,
+                message_id=call.message.message_id,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            bot.send_message(
+                admin_chat_id,
+                f"🧱 *Firewall Status:* {status_txt}\n\nSelect a channel below to view details or remove it:",
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
         return
 
     if call.data == "fw_edit_msg":
