@@ -26,7 +26,9 @@ REFERRAL_BONUS = 2
 
 upload_batches = {}
 upload_lock = threading.Lock()
-admin_active_category = {}
+admin_active_category = {}   # admin_id → cat_id
+admin_content_type = {}      # admin_id → 'text' | 'gif_sticker' | 'media'
+admin_session_msg = {}       # admin_id → (chat_id, message_id) of the live upload session msg
 
 # ================= Database =================
 # Connection pool for thread-safe PostgreSQL access
@@ -63,7 +65,8 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 name TEXT UNIQUE,
                 req_referrals INTEGER DEFAULT 0,
-                is_hidden INTEGER DEFAULT 0
+                is_hidden INTEGER DEFAULT 0,
+                content_type TEXT DEFAULT 'media'
             )
         ''')
         cursor.execute('''
@@ -72,7 +75,8 @@ def init_db():
                 file_id TEXT,
                 media_type TEXT,
                 file_unique_id TEXT,
-                category_id INTEGER REFERENCES categories(id)
+                category_id INTEGER REFERENCES categories(id),
+                content TEXT
             )
         ''')
         cursor.execute('''
@@ -84,16 +88,24 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-        
-        # Ensure default settings
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Safe migrations for existing deployments
+        cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS content_type TEXT DEFAULT 'media'")
+        cursor.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS content TEXT")
+
         cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
         cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("Enjoy this from {cat_name}! 🍿\nRemaining points: {points}",))
 
-        # Seed Default Category
         cursor.execute("SELECT id FROM categories LIMIT 1")
         if not cursor.fetchone():
             cursor.execute("INSERT INTO categories (name) VALUES (%s)", ('📺 Watch Media',))
-            
+
         conn.commit()
     finally:
         release_db(conn)
@@ -376,6 +388,36 @@ def get_stats():
         return users_count, media_count, int(ts) if ts else 0
     finally: release_db(conn)
 
+def set_category_content_type(cat_id, content_type):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE categories SET content_type = %s WHERE id = %s", (content_type, cat_id))
+        conn.commit()
+    finally: release_db(conn)
+
+def get_category_content_type(cat_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT content_type FROM categories WHERE id = %s", (cat_id,))
+        res = cursor.fetchone()
+        return res[0] if res else 'media'
+    finally: release_db(conn)
+
+def add_text_content(text_content, category_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO media (media_type, category_id, content) VALUES ('text', %s, %s) RETURNING id",
+            (category_id, text_content)
+        )
+        media_id = cursor.fetchone()[0]
+        conn.commit()
+        return media_id
+    finally: release_db(conn)
+
 
 # ================= UI & Keyboards =================
 def get_main_keyboard(admin=False):
@@ -391,7 +433,7 @@ def get_main_keyboard(admin=False):
         markup.add(KeyboardButton("👑 Admin Panel"))
     return markup
 
-def get_admin_panel_markup():
+def get_admin_panel_markup(user_id=None):
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"))
     markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"), 
@@ -399,6 +441,9 @@ def get_admin_panel_markup():
     markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
                InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
     markup.add(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"))
+    # Only super-admins see the Manage Admins button
+    if user_id and is_super_admin(user_id):
+        markup.add(InlineKeyboardButton("👥 Manage Admins", callback_data="admin_manage_admins"))
     return markup
 
 def generate_divisions_markup(cat_id):
@@ -469,8 +514,51 @@ if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-def is_admin(user_id):
+def is_super_admin(user_id):
+    """Super admins: only those set via the ADMIN_IDS environment variable."""
     return user_id in ADMIN_IDS
+
+def is_admin(user_id):
+    """Full admins: super admins + sub-admins added via /addadmin."""
+    if user_id in ADMIN_IDS:
+        return True
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM bot_admins WHERE user_id = %s", (user_id,))
+        return cursor.fetchone() is not None
+    except: return False
+    finally: release_db(conn)
+
+def add_admin_db(user_id, added_by):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO bot_admins (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (user_id, added_by)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except: return False
+    finally: release_db(conn)
+
+def remove_admin_db(user_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM bot_admins WHERE user_id = %s", (user_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally: release_db(conn)
+
+def get_all_admins_db():
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, added_at FROM bot_admins ORDER BY added_at DESC")
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 # ================= Primary Handlers =================
 @bot.message_handler(commands=['start'])
@@ -523,15 +611,66 @@ def flush_upload_batch(chat_id):
                 else: bot.send_message(chat_id, f"✅ Added {saved} media item(s) to *{cat_name}*!", parse_mode="Markdown")
             except: pass
 
+def _build_session_text(cat_id, cat_name, ctype):
+    """Build the live upload session message text."""
+    count = get_cat_stats(cat_id)
+    type_labels = {'text': '📝 Text', 'gif_sticker': '🎬 GIF & Stickers', 'media': '🖼️ Photo / Video / Document'}
+    type_label = type_labels.get(ctype, ctype)
+    type_instructions = {
+        'text': 'Send any text messages to add them to this category.',
+        'gif_sticker': 'Send GIFs or Stickers to add them to this category.',
+        'media': 'Send photos, videos, or documents to add them to this category.',
+    }
+    instruction = type_instructions.get(ctype, '')
+    return (
+        f"📂 **Upload Session Active**\n\n"
+        f"🏷️ Category: **{cat_name}**\n"
+        f"📦 Type: **{type_label}**\n"
+        f"📄 Items in category: **{count}**\n\n"
+        f"ℹ️ {instruction}\n\n"
+        f"Press **✅ Done** when finished, or **🔙 Back** to change category."
+    )
+
+def _build_session_markup(cat_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Done", callback_data=f"upload_done_{cat_id}"),
+        InlineKeyboardButton("🔙 Back", callback_data="admin_setcat")
+    )
+    return markup
+
+def _update_session_message(admin_id):
+    """Edit the live session message to reflect the current item count."""
+    info = admin_session_msg.get(admin_id)
+    if not info: return
+    chat_id, msg_id = info
+    cat_id = admin_active_category.get(admin_id)
+    ctype = admin_content_type.get(admin_id, 'media')
+    if not cat_id: return
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+    try:
+        bot.edit_message_text(
+            _build_session_text(cat_id, cat_name, ctype),
+            chat_id, msg_id,
+            reply_markup=_build_session_markup(cat_id),
+            parse_mode="Markdown"
+        )
+    except: pass
+
 @bot.message_handler(content_types=['photo', 'video', 'document'])
 def handle_media_upload(message):
     if not is_admin(message.from_user.id): return
-        
-    active_cat_id = admin_active_category.get(message.from_user.id)
-    if not active_cat_id:
-        bot.reply_to(message, "❌ **Upload Rejected** \nYou must set an Active Upload Category first via the Admin Panel.", parse_mode="Markdown")
+    admin_id = message.from_user.id
+    active_cat_id = admin_active_category.get(admin_id)
+    if not active_cat_id: return  # no active session, silently ignore
+
+    # Enforce content type
+    ctype = admin_content_type.get(admin_id, 'media')
+    if ctype != 'media':
+        bot.reply_to(message, f"❌ This category only accepts **{'text' if ctype == 'text' else 'GIF & Stickers'}** content.", parse_mode="Markdown")
         return
-        
+
     if message.photo:
         file_id = message.photo[-1].file_id
         file_unique_id = message.photo[-1].file_unique_id
@@ -545,22 +684,38 @@ def handle_media_upload(message):
         file_unique_id = message.document.file_unique_id
         media_type = 'document'
     else: return
-        
-    with upload_lock:
-        if message.chat.id not in upload_batches:
-            cats = get_categories()
-            cat_name = next((c[1] for c in cats if c[0] == active_cat_id), "Unknown")
-            upload_batches[message.chat.id] = {'saved': 0, 'dupes': 0, 'timer': None, 'cat_name': cat_name}
-        
-        batch = upload_batches[message.chat.id]
-        if check_duplicate_media(file_unique_id): batch['dupes'] += 1
-        else:
-            add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
-            batch['saved'] += 1
-            
-        if batch['timer']: batch['timer'].cancel()
-        batch['timer'] = threading.Timer(1.5, flush_upload_batch, args=(message.chat.id,))
-        batch['timer'].start()
+
+    if check_duplicate_media(file_unique_id):
+        bot.react(message.chat.id, message.message_id) if False else None  # skip dupe silently
+        return
+    add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
+    _update_session_message(admin_id)
+
+@bot.message_handler(content_types=['animation', 'sticker'])
+def handle_gif_sticker_upload(message):
+    if not is_admin(message.from_user.id): return
+    admin_id = message.from_user.id
+    active_cat_id = admin_active_category.get(admin_id)
+    if not active_cat_id: return
+
+    ctype = admin_content_type.get(admin_id, 'media')
+    if ctype != 'gif_sticker':
+        bot.reply_to(message, "❌ This category does not accept GIFs or Stickers.", parse_mode="Markdown")
+        return
+
+    if message.animation:
+        file_id = message.animation.file_id
+        file_unique_id = message.animation.file_unique_id
+        media_type = 'animation'
+    elif message.sticker:
+        file_id = message.sticker.file_id
+        file_unique_id = message.sticker.file_unique_id
+        media_type = 'sticker'
+    else: return
+
+    if check_duplicate_media(file_unique_id): return
+    add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
+    _update_session_message(admin_id)
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
@@ -581,9 +736,18 @@ def handle_text(message):
         return
         
     if text == "👑 Admin Panel" and admin_mode:
-        bot.reply_to(message, "👑 **Admin Control Panel**\nSelect an operation below:", reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
+        bot.reply_to(message, "👑 **Admin Control Panel**\nSelect an operation below:", reply_markup=get_admin_panel_markup(user_id), parse_mode="Markdown")
         return
-        
+
+    # 📝 Text upload during active session
+    if admin_mode and text and not text.startswith('/'):
+        active_cat_id = admin_active_category.get(user_id)
+        ctype = admin_content_type.get(user_id)
+        if active_cat_id and ctype == 'text':
+            add_text_content(text, active_cat_id)
+            _update_session_message(user_id)
+            return
+
     # Check if text targets a Media Category dynamically
     categories = get_categories()
     for cat_id, cat_name, cat_hidden in categories:
@@ -859,10 +1023,74 @@ def cb_setactive(call):
     cat_id = int(call.data.split('_')[1])
     cats = get_categories()
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
-    
-    admin_active_category[call.from_user.id] = cat_id
-    bot.edit_message_text(f"✅ **Active Category Set: {cat_name}**\n\nFeel free to forward bulk media to the bot now. It will instantly be cataloged under {cat_name}.", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
+
+    # Ask for content type
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
+        InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
+        InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
+        InlineKeyboardButton("🔙 Back",                         callback_data="admin_setcat")
+    )
+    bot.edit_message_text(
+        f"🏷️ **Category: {cat_name}**\n\nWhat type of content do you want to upload?",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=markup, parse_mode="Markdown"
+    )
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_ctype_"))
+def cb_set_content_type(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    parts = call.data.split('_', 3)  # set_ctype_{cat_id}_{type}
+    cat_id = int(parts[2])
+    ctype = parts[3]  # 'media', 'gif_sticker', or 'text'
+
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+
+    # Save the category content type to DB
+    set_category_content_type(cat_id, ctype)
+
+    # Set admin session state
+    admin_active_category[call.from_user.id] = cat_id
+    admin_content_type[call.from_user.id] = ctype
+
+    # Send the persistent upload session message
+    bot.answer_callback_query(call.id, "✅ Upload session started!")
+    sent = bot.send_message(
+        call.message.chat.id,
+        _build_session_text(cat_id, cat_name, ctype),
+        reply_markup=_build_session_markup(cat_id),
+        parse_mode="Markdown"
+    )
+    admin_session_msg[call.from_user.id] = (call.message.chat.id, sent.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("upload_done_"))
+def cb_upload_done(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    admin_id = call.from_user.id
+    cat_id = int(call.data.split('_')[2])
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+    count = get_cat_stats(cat_id)
+
+    # Clear session
+    admin_active_category.pop(admin_id, None)
+    admin_content_type.pop(admin_id, None)
+    admin_session_msg.pop(admin_id, None)
+
+    bot.edit_message_text(
+        f"✅ **Upload session ended.**\n\n"
+        f"🏷️ Category: **{cat_name}**\n"
+        f"📆 Total items now: **{count}**",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel_back")
+        ),
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, f"✅ Done! {count} items in {cat_name}.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
 def cb_admin_limits(call):
@@ -889,7 +1117,7 @@ def cb_manage_req(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
-    bot.edit_message_text("👑 **Admin Control Panel**\nSelect an operation below:", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
+    bot.edit_message_text("👑 **Admin Control Panel**\nSelect an operation below:", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="Markdown")
     bot.answer_callback_query(call.id)
 
 # --- Media Management via Categories ---
@@ -1107,6 +1335,110 @@ def handle_search(message):
         reply_markup=markup,
         parse_mode="Markdown"
     )
+
+# ================= Admin Management =================
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_manage_admins")
+def cb_manage_admins(call):
+    if not is_super_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id, "⛔ Only super admins can manage admins.", show_alert=True)
+    
+    sub_admins = get_all_admins_db()
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    text = "👥 **Admin Management**\n\n"
+    text += f"🔒 **Super Admins** (from environment):\n"
+    for sa_id in ADMIN_IDS:
+        text += f"• `{sa_id}`\n"
+    text += f"\n👤 **Sub-Admins** ({len(sub_admins)} added):\n"
+    
+    if sub_admins:
+        for sa_id, added_at in sub_admins:
+            text += f"• `{sa_id}` — added {str(added_at)[:10]}\n"
+            markup.add(InlineKeyboardButton(f"🚫 Remove {sa_id}", callback_data=f"removeadmin_confirm_{sa_id}"))
+    else:
+        text += "_No sub-admins added yet._\n"
+    
+    text += "\nℹ️ Use `/addadmin <user_id>` to add a new admin."
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("removeadmin_confirm_"))
+def cb_removeadmin_confirm(call):
+    if not is_super_admin(call.from_user.id):
+        return bot.answer_callback_query(call.id, "⛔ Unauthorized", show_alert=True)
+    target_uid = int(call.data.split('_')[2])
+    if is_super_admin(target_uid):
+        return bot.answer_callback_query(call.id, "⛔ Cannot remove a super admin.", show_alert=True)
+    remove_admin_db(target_uid)
+    bot.answer_callback_query(call.id, f"✅ Admin {target_uid} removed.")
+    cb_manage_admins(call)
+
+@bot.message_handler(commands=['addadmin'])
+def handle_addadmin(message):
+    """Super-admin only. Usage: /addadmin <user_id>"""
+    if not is_super_admin(message.from_user.id):
+        return bot.reply_to(message, "⛔ Only super admins can use this command.")
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        return bot.reply_to(
+            message,
+            "📋 **Usage:** `/addadmin <user_id>`\n"
+            "The user must have started the bot at least once.\n"
+            "Use `/search` to find their user ID.",
+            parse_mode="Markdown"
+        )
+    target_uid = int(args[1])
+    if is_super_admin(target_uid):
+        return bot.reply_to(message, "ℹ️ That user is already a super admin.")
+    success = add_admin_db(target_uid, message.from_user.id)
+    if success:
+        bot.reply_to(message, f"✅ User `{target_uid}` is now an admin!\nThey will see the Admin Panel next time they send /start.", parse_mode="Markdown")
+        try:
+            bot.send_message(target_uid, "👑 You have been granted **Admin access** to this bot!\nSend /start to see your Admin Panel.", parse_mode="Markdown")
+        except: pass
+    else:
+        bot.reply_to(message, f"ℹ️ User `{target_uid}` is already an admin.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['removeadmin'])
+def handle_removeadmin(message):
+    """Super-admin only. Usage: /removeadmin <user_id>"""
+    if not is_super_admin(message.from_user.id):
+        return bot.reply_to(message, "⛔ Only super admins can use this command.")
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        return bot.reply_to(message, "📋 **Usage:** `/removeadmin <user_id>`", parse_mode="Markdown")
+    target_uid = int(args[1])
+    if is_super_admin(target_uid):
+        return bot.reply_to(message, "⛔ Cannot remove a super admin. Remove them from the `ADMIN_IDS` environment variable instead.")
+    success = remove_admin_db(target_uid)
+    if success:
+        bot.reply_to(message, f"✅ Admin `{target_uid}` has been removed.", parse_mode="Markdown")
+        try:
+            bot.send_message(target_uid, "ℹ️ Your admin access to this bot has been revoked.")
+        except: pass
+    else:
+        bot.reply_to(message, f"❌ User `{target_uid}` is not a sub-admin.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['listadmins'])
+def handle_listadmins(message):
+    """List all admins. Super-admin only."""
+    if not is_super_admin(message.from_user.id):
+        return bot.reply_to(message, "⛔ Only super admins can use this command.")
+    sub_admins = get_all_admins_db()
+    text = "👥 **Admin List**\n\n"
+    text += "🔒 **Super Admins** (from environment):\n"
+    for sa_id in ADMIN_IDS:
+        text += f"• `{sa_id}`\n"
+    text += f"\n👤 **Sub-Admins** ({len(sub_admins)}):\n"
+    if sub_admins:
+        for sa_id, added_at in sub_admins:
+            text += f"• `{sa_id}` — since {str(added_at)[:10]}\n"
+    else:
+        text += "_None yet. Use /addadmin to add one._"
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 # ================= Execution =================
 if __name__ == "__main__":
