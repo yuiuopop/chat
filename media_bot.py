@@ -67,6 +67,8 @@ def init_db():
     except: pass
     try: cursor.execute("ALTER TABLE categories ADD COLUMN req_referrals INTEGER DEFAULT 0")
     except: pass
+    try: cursor.execute("ALTER TABLE categories ADD COLUMN is_hidden INTEGER DEFAULT 0")
+    except: pass
 
     # Seed Default Category to prevent breakage
     cursor.execute("SELECT id FROM categories LIMIT 1")
@@ -116,8 +118,27 @@ def get_total_referrals(user_id):
 def get_categories():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name FROM categories")
+    cursor.execute("SELECT id, name, is_hidden FROM categories")
     return cursor.fetchall()
+
+def get_visible_categories():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM categories WHERE is_hidden = 0")
+    return cursor.fetchall()
+
+def toggle_category_visibility(cat_id, hide):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE categories SET is_hidden = ? WHERE id = ?", (1 if hide else 0, cat_id))
+    conn.commit()
+
+def delete_category_db(cat_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM media WHERE category_id = ?", (cat_id,))
+    cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+    conn.commit()
     
 def get_category_req(cat_id):
     conn = get_db()
@@ -211,7 +232,7 @@ def get_stats():
 # ================= UI & Keyboards =================
 def get_main_keyboard(admin=False):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    categories = get_categories()
+    categories = get_visible_categories()
     
     # Generate buttons for all categories dynamically
     cat_buttons = [KeyboardButton(c[1]) for c in categories]
@@ -225,7 +246,7 @@ def get_main_keyboard(admin=False):
 def get_admin_panel_markup():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"))
-    markup.row(InlineKeyboardButton("➕ New Category", callback_data="admin_newcat"), 
+    markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"), 
                InlineKeyboardButton("🏷️ Set Upload Category", callback_data="admin_setcat"))
     markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
                InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
@@ -501,6 +522,74 @@ def cb_admin_stats(call):
     try: bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
     except: pass
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_manage_categories")
+def cb_manage_cats_main(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("➕ Create New Category", callback_data="admin_newcat"))
+    markup.add(InlineKeyboardButton("✏️ Edit/Hide/Delete Categories", callback_data="admin_edit_cats_list"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
+    bot.edit_message_text("🛠️ **Category Management**\nWhat would you like to do?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_edit_cats_list")
+def cb_edit_cats_list(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cats = get_categories()
+    markup = InlineKeyboardMarkup()
+    for c_id, c_name, c_hidden in cats:
+        status = "👻 " if c_hidden else ""
+        markup.add(InlineKeyboardButton(f"{status}{c_name}", callback_data=f"edit_cat_opts_{c_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_manage_categories"))
+    bot.edit_message_text("✏️ **Select Category to Edit**\nGhost icon (👻) means category is hidden from users.", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_cat_opts_"))
+def cb_edit_cat_opts(call):
+    cat_id = int(call.data.split('_')[3])
+    cats = get_categories()
+    cat = next((c for c in cats if c[0] == cat_id), None)
+    if not cat: return bot.answer_callback_query(call.id, "Category not found.")
+    
+    c_id, c_name, c_hidden = cat
+    markup = InlineKeyboardMarkup(row_width=2)
+    if c_hidden:
+        markup.add(InlineKeyboardButton("👁️ Unhide Category", callback_data=f"toggle_hide_{c_id}_0"))
+    else:
+        markup.add(InlineKeyboardButton("👻 Hide Category", callback_data=f"toggle_hide_{c_id}_1"))
+    
+    markup.add(InlineKeyboardButton("🗑️ Delete Category", callback_data=f"del_cat_init_{c_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_edit_cats_list"))
+    
+    status_text = "HIDDEN" if c_hidden else "VISIBLE"
+    bot.edit_message_text(f"✏️ **Editing: {c_name}**\nCurrent Status: `{status_text}`", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("toggle_hide_"))
+def cb_toggle_hide(call):
+    pts = call.data.split('_')
+    cat_id = int(pts[2])
+    hide = int(pts[3]) == 1
+    toggle_category_visibility(cat_id, hide)
+    bot.answer_callback_query(call.id, "Visibility updated!")
+    cb_edit_cats_list(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_cat_init_"))
+def cb_del_cat_init(call):
+    cat_id = int(call.data.split('_')[3])
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("⚠️ YES, DELETE AND WIPE MEDIA ⚠️", callback_data=f"del_cat_confirm_{cat_id}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"edit_cat_opts_{cat_id}"))
+    bot.edit_message_text("🚨 **FINAL WARNING!** 🚨\nDeleting this category will permanently erase it AND ALL MEDIA INSIDE IT. This cannot be undone.", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_cat_confirm_"))
+def cb_del_cat_confirm(call):
+    cat_id = int(call.data.split('_')[3])
+    delete_category_db(cat_id)
+    bot.answer_callback_query(call.id, "Category and media deleted!")
+    cb_edit_cats_list(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_newcat")
 def cb_admin_newcat(call):
