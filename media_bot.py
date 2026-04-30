@@ -7,13 +7,20 @@ import math
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables (from .env file if it exists)
 load_dotenv()
 
 # ================= Configuration =================
+# Prioritizes system environment variables (hosting sites) over .env defaults
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(i.strip()) for i in ADMIN_IDS_RAW.split(",") if i.strip()]
+
+# Basic validation
+if not BOT_TOKEN or not DATABASE_URL:
+    print("CRITICAL: BOT_TOKEN or DATABASE_URL not found in environment!")
+    # In some hosting environments, we want to fail fast
 
 # Economics
 FREE_STARTING_POINTS = 10
