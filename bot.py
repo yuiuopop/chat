@@ -5,7 +5,10 @@ from psycopg2 import pool
 import threading
 import math
 import os
-import os
+try:
+    from flask import Flask, request, abort
+except ImportError:
+    Flask = None
 
 # ================= Configuration =================
 # Prioritizes system environment variables (hosting sites) over .env defaults
@@ -98,7 +101,15 @@ def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Safe migrations for existing deployments
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS firewall_channels (
+                id SERIAL PRIMARY KEY,
+                button_name TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                invite_link TEXT NOT NULL
+            )
+        ''')
+        # Safe migrations
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS content_type TEXT DEFAULT 'media'")
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS type_configured BOOLEAN DEFAULT FALSE")
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0")
@@ -114,6 +125,9 @@ def init_db():
 
         cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
         cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("Enjoy this from {cat_name}! 🍿\nRemaining points: {points}",))
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('firewall_enabled', 'false') ON CONFLICT (key) DO NOTHING")
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('firewall_message', %s) ON CONFLICT (key) DO NOTHING",
+                       ("🔒 **You must join our channel(s) to use this bot.**\n\nPlease join the channel(s) below, then press ✅ **I Joined**.",))
 
         cursor.execute("SELECT id FROM categories LIMIT 1")
         if not cursor.fetchone():
@@ -491,6 +505,80 @@ def check_duplicate_text(content, category_id):
         return cursor.fetchone() is not None
     finally: release_db(conn)
 
+# ================= Firewall DB Helpers =================
+
+def get_firewall_channels():
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, button_name, channel_id, invite_link FROM firewall_channels ORDER BY id")
+        return cursor.fetchall()
+    finally: release_db(conn)
+
+def add_firewall_channel(button_name, channel_id, invite_link):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO firewall_channels (button_name, channel_id, invite_link) VALUES (%s, %s, %s)",
+            (button_name, channel_id, invite_link)
+        )
+        conn.commit()
+    finally: release_db(conn)
+
+def remove_firewall_channel(fw_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM firewall_channels WHERE id = %s", (fw_id,))
+        conn.commit()
+    finally: release_db(conn)
+
+def is_firewall_enabled():
+    return get_setting('firewall_enabled', 'false') == 'true'
+
+def set_firewall_enabled(enabled: bool):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO settings (key, value) VALUES ('firewall_enabled', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            ('true' if enabled else 'false',)
+        )
+        conn.commit()
+    finally: release_db(conn)
+
+def check_user_firewall(user_id):
+    """
+    Returns a list of (id, button_name, invite_link) for channels
+    the user has NOT joined. Empty list = firewall passed.
+    Admins bypass this check externally.
+    """
+    if not is_firewall_enabled(): return []
+    channels = get_firewall_channels()
+    if not channels: return []
+    missing = []
+    for fw_id, btn_name, ch_id, invite_link in channels:
+        try:
+            member = bot.get_chat_member(ch_id, user_id)
+            if member.status in ('left', 'kicked'):
+                missing.append((fw_id, btn_name, invite_link))
+        except:
+            missing.append((fw_id, btn_name, invite_link))
+    return missing
+
+def send_firewall_prompt(chat_id, missing_channels):
+    """Send the force-join message with join buttons + a check button."""
+    fw_msg = get_setting(
+        'firewall_message',
+        "🔒 **You must join our channel(s) to use this bot.**\n\nJoin below then press ✅ I Joined."
+    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    for _fw_id, btn_name, invite_link in missing_channels:
+        markup.add(InlineKeyboardButton(f"🔗 {btn_name}", url=invite_link))
+    markup.add(InlineKeyboardButton("✅ I Joined — Check Again", callback_data="fw_check_join"))
+    bot.send_message(chat_id, fw_msg, reply_markup=markup, parse_mode="Markdown")
+
 # ================= UI & Keyboards =================
 def get_main_keyboard(admin=False):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -508,12 +596,12 @@ def get_main_keyboard(admin=False):
 def get_admin_panel_markup(user_id=None):
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"))
-    markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"), 
+    markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"),
                InlineKeyboardButton("🏷️ Set Upload Category", callback_data="admin_setcat"))
     markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
                InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
-    markup.add(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"))
-    # Only super-admins see the Manage Admins button
+    markup.row(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"),
+               InlineKeyboardButton("🔥 Firewall", callback_data="admin_firewall"))
     if user_id and is_super_admin(user_id):
         markup.add(InlineKeyboardButton("👥 Manage Admins", callback_data="admin_manage_admins"))
     return markup
@@ -654,6 +742,12 @@ def handle_start(message):
     if admin_mode:
         bot.reply_to(message, "👑 **Admin Access Granted!** Welcome to your media bot.", reply_markup=get_main_keyboard(admin=True), parse_mode="Markdown")
     else:
+        # 🔥 Firewall check for new/existing users on /start
+        missing = check_user_firewall(user_id)
+        if missing:
+            send_firewall_prompt(message.chat.id, missing)
+            return
+
         start_msg = get_setting('start_message', "Welcome to the Media Bot! 📺\nUse the menu below to navigate.")
         bot.reply_to(message, start_msg, reply_markup=get_main_keyboard())
 
@@ -822,6 +916,13 @@ def handle_text(message):
     user_id = message.from_user.id
     admin_mode = is_admin(user_id)
     text = message.text
+
+    # 🔥 Firewall check — blocks non-admins who haven't joined required channels
+    if not admin_mode:
+        missing = check_user_firewall(user_id)
+        if missing:
+            send_firewall_prompt(message.chat.id, missing)
+            return
     
     if text == "💰 Balance":
         user = get_user(user_id)
@@ -930,6 +1031,117 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
             update_points(user_id, MEDIA_COST)
 
 # ================= Admin Callbacks =================
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_firewall")
+def cb_admin_firewall(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    _show_firewall_menu(call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+def _show_firewall_menu(chat_id, message_id=None):
+    enabled = is_firewall_enabled()
+    channels = get_firewall_channels()
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    if enabled:
+        markup.add(InlineKeyboardButton("🟢 Firewall: ENABLED (Click to Disable)", callback_data="fw_toggle_0"))
+    else:
+        markup.add(InlineKeyboardButton("🔴 Firewall: DISABLED (Click to Enable)", callback_data="fw_toggle_1"))
+        
+    markup.add(InlineKeyboardButton("✍️ Edit Firewall Message", callback_data="fw_edit_msg"))
+    markup.add(InlineKeyboardButton("➕ Add Channel/Group", callback_data="fw_add_channel"))
+    
+    text = "🔥 **Firewall Management**\n\n"
+    text += f"**Status:** {'Enabled' if enabled else 'Disabled'}\n"
+    text += f"**Current Message:**\n`{get_setting('firewall_message', '')}`\n\n"
+    text += "**Required Channels/Groups:**\n"
+    
+    if channels:
+        for fw_id, btn_name, ch_id, inv_link in channels:
+            text += f"• {btn_name} (`{ch_id}`)\n"
+            markup.add(InlineKeyboardButton(f"❌ Remove {btn_name}", callback_data=f"fw_remove_{fw_id}"))
+    else:
+        text += "_None added yet._\n"
+        
+    markup.add(InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel_back"))
+    
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("fw_toggle_"))
+def cb_fw_toggle(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    enable = call.data.split('_')[2] == '1'
+    set_firewall_enabled(enable)
+    _show_firewall_menu(call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id, f"Firewall {'Enabled' if enable else 'Disabled'}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "fw_edit_msg")
+def cb_fw_edit_msg(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    msg = bot.send_message(call.message.chat.id, "✍️ Send the new Firewall prompt message.\n\n_Note: The join buttons and 'I Joined' button will be attached automatically._")
+    bot.register_next_step_handler(msg, process_fw_edit_msg)
+    bot.answer_callback_query(call.id)
+
+def process_fw_edit_msg(message):
+    if not is_admin(message.from_user.id): return
+    set_setting('firewall_message', message.text)
+    bot.reply_to(message, "✅ Firewall message updated.")
+    _show_firewall_menu(message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "fw_add_channel")
+def cb_fw_add_channel(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    msg = bot.send_message(
+        call.message.chat.id, 
+        "➕ **Add Firewall Channel/Group**\n\n"
+        "Send the details in this exact format:\n"
+        "`Button Name - ChannelID - InviteLink`\n\n"
+        "**Example:**\n"
+        "`Join Our VIP - -10012345678 - https://t.me/+AbCdEfGh`\n\n"
+        "_(Make sure the bot is an admin in that channel/group to verify members!)_",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, process_fw_add_channel)
+    bot.answer_callback_query(call.id)
+
+def process_fw_add_channel(message):
+    if not is_admin(message.from_user.id): return
+    try:
+        parts = [p.strip() for p in message.text.split('-', 2)]
+        if len(parts) != 3:
+            bot.reply_to(message, "❌ Invalid format. Must be `Name - ID - Link`.", parse_mode="Markdown")
+            return _show_firewall_menu(message.chat.id)
+            
+        btn_name, ch_id, link = parts
+        add_firewall_channel(btn_name, ch_id, link)
+        bot.reply_to(message, f"✅ Added '{btn_name}' to firewall requirements!")
+        _show_firewall_menu(message.chat.id)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("fw_remove_"))
+def cb_fw_remove(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    fw_id = int(call.data.split('_')[2])
+    remove_firewall_channel(fw_id)
+    _show_firewall_menu(call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id, "✅ Channel removed")
+
+@bot.callback_query_handler(func=lambda call: call.data == "fw_check_join")
+def cb_fw_check_join(call):
+    user_id = call.from_user.id
+    missing = check_user_firewall(user_id)
+    if missing:
+        bot.answer_callback_query(call.id, "❌ You still haven't joined all required channels!", show_alert=True)
+    else:
+        bot.answer_callback_query(call.id, "✅ Thank you for joining!", show_alert=True)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        bot.send_message(call.message.chat.id, "🎉 **Access Granted!** You can now use the bot.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tools")
 def cb_admin_tools(call):
@@ -1721,9 +1933,63 @@ def handle_listadmins(message):
     bot.reply_to(message, text, parse_mode="Markdown")
 
 # ================= Execution =================
+# Supports two modes:
+#   POLLING  (local dev)  — no extra env vars needed, just run the script.
+#   WEBHOOK  (web hosting) — set WEBHOOK_URL=https://your-app.onrender.com
+#                            and optionally WEBHOOK_PORT (default 8080).
+#
+# On Koyeb / Render / Railway: set WEBHOOK_URL, expose the HTTP port,
+#   the bot will register the webhook and serve Telegram updates via Flask.
+
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_PATH = f"/{BOT_TOKEN}"  # secret path Telegram will POST to
+
 if __name__ == "__main__":
     init_db()
     print("Database initialized.")
-    print("Bot is polling...")
-    try: bot.infinity_polling()
-    except Exception as e: print(f"Error while polling: {e}")
+
+    if WEBHOOK_URL and Flask is not None:
+        # ── WEBHOOK MODE (web hosting) ──────────────────────────────────
+        print(f"Starting in WEBHOOK mode on port {WEBHOOK_PORT}")
+        print(f"Webhook URL: {WEBHOOK_URL}{WEBHOOK_PATH}")
+
+        app = Flask(__name__)
+
+        @app.route("/", methods=["GET"])
+        def health():
+            """Health-check endpoint required by most hosting platforms."""
+            return "Bot is running!", 200
+
+        @app.route(WEBHOOK_PATH, methods=["POST"])
+        def webhook():
+            if request.headers.get("content-type") == "application/json":
+                json_str = request.get_data(as_text=True)
+                update = telebot.types.Update.de_json(json_str)
+                bot.process_new_updates([update])
+                return "", 200
+            else:
+                abort(403)
+
+        # Remove any old webhook and set the new one
+        bot.remove_webhook()
+        bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+        print("Webhook registered. Flask server starting...")
+
+        app.run(host="0.0.0.0", port=WEBHOOK_PORT)
+
+    elif WEBHOOK_URL and Flask is None:
+        print("ERROR: WEBHOOK_URL is set but Flask is not installed.")
+        print("Run: pip install flask")
+        print("Falling back to polling mode...")
+        bot.remove_webhook()
+        try: bot.infinity_polling()
+        except Exception as e: print(f"Polling error: {e}")
+
+    else:
+        # ── POLLING MODE (local / default) ──────────────────────────────
+        print("Starting in POLLING mode (local dev).")
+        print("Tip: set WEBHOOK_URL env var to switch to webhook mode for hosting.")
+        bot.remove_webhook()  # clear any stale webhook
+        try: bot.infinity_polling()
+        except Exception as e: print(f"Polling error: {e}")
