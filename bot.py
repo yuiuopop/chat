@@ -28,7 +28,8 @@ upload_batches = {}
 upload_lock = threading.Lock()
 admin_active_category = {}   # admin_id → cat_id
 admin_content_type = {}      # admin_id → 'text' | 'gif_sticker' | 'media'
-admin_session_msg = {}       # admin_id → (chat_id, message_id) of the live upload session msg
+admin_session_msg = {}       # admin_id → (chat_id, message_id)
+admin_session_stats = {}     # admin_id → {'sent': int, 'saved': int, 'dupes': int}
 
 # ================= Database =================
 # Connection pool for thread-safe PostgreSQL access
@@ -419,6 +420,18 @@ def add_text_content(text_content, category_id):
     finally: release_db(conn)
 
 
+def check_duplicate_text(content, category_id):
+    """Check if identical text already exists in this category."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM media WHERE media_type='text' AND content=%s AND category_id=%s",
+            (content, category_id)
+        )
+        return cursor.fetchone() is not None
+    finally: release_db(conn)
+
 # ================= UI & Keyboards =================
 def get_main_keyboard(admin=False):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -611,7 +624,7 @@ def flush_upload_batch(chat_id):
                 else: bot.send_message(chat_id, f"✅ Added {saved} media item(s) to *{cat_name}*!", parse_mode="Markdown")
             except: pass
 
-def _build_session_text(cat_id, cat_name, ctype):
+def _build_session_text(cat_id, cat_name, ctype, admin_id=None):
     """Build the live upload session message text."""
     count = get_cat_stats(cat_id)
     type_labels = {'text': '📝 Text', 'gif_sticker': '🎬 GIF & Stickers', 'media': '🖼️ Photo / Video / Document'}
@@ -622,11 +635,21 @@ def _build_session_text(cat_id, cat_name, ctype):
         'media': 'Send photos, videos, or documents to add them to this category.',
     }
     instruction = type_instructions.get(ctype, '')
+
+    stats_line = ""
+    if admin_id and admin_id in admin_session_stats:
+        s = admin_session_stats[admin_id]
+        stats_line = (
+            f"\n📊 **This session:**\n"
+            f"• Sent: {s['sent']}  • Saved: {s['saved']}  • Duplicates: {s['dupes']}\n"
+        )
+
     return (
         f"📂 **Upload Session Active**\n\n"
         f"🏷️ Category: **{cat_name}**\n"
         f"📦 Type: **{type_label}**\n"
-        f"📄 Items in category: **{count}**\n\n"
+        f"📄 Items in category: **{count}**\n"
+        f"{stats_line}\n"
         f"ℹ️ {instruction}\n\n"
         f"Press **✅ Done** when finished, or **🔙 Back** to change category."
     )
@@ -640,7 +663,7 @@ def _build_session_markup(cat_id):
     return markup
 
 def _update_session_message(admin_id):
-    """Edit the live session message to reflect the current item count."""
+    """Edit the live session message to reflect the current item count and stats."""
     info = admin_session_msg.get(admin_id)
     if not info: return
     chat_id, msg_id = info
@@ -651,7 +674,7 @@ def _update_session_message(admin_id):
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
     try:
         bot.edit_message_text(
-            _build_session_text(cat_id, cat_name, ctype),
+            _build_session_text(cat_id, cat_name, ctype, admin_id),
             chat_id, msg_id,
             reply_markup=_build_session_markup(cat_id),
             parse_mode="Markdown"
@@ -688,11 +711,15 @@ def handle_media_upload(message):
     if check_duplicate_media(file_unique_id):
         try: bot.delete_message(message.chat.id, message.message_id)
         except: pass
+        s = admin_session_stats.setdefault(admin_id, {'sent': 0, 'saved': 0, 'dupes': 0})
+        s['sent'] += 1; s['dupes'] += 1
+        _update_session_message(admin_id)
         return
     add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
-    # Delete admin's message to keep chat clean, then update counter
     try: bot.delete_message(message.chat.id, message.message_id)
     except: pass
+    s = admin_session_stats.setdefault(admin_id, {'sent': 0, 'saved': 0, 'dupes': 0})
+    s['sent'] += 1; s['saved'] += 1
     _update_session_message(admin_id)
 
 @bot.message_handler(content_types=['animation', 'sticker'])
@@ -720,10 +747,15 @@ def handle_gif_sticker_upload(message):
     if check_duplicate_media(file_unique_id):
         try: bot.delete_message(message.chat.id, message.message_id)
         except: pass
+        s = admin_session_stats.setdefault(admin_id, {'sent': 0, 'saved': 0, 'dupes': 0})
+        s['sent'] += 1; s['dupes'] += 1
+        _update_session_message(admin_id)
         return
     add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
     try: bot.delete_message(message.chat.id, message.message_id)
     except: pass
+    s = admin_session_stats.setdefault(admin_id, {'sent': 0, 'saved': 0, 'dupes': 0})
+    s['sent'] += 1; s['saved'] += 1
     _update_session_message(admin_id)
 
 @bot.message_handler(func=lambda message: True)
@@ -753,7 +785,13 @@ def handle_text(message):
         active_cat_id = admin_active_category.get(user_id)
         ctype = admin_content_type.get(user_id)
         if active_cat_id and ctype == 'text':
-            add_text_content(text, active_cat_id)
+            s = admin_session_stats.setdefault(user_id, {'sent': 0, 'saved': 0, 'dupes': 0})
+            s['sent'] += 1
+            if check_duplicate_text(text, active_cat_id):
+                s['dupes'] += 1
+            else:
+                add_text_content(text, active_cat_id)
+                s['saved'] += 1
             try: bot.delete_message(message.chat.id, message.message_id)
             except: pass
             _update_session_message(user_id)
@@ -1114,22 +1152,33 @@ def cb_upload_done(call):
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
     count = get_cat_stats(cat_id)
 
-    # Clear session
+    # Pull session stats before clearing
+    s = admin_session_stats.pop(admin_id, {'sent': 0, 'saved': 0, 'dupes': 0})
     admin_active_category.pop(admin_id, None)
     admin_content_type.pop(admin_id, None)
     admin_session_msg.pop(admin_id, None)
 
+    # Build summary
+    summary = (
+        f"✅ **Upload Session Complete!**\n\n"
+        f"🏷️ Category: **{cat_name}**\n\n"
+        f"📊 **Session Summary:**\n"
+        f"• 📤 Total sent: **{s['sent']}**\n"
+        f"• ✅ Saved: **{s['saved']}**\n"
+    )
+    if s['dupes'] > 0:
+        summary += f"• ⚠️ Duplicates skipped: **{s['dupes']}**\n"
+    summary += f"\n📆 Total items in category now: **{count}**"
+
     bot.edit_message_text(
-        f"✅ **Upload session ended.**\n\n"
-        f"🏷️ Category: **{cat_name}**\n"
-        f"📆 Total items now: **{count}**",
+        summary,
         call.message.chat.id, call.message.message_id,
         reply_markup=InlineKeyboardMarkup().add(
             InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel_back")
         ),
         parse_mode="Markdown"
     )
-    bot.answer_callback_query(call.id, f"✅ Done! {count} items in {cat_name}.")
+    bot.answer_callback_query(call.id, f"✅ Done! {s['saved']} saved, {s['dupes']} dupes.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
 def cb_admin_limits(call):
