@@ -1,15 +1,19 @@
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-import sqlite3
+import psycopg2
+from psycopg2 import pool
 import threading
 import math
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # ================= Configuration =================
-# Replace with your actual Bot Token from BotFather
-BOT_TOKEN = "8756272091:AAGEvJTyq0jPh1aFzDeYhvZ39c1D-TGCEok"
-
-# List of admin Telegram User IDs
-ADMIN_IDS = [8305774350] 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Economics
 FREE_STARTING_POINTS = 10
@@ -21,275 +25,329 @@ upload_lock = threading.Lock()
 admin_active_category = {}
 
 # ================= Database =================
-local = threading.local()
+# Connection pool for thread-safe PostgreSQL access
+db_pool = None
+
+def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
+    return db_pool
 
 def get_db():
-    if not hasattr(local, 'db'):
-        local.db = sqlite3.connect('media_bot.sqlite', check_same_thread=False)
-    return local.db
+    return get_db_pool().getconn()
+
+def release_db(conn):
+    get_db_pool().putconn(conn)
 
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            points INTEGER DEFAULT 10,
-            referred_by INTEGER,
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            media_received INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS media (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT,
-            media_type TEXT,
-            file_unique_id TEXT,
-            category_id INTEGER,
-            FOREIGN KEY(category_id) REFERENCES categories(id)
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_category_stats (
-            user_id INTEGER,
-            category_id INTEGER,
-            count INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, category_id)
-        )
-    ''')
-    try: cursor.execute("ALTER TABLE users ADD COLUMN join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-    except: pass
-    try: cursor.execute("ALTER TABLE users ADD COLUMN media_received INTEGER DEFAULT 0")
-    except: pass
-    try: cursor.execute("ALTER TABLE media ADD COLUMN file_unique_id TEXT")
-    except: pass
-    try: cursor.execute("ALTER TABLE media ADD COLUMN category_id INTEGER DEFAULT 1")
-    except: pass
-    try: cursor.execute("ALTER TABLE categories ADD COLUMN req_referrals INTEGER DEFAULT 0")
-    except: pass
-    try: cursor.execute("ALTER TABLE categories ADD COLUMN is_hidden INTEGER DEFAULT 0")
-    except: pass
-    cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('start_message', 'Welcome to the Media Bot! 📺\nUse the menu below to navigate.')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('media_caption', 'Enjoy this from {cat_name}! 🍿\nRemaining points: {points}')")
-
-
-    # Seed Default Category to prevent breakage
-    cursor.execute("SELECT id FROM categories LIMIT 1")
-    if not cursor.fetchone():
-        cursor.execute("INSERT INTO categories (id, name) VALUES (1, '📺 Watch Media')")
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                points INTEGER DEFAULT 10,
+                referred_by BIGINT,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                media_received INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE,
+                req_referrals INTEGER DEFAULT 0,
+                is_hidden INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS media (
+                id SERIAL PRIMARY KEY,
+                file_id TEXT,
+                media_type TEXT,
+                file_unique_id TEXT,
+                category_id INTEGER REFERENCES categories(id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_category_stats (
+                user_id BIGINT,
+                category_id INTEGER,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, category_id)
+            )
+        ''')
+        cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
         
-    conn.commit()
+        # Ensure default settings
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("Enjoy this from {cat_name}! 🍿\nRemaining points: {points}",))
+
+        # Seed Default Category
+        cursor.execute("SELECT id FROM categories LIMIT 1")
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO categories (name) VALUES (%s)", ('📺 Watch Media',))
+            
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def add_user(user_id, username, starting_points, referred_by=None):
     conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO users (user_id, username, points, referred_by) VALUES (?, ?, ?, ?)", (user_id, username, starting_points, referred_by))
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO users (user_id, username, points, referred_by) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (user_id, username, starting_points, referred_by))
         conn.commit()
-        return True
+        return cursor.rowcount > 0
     except: return False
+    finally: release_db(conn)
 
 def get_user(user_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, points, referred_by, DATE(join_date) FROM users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, points, referred_by, join_date::DATE FROM users WHERE user_id = %s", (user_id,))
+        return cursor.fetchone()
+    finally: release_db(conn)
 
 def update_points(user_id, delta):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (delta, user_id))
-    conn.commit()
-    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET points = points + %s WHERE user_id = %s", (delta, user_id))
+        conn.commit()
+    finally: release_db(conn)
+
 def get_points(user_id):
     user = get_user(user_id)
     return user[2] if user else 0
     
 def update_media_received(user_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET media_received = media_received + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET media_received = media_received + 1 WHERE user_id = %s", (user_id,))
+        conn.commit()
+    finally: release_db(conn)
 
 def get_setting(key, default=None):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    res = cursor.fetchone()
-    return res[0] if res else default
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = %s", (key,))
+        res = cursor.fetchone()
+        return res[0] if res else default
+    finally: release_db(conn)
 
 def set_setting(key, value):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+        conn.commit()
+    finally: release_db(conn)
 
 def increment_user_category_stat(user_id, category_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO user_category_stats (user_id, category_id, count) 
-        VALUES (?, ?, 1)
-        ON CONFLICT(user_id, category_id) DO UPDATE SET count = count + 1
-    ''', (user_id, category_id))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO user_category_stats (user_id, category_id, count) 
+            VALUES (%s, %s, 1)
+            ON CONFLICT(user_id, category_id) DO UPDATE SET count = user_category_stats.count + 1
+        ''', (user_id, category_id))
+        conn.commit()
+    finally: release_db(conn)
 
 def get_user_list_page(limit, offset):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT u.user_id, u.username, (SELECT COUNT(*) FROM users WHERE referred_by = u.user_id) as ref_count 
-        FROM users u 
-        ORDER BY u.join_date DESC 
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-    return cursor.fetchall()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, u.username, (SELECT COUNT(*) FROM users WHERE referred_by = u.user_id) as ref_count 
+            FROM users u 
+            ORDER BY u.join_date DESC 
+            LIMIT %s OFFSET %s
+        ''', (limit, offset))
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 def get_user_detail(user_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, points, referred_by, join_date, media_received FROM users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, points, referred_by, join_date, media_received FROM users WHERE user_id = %s", (user_id,))
+        return cursor.fetchone()
+    finally: release_db(conn)
 
 def get_user_cat_breakdown(user_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT c.name, s.count 
-        FROM user_category_stats s
-        JOIN categories c ON s.category_id = c.id
-        WHERE s.user_id = ?
-    ''', (user_id,))
-    return cursor.fetchall()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT c.name, s.count 
+            FROM user_category_stats s
+            JOIN categories c ON s.category_id = c.id
+            WHERE s.user_id = %s
+        ''', (user_id,))
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 def get_total_referrals(user_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
-    res = cursor.fetchone()
-    return res[0] if res else 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE referred_by = %s", (user_id,))
+        res = cursor.fetchone()
+        return res[0] if res else 0
+    finally: release_db(conn)
 
 def get_categories():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, is_hidden FROM categories")
-    return cursor.fetchall()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, is_hidden FROM categories")
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 def get_visible_categories():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name FROM categories WHERE is_hidden = 0")
-    return cursor.fetchall()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM categories WHERE is_hidden = 0")
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 def toggle_category_visibility(cat_id, hide):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE categories SET is_hidden = ? WHERE id = ?", (1 if hide else 0, cat_id))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE categories SET is_hidden = %s WHERE id = %s", (1 if hide else 0, cat_id))
+        conn.commit()
+    finally: release_db(conn)
 
 def delete_category_db(cat_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM media WHERE category_id = ?", (cat_id,))
-    cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-    conn.commit()
-    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM media WHERE category_id = %s", (cat_id,))
+        cursor.execute("DELETE FROM categories WHERE id = %s", (cat_id,))
+        conn.commit()
+    finally: release_db(conn)
+
 def get_category_req(cat_id):
     conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute("SELECT req_referrals FROM categories WHERE id = ?", (cat_id,))
+        cursor = conn.cursor()
+        cursor.execute("SELECT req_referrals FROM categories WHERE id = %s", (cat_id,))
         res = cursor.fetchone()
         return res[0] if res and res[0] else 0
     except: return 0
+    finally: release_db(conn)
 
 def update_category_req(cat_id, limit):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE categories SET req_referrals = ? WHERE id = ?", (limit, cat_id))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE categories SET req_referrals = %s WHERE id = %s", (limit, cat_id))
+        conn.commit()
+    finally: release_db(conn)
 
 def add_category(name):
     conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO categories (name) VALUES (%s) RETURNING id", (name,))
+        cat_id = cursor.fetchone()[0]
         conn.commit()
-        return cursor.lastrowid
+        return cat_id
     except: return None
+    finally: release_db(conn)
 
 def add_media(file_id, media_type, file_unique_id=None, category_id=1):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO media (file_id, media_type, file_unique_id, category_id) VALUES (?, ?, ?, ?)", (file_id, media_type, file_unique_id, category_id))
-    conn.commit()
-    return cursor.lastrowid
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO media (file_id, media_type, file_unique_id, category_id) VALUES (%s, %s, %s, %s) RETURNING id", (file_id, media_type, file_unique_id, category_id))
+        media_id = cursor.fetchone()[0]
+        conn.commit()
+        return media_id
+    finally: release_db(conn)
 
 def check_duplicate_media(file_unique_id):
     if not file_unique_id: return False
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM media WHERE file_unique_id = ?", (file_unique_id,))
-    return cursor.fetchone() is not None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM media WHERE file_unique_id = %s", (file_unique_id,))
+        return cursor.fetchone() is not None
+    finally: release_db(conn)
 
 def get_random_media(category_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, file_id, media_type FROM media WHERE category_id = ? ORDER BY RANDOM() LIMIT 1", (category_id,))
-    return cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, file_id, media_type FROM media WHERE category_id = %s ORDER BY RANDOM() LIMIT 1", (category_id,))
+        return cursor.fetchone()
+    finally: release_db(conn)
 
 def delete_media(media_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM media WHERE id = ?", (media_id,))
-    success = cursor.rowcount > 0
-    conn.commit()
-    return success
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM media WHERE id = %s", (media_id,))
+        success = cursor.rowcount > 0
+        conn.commit()
+        return success
+    finally: release_db(conn)
 
 def get_media_page(category_id, limit, offset):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, media_type FROM media WHERE category_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", (category_id, limit, offset))
-    return cursor.fetchall()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, media_type FROM media WHERE category_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (category_id, limit, offset))
+        return cursor.fetchall()
+    finally: release_db(conn)
 
 def get_media_by_id(media_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_id, media_type FROM media WHERE id = ?", (media_id,))
-    return cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_id, media_type FROM media WHERE id = %s", (media_id,))
+        return cursor.fetchone()
+    finally: release_db(conn)
 
 def wipe_category(category_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM media WHERE category_id = ?", (category_id,))
-    conn.commit()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM media WHERE category_id = %s", (category_id,))
+        conn.commit()
+    finally: release_db(conn)
 
 def get_cat_stats(category_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM media WHERE category_id = ?", (category_id,))
-    res = cursor.fetchone()
-    return res[0] if res else 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM media WHERE category_id = %s", (category_id,))
+        res = cursor.fetchone()
+        return res[0] if res else 0
+    finally: release_db(conn)
 
 def get_stats():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    users_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM media")
-    media_count = cursor.fetchone()[0]
-    cursor.execute("SELECT SUM(media_received) FROM users")
-    ts = cursor.fetchone()[0]
-    return users_count, media_count, ts if ts else 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        users_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM media")
+        media_count = cursor.fetchone()[0]
+        cursor.execute("SELECT SUM(media_received) FROM users")
+        ts = cursor.fetchone()[0]
+        return users_count, media_count, int(ts) if ts else 0
+    finally: release_db(conn)
 
 
 # ================= UI & Keyboards =================
