@@ -57,6 +57,14 @@ def init_db():
             FOREIGN KEY(category_id) REFERENCES categories(id)
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_category_stats (
+            user_id INTEGER,
+            category_id INTEGER,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, category_id)
+        )
+    ''')
     try: cursor.execute("ALTER TABLE users ADD COLUMN join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     except: pass
     try: cursor.execute("ALTER TABLE users ADD COLUMN media_received INTEGER DEFAULT 0")
@@ -69,6 +77,10 @@ def init_db():
     except: pass
     try: cursor.execute("ALTER TABLE categories ADD COLUMN is_hidden INTEGER DEFAULT 0")
     except: pass
+    cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('start_message', 'Welcome to the Media Bot! 📺\nUse the menu below to navigate.')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('media_caption', 'Enjoy this from {cat_name}! 🍿\nRemaining points: {points}')")
+
 
     # Seed Default Category to prevent breakage
     cursor.execute("SELECT id FROM categories LIMIT 1")
@@ -107,6 +119,57 @@ def update_media_received(user_id):
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET media_received = media_received + 1 WHERE user_id = ?", (user_id,))
     conn.commit()
+
+def get_setting(key, default=None):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    res = cursor.fetchone()
+    return res[0] if res else default
+
+def set_setting(key, value):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+def increment_user_category_stat(user_id, category_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO user_category_stats (user_id, category_id, count) 
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, category_id) DO UPDATE SET count = count + 1
+    ''', (user_id, category_id))
+    conn.commit()
+
+def get_user_list_page(limit, offset):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.user_id, u.username, (SELECT COUNT(*) FROM users WHERE referred_by = u.user_id) as ref_count 
+        FROM users u 
+        ORDER BY u.join_date DESC 
+        LIMIT ? OFFSET ?
+    ''', (limit, offset))
+    return cursor.fetchall()
+
+def get_user_detail(user_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, points, referred_by, join_date, media_received FROM users WHERE user_id = ?", (user_id,))
+    return cursor.fetchone()
+
+def get_user_cat_breakdown(user_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.name, s.count 
+        FROM user_category_stats s
+        JOIN categories c ON s.category_id = c.id
+        WHERE s.user_id = ?
+    ''', (user_id,))
+    return cursor.fetchall()
 
 def get_total_referrals(user_id):
     conn = get_db()
@@ -250,6 +313,7 @@ def get_admin_panel_markup():
                InlineKeyboardButton("🏷️ Set Upload Category", callback_data="admin_setcat"))
     markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
                InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
+    markup.add(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"))
     return markup
 
 def generate_divisions_markup(cat_id):
@@ -345,7 +409,8 @@ def handle_start(message):
     if admin_mode:
         bot.reply_to(message, "👑 **Admin Access Granted!** Welcome to your media bot.", reply_markup=get_main_keyboard(admin=True), parse_mode="Markdown")
     else:
-        bot.reply_to(message, "Welcome to the Media Bot! 📺\nUse the menu below to navigate.", reply_markup=get_main_keyboard())
+        start_msg = get_setting('start_message', "Welcome to the Media Bot! 📺\nUse the menu below to navigate.")
+        bot.reply_to(message, start_msg, reply_markup=get_main_keyboard())
 
 @bot.message_handler(commands=['newcategory'])
 def handle_newcategory(message):
@@ -464,8 +529,11 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
     if not admin_mode:
         update_points(user_id, -MEDIA_COST)
         update_media_received(user_id)
+        increment_user_category_stat(user_id, cat_id)
         new_points = points - MEDIA_COST
-        caption_text = f"Enjoy this from {cat_name}! 🍿\nRemaining points: {new_points}"
+        
+        caption_tmpl = get_setting('media_caption', "Enjoy this from {cat_name}! 🍿\nRemaining points: {points}")
+        caption_text = caption_tmpl.replace("{cat_name}", cat_name).replace("{points}", str(new_points))
     else:
         caption_text = f"🍿 {cat_name}\n[👑 Admin View: Unlimited]\n[ID: {_id}]"
     
@@ -475,6 +543,47 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
         else: bot.send_document(user_id, file_id, caption=caption_text)
     except:
         if not admin_mode: update_points(user_id, MEDIA_COST)
+
+# ================= Admin Callbacks =================
+@bot.callback_query_handler(func=lambda call: call.data == "admin_tools")
+def cb_admin_tools(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("✍️ Edit Start Message", callback_data="tool_edit_start"))
+    markup.add(InlineKeyboardButton("🎞️ Edit Media Caption", callback_data="tool_edit_caption"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
+    bot.edit_message_text("🛠️ **Admin Tools**\nCustomize your bot's automated messages:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "tool_edit_start")
+def cb_edit_start_init(call):
+    if not is_admin(call.from_user.id): return
+    msg = bot.send_message(call.message.chat.id, "✍️ Please send the new **Start Message** text.\n\n_Tip: Use Markdown for bold/italics!_")
+    bot.register_next_step_handler(msg, process_start_msg_edit)
+    bot.answer_callback_query(call.id)
+
+def process_start_msg_edit(message):
+    if not is_admin(message.from_user.id): return
+    new_text = message.text
+    set_setting('start_message', new_text)
+    bot.reply_to(message, "✅ **Start Message Updated!**", parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "tool_edit_caption")
+def cb_edit_caption_init(call):
+    if not is_admin(call.from_user.id): return
+    msg = bot.send_message(call.message.chat.id, "🎞️ Please send the new **Media Caption Template**.\n\n"
+                                                  "Available Placeholders:\n"
+                                                  "`{cat_name}` - Category Name\n"
+                                                  "`{points}` - User Points Remaining\n\n"
+                                                  "Example: _Here is your {cat_name}! You have {points} left._")
+    bot.register_next_step_handler(msg, process_caption_edit)
+    bot.answer_callback_query(call.id)
+
+def process_caption_edit(message):
+    if not is_admin(message.from_user.id): return
+    new_text = message.text
+    set_setting('media_caption', new_text)
+    bot.reply_to(message, "✅ **Media Caption Updated!**", parse_mode="Markdown")
 
 # ================= Admin Callbacks =================
 @bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
@@ -519,8 +628,75 @@ def cb_admin_stats(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     users_count, media_count, total_received = get_stats()
     text = (f"📊 **Bot Stats Dashboard**\n\n👥 **Total Registered Users:** {users_count}\n📦 **Total Media Uploaded:** {media_count}\n📤 **Total Media Distributed:** {total_received}")
-    try: bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(InlineKeyboardButton("👥 User List", callback_data="admin_user_list_0"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
+    
+    try: bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
     except: pass
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_user_list_"))
+def cb_admin_user_list(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    page = int(call.data.split('_')[3])
+    limit = 10
+    offset = page * limit
+    
+    users = get_user_list_page(limit, offset)
+    users_count, _, _ = get_stats()
+    total_pages = math.ceil(users_count / limit) if users_count > 0 else 1
+    
+    markup = InlineKeyboardMarkup()
+    if users:
+        for u_id, u_name, ref_count in users:
+            display_name = u_name if u_name else f"ID:{u_id}"
+            markup.add(InlineKeyboardButton(f"{display_name} ({ref_count} refs)", callback_data=f"user_detail_{u_id}_{page}"))
+            
+        nav_btns = []
+        if page > 0: nav_btns.append(InlineKeyboardButton("⬅️", callback_data=f"admin_user_list_{page-1}"))
+        nav_btns.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="ignore"))
+        if page < total_pages - 1: nav_btns.append(InlineKeyboardButton("➡️", callback_data=f"admin_user_list_{page+1}"))
+        markup.row(*nav_btns)
+        
+    markup.add(InlineKeyboardButton("🔙 Back to Stats", callback_data="admin_stats"))
+    
+    bot.edit_message_text("👥 **User Directory**\nSelect a user to view their full profile:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("user_detail_"))
+def cb_admin_user_detail(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    pts = call.data.split('_')
+    user_id = int(pts[2])
+    back_page = int(pts[3])
+    
+    user = get_user_detail(user_id)
+    if not user: return bot.answer_callback_query(call.id, "User not found")
+    
+    u_id, u_name, points, ref_by, join_date, total_media = user
+    ref_count = get_total_referrals(user_id)
+    breakdown = get_user_cat_breakdown(user_id)
+    
+    text = (f"👤 **User Profile: {u_name if u_name else 'N/A'}**\n\n"
+            f"🆔 **ID:** `{u_id}`\n"
+            f"📅 **Joined:** {join_date}\n"
+            f"💰 **Points Balance:** {points}\n"
+            f"👥 **Total Referrals:** {ref_count}\n"
+            f"📦 **Total Media Extracted:** {total_media}\n\n"
+            f"📑 **Category Breakdown:**\n")
+    
+    if breakdown:
+        for cat_name, count in breakdown:
+            text += f"- {cat_name}: {count}\n"
+    else:
+        text += "_No specific category data yet._"
+        
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"admin_user_list_{back_page}"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_manage_categories")
