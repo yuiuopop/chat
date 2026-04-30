@@ -563,7 +563,7 @@ def handle_text(message):
         
     # Check if text targets a Media Category dynamically
     categories = get_categories()
-    for cat_id, cat_name in categories:
+    for cat_id, cat_name, cat_hidden in categories:
         if text == cat_name:
             process_media_request(message, cat_id, cat_name, admin_mode)
             return
