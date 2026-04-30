@@ -545,6 +545,7 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
         if not admin_mode: update_points(user_id, MEDIA_COST)
 
 # ================= Admin Callbacks =================
+
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tools")
 def cb_admin_tools(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
@@ -585,44 +586,6 @@ def process_caption_edit(message):
     set_setting('media_caption', new_text)
     bot.reply_to(message, "✅ **Media Caption Updated!**", parse_mode="Markdown")
 
-# ================= Admin Callbacks =================
-@bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
-def cb_admin_limits(call):
-    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
-    cats = get_categories()
-    markup = InlineKeyboardMarkup()
-    for c_id, c_name in cats: 
-        reqs = get_category_req(c_id)
-        markup.add(InlineKeyboardButton(f"{c_name} (Req: {reqs} refs)", callback_data=f"manage_req_{c_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
-    bot.edit_message_text("⚙️ **Category Limits**\nSelect a category to change its referral requirements:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("manage_req_"))
-def cb_manage_req(call):
-    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
-    cat_id = int(call.data.split('_')[2])
-    cats = get_categories()
-    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
-    
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, f"⚙️ To change the referral requirement for **{cat_name}**, type:\n`/setreq {cat_id} <limit>`\n_Example: /setreq {cat_id} 5_", parse_mode="Markdown")
-
-@bot.message_handler(commands=['setreq'])
-def handle_setreq(message):
-    if not is_admin(message.from_user.id): return
-    args = message.text.split()
-    if len(args) != 3:
-        return bot.reply_to(message, "Usage: `/setreq <CategoryID> <Limit>`\nYou can get the Category ID from the Category Limits menu.", parse_mode="Markdown")
-    try:
-        cat_id = int(args[1])
-        limit = int(args[2])
-        update_category_req(cat_id, limit)
-        bot.reply_to(message, f"✅ Done! The category now requires **{limit}** referrals to access.", parse_mode="Markdown")
-    except:
-        bot.reply_to(message, "Invalid number.")
-
-# ================= Admin Callbacks =================
 @bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
 def cb_admin_stats(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
@@ -797,6 +760,28 @@ def cb_setactive(call):
     bot.edit_message_text(f"✅ **Active Category Set: {cat_name}**\n\nFeel free to forward bulk media to the bot now. It will instantly be cataloged under {cat_name}.", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(), parse_mode="Markdown")
     bot.answer_callback_query(call.id)
 
+@bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
+def cb_admin_limits(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cats = get_categories()
+    markup = InlineKeyboardMarkup()
+    for c_id, c_name in cats: 
+        reqs = get_category_req(c_id)
+        markup.add(InlineKeyboardButton(f"{c_name} (Req: {reqs} refs)", callback_data=f"manage_req_{c_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
+    bot.edit_message_text("⚙️ **Category Limits**\nSelect a category to change its referral requirements:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("manage_req_"))
+def cb_manage_req(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cat_id = int(call.data.split('_')[2])
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+    
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"⚙️ To change the referral requirement for **{cat_name}**, type:\n`/setreq {cat_id} <limit>`\n_Example: /setreq {cat_id} 5_", parse_mode="Markdown")
+
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
@@ -894,6 +879,20 @@ def cb_wipe_confirm(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "ignore")
 def cb_ignore(call): bot.answer_callback_query(call.id)
+
+@bot.message_handler(commands=['setreq'])
+def handle_setreq(message):
+    if not is_admin(message.from_user.id): return
+    args = message.text.split()
+    if len(args) != 3:
+        return bot.reply_to(message, "Usage: `/setreq <CategoryID> <Limit>`\nYou can get the Category ID from the Category Limits menu.", parse_mode="Markdown")
+    try:
+        cat_id = int(args[1])
+        limit = int(args[2])
+        update_category_req(cat_id, limit)
+        bot.reply_to(message, f"✅ Done! The category now requires **{limit}** referrals to access.", parse_mode="Markdown")
+    except:
+        bot.reply_to(message, "Invalid number.")
 
 # ================= Execution =================
 if __name__ == "__main__":
