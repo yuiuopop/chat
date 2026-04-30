@@ -8,7 +8,7 @@ import os
 # from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+# load_dotenv()
 
 # ================= Configuration =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
