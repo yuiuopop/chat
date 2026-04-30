@@ -208,6 +208,29 @@ def get_total_referrals(user_id):
         return res[0] if res else 0
     finally: release_db(conn)
 
+def search_users(query):
+    """Search users by user_id, username. Returns list of (user_id, username, points)."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        # If query is a number, search by user_id first
+        results = []
+        if query.lstrip('-').isdigit():
+            cursor.execute(
+                "SELECT user_id, username, points FROM users WHERE user_id = %s LIMIT 10",
+                (int(query),)
+            )
+            results = cursor.fetchall()
+        # Also search by username (partial match)
+        if not results:
+            cursor.execute(
+                "SELECT user_id, username, points FROM users WHERE LOWER(username) LIKE LOWER(%s) LIMIT 10",
+                (f"%{query}%",)
+            )
+            results = cursor.fetchall()
+        return results
+    finally: release_db(conn)
+
 def get_categories():
     conn = get_db()
     try:
@@ -718,11 +741,30 @@ def cb_admin_user_detail(call):
     else:
         text += "_No specific category data yet._"
         
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"admin_user_list_{back_page}"))
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💰 Give Points", callback_data=f"givepoints_init_{user_id}_{back_page}"),
+        InlineKeyboardButton("🔙 Back to List", callback_data=f"admin_user_list_{back_page}")
+    )
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("givepoints_init_"))
+def cb_givepoints_init(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    pts = call.data.split('_')
+    target_uid = int(pts[2])
+    back_page = pts[3]
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(
+        call.message.chat.id,
+        f"💰 **Give Points to User `{target_uid}`**\n\n"
+        f"Send the number of points to add (use negative to deduct, e.g. `-5`).\n"
+        f"Type /cancel to abort.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, process_givepoints, target_uid, back_page)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_manage_categories")
 def cb_manage_cats_main(call):
@@ -955,6 +997,116 @@ def handle_setreq(message):
         bot.reply_to(message, f"✅ Done! The category now requires **{limit}** referrals to access.", parse_mode="Markdown")
     except:
         bot.reply_to(message, "Invalid number.")
+
+def process_givepoints(message, target_uid, back_page):
+    """Next-step handler: receives the points amount from admin."""
+    if not is_admin(message.from_user.id): return
+    if message.text and message.text.strip().lower() == '/cancel':
+        return bot.reply_to(message, "❌ Cancelled.")
+    try:
+        amount = int(message.text.strip())
+    except (ValueError, AttributeError):
+        return bot.reply_to(message, "❌ Invalid number. Please send a whole number like `50` or `-10`.", parse_mode="Markdown")
+
+    update_points(target_uid, amount)
+    new_balance = get_points(target_uid)
+    action = "added" if amount >= 0 else "deducted"
+    bot.reply_to(
+        message,
+        f"✅ **Done!** `{abs(amount)}` points {action} for user `{target_uid}`.\n"
+        f"💰 Their new balance: **{new_balance} points**.",
+        parse_mode="Markdown"
+    )
+    # Notify the user silently
+    try:
+        direction = f"+{amount}" if amount >= 0 else str(amount)
+        bot.send_message(
+            target_uid,
+            f"🎁 An admin has adjusted your balance: **{direction} points**!\n"
+            f"💰 Your new balance: **{new_balance} points**.",
+            parse_mode="Markdown"
+        )
+    except: pass
+
+@bot.message_handler(commands=['givepoints'])
+def handle_givepoints(message):
+    """Usage: /givepoints <user_id> <amount>"""
+    if not is_admin(message.from_user.id): return
+    args = message.text.split()
+    if len(args) != 3:
+        return bot.reply_to(
+            message,
+            "📋 **Usage:** `/givepoints <user_id> <amount>`\n"
+            "_Examples:_\n"
+            "`/givepoints 123456789 50` → add 50 points\n"
+            "`/givepoints 123456789 -10` → deduct 10 points",
+            parse_mode="Markdown"
+        )
+    try:
+        target_uid = int(args[1])
+        amount = int(args[2])
+    except ValueError:
+        return bot.reply_to(message, "❌ Both `user_id` and `amount` must be whole numbers.", parse_mode="Markdown")
+
+    user = get_user(target_uid)
+    if not user:
+        return bot.reply_to(message, f"❌ User `{target_uid}` not found in database.", parse_mode="Markdown")
+
+    update_points(target_uid, amount)
+    new_balance = get_points(target_uid)
+    action = "added" if amount >= 0 else "deducted"
+    bot.reply_to(
+        message,
+        f"✅ `{abs(amount)}` points {action} for user `{target_uid}` (@{user[1] or 'no username'}).\n"
+        f"💰 New balance: **{new_balance} points**.",
+        parse_mode="Markdown"
+    )
+    try:
+        direction = f"+{amount}" if amount >= 0 else str(amount)
+        bot.send_message(
+            target_uid,
+            f"🎁 An admin has adjusted your balance: **{direction} points**!\n"
+            f"💰 Your new balance: **{new_balance} points**.",
+            parse_mode="Markdown"
+        )
+    except: pass
+
+@bot.message_handler(commands=['search'])
+def handle_search(message):
+    """Usage: /search <user_id | @username | name>"""
+    if not is_admin(message.from_user.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        return bot.reply_to(
+            message,
+            "🔍 **User Search**\n\n"
+            "**Usage:** `/search <query>`\n"
+            "_Search by:_\n"
+            "• User ID (e.g. `/search 123456789`)\n"
+            "• Username (e.g. `/search john` or `/search @john`)",
+            parse_mode="Markdown"
+        )
+
+    query = args[1].strip().lstrip('@')
+    results = search_users(query)
+
+    if not results:
+        return bot.reply_to(message, f"🔍 No users found matching `{query}`.", parse_mode="Markdown")
+
+    markup = InlineKeyboardMarkup()
+    for u_id, u_name, u_points in results:
+        display = f"@{u_name}" if u_name else f"ID:{u_id}"
+        markup.add(InlineKeyboardButton(
+            f"{display} — {u_points} pts",
+            callback_data=f"user_detail_{u_id}_0"
+        ))
+
+    bot.reply_to(
+        message,
+        f"🔍 **Search results for** `{query}` — {len(results)} found:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
 # ================= Execution =================
 if __name__ == "__main__":
