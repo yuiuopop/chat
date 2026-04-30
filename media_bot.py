@@ -5,10 +5,10 @@ from psycopg2 import pool
 import threading
 import math
 import os
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 
 # Load environment variables
-# load_dotenv()
+load_dotenv()
 
 # ================= Configuration =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
