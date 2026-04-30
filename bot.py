@@ -67,7 +67,8 @@ def init_db():
                 name TEXT UNIQUE,
                 req_referrals INTEGER DEFAULT 0,
                 is_hidden INTEGER DEFAULT 0,
-                content_type TEXT DEFAULT 'media'
+                content_type TEXT DEFAULT 'media',
+                type_configured BOOLEAN DEFAULT FALSE
             )
         ''')
         cursor.execute('''
@@ -98,6 +99,7 @@ def init_db():
         ''')
         # Safe migrations for existing deployments
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS content_type TEXT DEFAULT 'media'")
+        cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS type_configured BOOLEAN DEFAULT FALSE")
         cursor.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS content TEXT")
 
         cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
@@ -393,8 +395,33 @@ def set_category_content_type(cat_id, content_type):
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE categories SET content_type = %s WHERE id = %s", (content_type, cat_id))
+        cursor.execute(
+            "UPDATE categories SET content_type = %s, type_configured = TRUE WHERE id = %s",
+            (content_type, cat_id)
+        )
         conn.commit()
+    finally: release_db(conn)
+
+def is_category_type_configured(cat_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT type_configured FROM categories WHERE id = %s", (cat_id,))
+        res = cursor.fetchone()
+        return bool(res[0]) if res else False
+    finally: release_db(conn)
+
+def get_category_extractions(cat_id):
+    """Total number of times users have received content from this category."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM user_category_stats WHERE category_id = %s",
+            (cat_id,)
+        )
+        res = cursor.fetchone()
+        return int(res[0]) if res else 0
     finally: release_db(conn)
 
 def get_category_content_type(cat_id):
@@ -1098,19 +1125,125 @@ def cb_admin_setcat(call):
 def cb_setactive(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     cat_id = int(call.data.split('_')[1])
+    bot.answer_callback_query(call.id)
+
+    if is_category_type_configured(cat_id):
+        # Type already configured — show the category dashboard
+        _show_category_dashboard(call, cat_id)
+    else:
+        # First time — ask for content type
+        cats = get_categories()
+        cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
+            InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
+            InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
+            InlineKeyboardButton("🔙 Back",                         callback_data="admin_setcat")
+        )
+        bot.edit_message_text(
+            f"🏷️ **Category: {cat_name}**\n\nThis is your first time setting up this category.\nWhat type of content will it hold?",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=markup, parse_mode="Markdown"
+        )
+
+def _show_category_dashboard(call, cat_id):
+    """Edit (or send) the category dashboard message."""
+    cats = get_categories()
+    cat_row = next((c for c in cats if c[0] == cat_id), None)
+    cat_name = cat_row[1] if cat_row else "Unknown"
+    ctype = get_category_content_type(cat_id)
+    count = get_cat_stats(cat_id)
+    extractions = get_category_extractions(cat_id)
+
+    type_labels = {
+        'text': '📝 Text Messages',
+        'gif_sticker': '🎬 GIF & Stickers',
+        'media': '🖼️ Photo / Video / Document'
+    }
+    type_label = type_labels.get(ctype, ctype)
+
+    text = (
+        f"📂 **Category Dashboard**\n\n"
+        f"🏷️ **Name:** {cat_name}\n"
+        f"📦 **Content Type:** {type_label}\n"
+        f"📄 **Total Content:** {count} item(s)\n"
+        f"📤 **Total Extractions by Users:** {extractions}\n"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Add Content",    callback_data=f"cat_add_content_{cat_id}"),
+        InlineKeyboardButton("🗑️ Delete Content", callback_data=f"cat_delete_menu_{cat_id}")
+    )
+    markup.add(InlineKeyboardButton("🔄 Change Type", callback_data=f"cat_change_type_{cat_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_setcat"))
+
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              reply_markup=markup, parse_mode="Markdown")
+    except:
+        bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cat_add_content_"))
+def cb_cat_add_content(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cat_id = int(call.data.split('_')[3])
     cats = get_categories()
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+    ctype = get_category_content_type(cat_id)
 
-    # Ask for content type
+    admin_active_category[call.from_user.id] = cat_id
+    admin_content_type[call.from_user.id] = ctype
+    admin_session_stats[call.from_user.id] = {'sent': 0, 'saved': 0, 'dupes': 0}
+
+    bot.answer_callback_query(call.id, "✅ Upload session started!")
+    sent = bot.send_message(
+        call.message.chat.id,
+        _build_session_text(cat_id, cat_name, ctype, call.from_user.id),
+        reply_markup=_build_session_markup(cat_id),
+        parse_mode="Markdown"
+    )
+    admin_session_msg[call.from_user.id] = (call.message.chat.id, sent.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cat_change_type_"))
+def cb_cat_change_type(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cat_id = int(call.data.split('_')[3])
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
         InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
         InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
         InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
-        InlineKeyboardButton("🔙 Back",                         callback_data="admin_setcat")
+        InlineKeyboardButton("🔙 Back",                         callback_data=f"setactive_{cat_id}")
     )
     bot.edit_message_text(
-        f"🏷️ **Category: {cat_name}**\n\nWhat type of content do you want to upload?",
+        f"🏷️ **Change Type: {cat_name}**\n\n⚠️ Changing the content type will affect future uploads only.\nExisting content stays as-is.\n\nSelect new type:",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=markup, parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cat_delete_menu_"))
+def cb_cat_delete_menu(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    cat_id = int(call.data.split('_')[3])
+    cats = get_categories()
+    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
+    count = get_cat_stats(cat_id)
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📝 Delete Specific Content", callback_data=f"manage_divs_{cat_id}"),
+        InlineKeyboardButton("🚨 Delete ALL Content 🚨",   callback_data=f"wipe_media_init_{cat_id}"),
+        InlineKeyboardButton("🔙 Back",                        callback_data=f"setactive_{cat_id}")
+    )
+    bot.edit_message_text(
+        f"🗑️ **Delete Content: {cat_name}**\n\n"
+        f"📄 Current items: **{count}**\n\n"
+        f"Choose what to delete:",
         call.message.chat.id, call.message.message_id,
         reply_markup=markup, parse_mode="Markdown"
     )
@@ -1123,25 +1256,12 @@ def cb_set_content_type(call):
     cat_id = int(parts[2])
     ctype = parts[3]  # 'media', 'gif_sticker', or 'text'
 
-    cats = get_categories()
-    cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
-
-    # Save the category content type to DB
+    # Save the category content type to DB (also marks type_configured=TRUE)
     set_category_content_type(cat_id, ctype)
+    bot.answer_callback_query(call.id, "✅ Content type saved!")
 
-    # Set admin session state
-    admin_active_category[call.from_user.id] = cat_id
-    admin_content_type[call.from_user.id] = ctype
-
-    # Send the persistent upload session message
-    bot.answer_callback_query(call.id, "✅ Upload session started!")
-    sent = bot.send_message(
-        call.message.chat.id,
-        _build_session_text(cat_id, cat_name, ctype),
-        reply_markup=_build_session_markup(cat_id),
-        parse_mode="Markdown"
-    )
-    admin_session_msg[call.from_user.id] = (call.message.chat.id, sent.message_id)
+    # Show the category dashboard
+    _show_category_dashboard(call, cat_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("upload_done_"))
 def cb_upload_done(call):
@@ -1170,12 +1290,17 @@ def cb_upload_done(call):
         summary += f"• ⚠️ Duplicates skipped: **{s['dupes']}**\n"
     summary += f"\n📆 Total items in category now: **{count}**"
 
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Add More",        callback_data=f"cat_add_content_{cat_id}"),
+        InlineKeyboardButton("📂 Dashboard",       callback_data=f"setactive_{cat_id}")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel_back"))
+
     bot.edit_message_text(
         summary,
         call.message.chat.id, call.message.message_id,
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel_back")
-        ),
+        reply_markup=markup,
         parse_mode="Markdown"
     )
     bot.answer_callback_query(call.id, f"✅ Done! {s['saved']} saved, {s['dupes']} dupes.")
