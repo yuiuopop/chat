@@ -68,7 +68,8 @@ def init_db():
                 req_referrals INTEGER DEFAULT 0,
                 is_hidden INTEGER DEFAULT 0,
                 content_type TEXT DEFAULT 'media',
-                type_configured BOOLEAN DEFAULT FALSE
+                type_configured BOOLEAN DEFAULT FALSE,
+                sort_order INTEGER DEFAULT 0
             )
         ''')
         cursor.execute('''
@@ -100,7 +101,16 @@ def init_db():
         # Safe migrations for existing deployments
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS content_type TEXT DEFAULT 'media'")
         cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS type_configured BOOLEAN DEFAULT FALSE")
+        cursor.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0")
         cursor.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS content TEXT")
+        # Initialize sort_order for existing categories if all are 0
+        cursor.execute("SELECT COUNT(*) FROM categories WHERE sort_order != 0")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                UPDATE categories SET sort_order = sub.rn
+                FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM categories) sub
+                WHERE categories.id = sub.id
+            """)
 
         cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
         cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("Enjoy this from {cat_name}! 🍿\nRemaining points: {points}",))
@@ -250,7 +260,7 @@ def get_categories():
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, is_hidden FROM categories")
+        cursor.execute("SELECT id, name, is_hidden FROM categories ORDER BY sort_order, id")
         return cursor.fetchall()
     finally: release_db(conn)
 
@@ -258,8 +268,30 @@ def get_visible_categories():
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name FROM categories WHERE is_hidden = 0")
+        cursor.execute("SELECT id, name FROM categories WHERE is_hidden = 0 ORDER BY sort_order, id")
         return cursor.fetchall()
+    finally: release_db(conn)
+
+def move_category(cat_id, direction):
+    """Move a category up (-1) or down (+1) by swapping sort_order with its neighbour."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        # Get ordered list of all categories
+        cursor.execute("SELECT id, sort_order FROM categories ORDER BY sort_order, id")
+        rows = cursor.fetchall()
+        ids = [r[0] for r in rows]
+        if cat_id not in ids: return
+        idx = ids.index(cat_id)
+        swap_idx = idx + direction  # -1 = up, +1 = down
+        if swap_idx < 0 or swap_idx >= len(ids): return  # already at edge
+        other_id = ids[swap_idx]
+        # Swap sort_order values
+        cur_order = rows[idx][1]
+        other_order = rows[swap_idx][1]
+        cursor.execute("UPDATE categories SET sort_order = %s WHERE id = %s", (other_order, cat_id))
+        cursor.execute("UPDATE categories SET sort_order = %s WHERE id = %s", (cur_order, other_id))
+        conn.commit()
     finally: release_db(conn)
 
 def toggle_category_visibility(cat_id, hide):
@@ -1062,20 +1094,55 @@ def cb_edit_cat_opts(call):
     cats = get_categories()
     cat = next((c for c in cats if c[0] == cat_id), None)
     if not cat: return bot.answer_callback_query(call.id, "Category not found.")
-    
+
     c_id, c_name, c_hidden = cat
+    cat_ids = [c[0] for c in cats]
+    idx = cat_ids.index(c_id)
+    is_first = (idx == 0)
+    is_last  = (idx == len(cat_ids) - 1)
+
     markup = InlineKeyboardMarkup(row_width=2)
+    # Position controls
+    up_btn   = InlineKeyboardButton("⬆️ Move Up",   callback_data=f"cat_move_{c_id}_up")
+    down_btn = InlineKeyboardButton("⬇️ Move Down", callback_data=f"cat_move_{c_id}_down")
+    none_btn = InlineKeyboardButton(" ",            callback_data="ignore")
+    if is_first:
+        markup.row(none_btn, down_btn)
+    elif is_last:
+        markup.row(up_btn, none_btn)
+    else:
+        markup.row(up_btn, down_btn)
+    markup.add(InlineKeyboardButton(f"📄 Position: {idx + 1} of {len(cats)}", callback_data="ignore"))
+
+    # Visibility
     if c_hidden:
         markup.add(InlineKeyboardButton("👁️ Unhide Category", callback_data=f"toggle_hide_{c_id}_0"))
     else:
-        markup.add(InlineKeyboardButton("👻 Hide Category", callback_data=f"toggle_hide_{c_id}_1"))
-    
+        markup.add(InlineKeyboardButton("👻 Hide Category",   callback_data=f"toggle_hide_{c_id}_1"))
+
     markup.add(InlineKeyboardButton("🗑️ Delete Category", callback_data=f"del_cat_init_{c_id}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_edit_cats_list"))
-    
+
     status_text = "HIDDEN" if c_hidden else "VISIBLE"
-    bot.edit_message_text(f"✏️ **Editing: {c_name}**\nCurrent Status: `{status_text}`", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.edit_message_text(
+        f"✏️ **Editing: {c_name}**\n"
+        f"Status: `{status_text}` • Position: `{idx + 1} of {len(cats)}`",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=markup, parse_mode="Markdown"
+    )
     bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cat_move_"))
+def cb_cat_move(call):
+    if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
+    parts = call.data.split('_')  # cat_move_{cat_id}_{up|down}
+    cat_id = int(parts[2])
+    direction = -1 if parts[3] == 'up' else 1
+    move_category(cat_id, direction)
+    bot.answer_callback_query(call.id, "✅ Position updated!")
+    # Refresh the edit panel with the new order
+    call.data = f"edit_cat_opts_{cat_id}"
+    cb_edit_cat_opts(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("toggle_hide_"))
 def cb_toggle_hide(call):
