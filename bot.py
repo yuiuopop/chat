@@ -686,9 +686,13 @@ def handle_media_upload(message):
     else: return
 
     if check_duplicate_media(file_unique_id):
-        bot.react(message.chat.id, message.message_id) if False else None  # skip dupe silently
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except: pass
         return
     add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
+    # Delete admin's message to keep chat clean, then update counter
+    try: bot.delete_message(message.chat.id, message.message_id)
+    except: pass
     _update_session_message(admin_id)
 
 @bot.message_handler(content_types=['animation', 'sticker'])
@@ -713,8 +717,13 @@ def handle_gif_sticker_upload(message):
         media_type = 'sticker'
     else: return
 
-    if check_duplicate_media(file_unique_id): return
+    if check_duplicate_media(file_unique_id):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except: pass
+        return
     add_media(file_id, media_type, file_unique_id, category_id=active_cat_id)
+    try: bot.delete_message(message.chat.id, message.message_id)
+    except: pass
     _update_session_message(admin_id)
 
 @bot.message_handler(func=lambda message: True)
@@ -745,6 +754,8 @@ def handle_text(message):
         ctype = admin_content_type.get(user_id)
         if active_cat_id and ctype == 'text':
             add_text_content(text, active_cat_id)
+            try: bot.delete_message(message.chat.id, message.message_id)
+            except: pass
             _update_session_message(user_id)
             return
 
@@ -758,40 +769,68 @@ def handle_text(message):
 def process_media_request(message, cat_id, cat_name, admin_mode):
     user_id = message.from_user.id
     points = get_points(user_id)
-    
+    ctype = get_category_content_type(cat_id)  # 'media', 'gif_sticker', or 'text'
+    is_free = ctype in ('text', 'gif_sticker')  # non-media types are always free
+
     if not admin_mode:
+        # Referral gate (applies to all types)
         req_refs = get_category_req(cat_id)
         if req_refs > 0:
             actual_refs = get_total_referrals(user_id)
             if actual_refs < req_refs:
                 return bot.reply_to(message, f"🔒 **Access Denied!**\n\nThe `{cat_name}` category requires at least **{req_refs} successful referrals** to unlock.\nYou currently have {actual_refs} referrals.\n\nUse your `🔗 Referral` link to invite more friends!", parse_mode="Markdown")
-                
-        if points < MEDIA_COST:
+
+        # Points gate — only for paid (media) categories
+        if not is_free and points < MEDIA_COST:
             return bot.reply_to(message, f"❌ You don't have enough points left!\nClick '🔗 Referral' to get your invite link.")
-        
+
     media = get_random_media(cat_id)
     if not media:
-        return bot.reply_to(message, f"Currently there is no media available in {cat_name}. Check back later!")
-        
+        return bot.reply_to(message, f"Currently there is no content available in {cat_name}. Check back later!")
+
     _id, file_id, media_type = media
-    
-    if not admin_mode:
+
+    if not admin_mode and not is_free:
         update_points(user_id, -MEDIA_COST)
         update_media_received(user_id)
         increment_user_category_stat(user_id, cat_id)
         new_points = points - MEDIA_COST
-        
         caption_tmpl = get_setting('media_caption', "Enjoy this from {cat_name}! 🍿\nRemaining points: {points}")
         caption_text = caption_tmpl.replace("{cat_name}", cat_name).replace("{points}", str(new_points))
+    elif not admin_mode and is_free:
+        update_media_received(user_id)
+        increment_user_category_stat(user_id, cat_id)
+        caption_text = f"🍿 {cat_name}"
     else:
         caption_text = f"🍿 {cat_name}\n[👑 Admin View: Unlimited]\n[ID: {_id}]"
-    
+
+    # Fetch the content field for text items
+    conn = get_db()
     try:
-        if media_type == 'photo': bot.send_photo(user_id, file_id, caption=caption_text)
-        elif media_type == 'video': bot.send_video(user_id, file_id, caption=caption_text)
-        else: bot.send_document(user_id, file_id, caption=caption_text)
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM media WHERE id = %s", (_id,))
+        row = cursor.fetchone()
+        content_text = row[0] if row else None
+    finally:
+        release_db(conn)
+
+    try:
+        if media_type == 'text':
+            bot.send_message(user_id, content_text or "📝 (empty)")
+        elif media_type == 'animation':
+            bot.send_animation(user_id, file_id, caption=caption_text if not is_free else None)
+        elif media_type == 'sticker':
+            bot.send_sticker(user_id, file_id)
+        elif media_type == 'photo':
+            bot.send_photo(user_id, file_id, caption=caption_text)
+        elif media_type == 'video':
+            bot.send_video(user_id, file_id, caption=caption_text)
+        else:
+            bot.send_document(user_id, file_id, caption=caption_text)
     except:
-        if not admin_mode: update_points(user_id, MEDIA_COST)
+        # Refund points on failure if it was a paid request
+        if not admin_mode and not is_free:
+            update_points(user_id, MEDIA_COST)
 
 # ================= Admin Callbacks =================
 
