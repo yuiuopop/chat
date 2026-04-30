@@ -805,7 +805,7 @@ def cb_admin_setcat(call):
     if not cats: return bot.answer_callback_query(call.id, "No categories exist!")
     
     markup = InlineKeyboardMarkup()
-    for c_id, c_name in cats: markup.add(InlineKeyboardButton(c_name, callback_data=f"setactive_{c_id}"))
+    for c_id, c_name, c_hidden in cats: markup.add(InlineKeyboardButton(c_name, callback_data=f"setactive_{c_id}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
     
     bot.edit_message_text("🏷️ **Select Upload Category**\n\nAll media you send to the bot will be automatically stored there:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -827,7 +827,7 @@ def cb_admin_limits(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     cats = get_categories()
     markup = InlineKeyboardMarkup()
-    for c_id, c_name in cats: 
+    for c_id, c_name, c_hidden in cats: 
         reqs = get_category_req(c_id)
         markup.add(InlineKeyboardButton(f"{c_name} (Req: {reqs} refs)", callback_data=f"manage_req_{c_id}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
@@ -856,7 +856,7 @@ def cb_manage_cats(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     cats = get_categories()
     markup = InlineKeyboardMarkup()
-    for c_id, c_name in cats: 
+    for c_id, c_name, c_hidden in cats: 
         m_count = get_cat_stats(c_id)
         markup.add(InlineKeyboardButton(f"{c_name} ({m_count} items)", callback_data=f"manage_divs_{c_id}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
