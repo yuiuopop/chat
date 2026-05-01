@@ -744,7 +744,7 @@ def handle_start(message):
         except: pass
             
     if admin_mode:
-        bot.reply_to(message, "👑 **Admin Access Granted!** Welcome to your media bot.", reply_markup=get_main_keyboard(admin=True), parse_mode="Markdown")
+        bot.reply_to(message, "⚙️ <b>Admin Access Granted!</b>\n<blockquote>Welcome to your control center.</blockquote>", reply_markup=get_main_keyboard(admin=True), parse_mode="HTML")
     else:
         # 🔥 Firewall check for new/existing users on /start
         missing = check_user_firewall(user_id)
@@ -931,17 +931,17 @@ def handle_text(message):
     if text == "💰 Balance":
         user = get_user(user_id)
         if not user: return bot.reply_to(message, "Please type /start first.")
-        bot.reply_to(message, f"👤 **Account Information**\n\n💳 **Wallet Balance:** {user[2]} points\n📅 **Date of Joining:** {user[4]}", parse_mode="Markdown")
+        bot.reply_to(message, f"💼 <b>Account Information</b>\n\n<blockquote>💳 <b>Balance:</b> {user[2]} Points\n📅 <b>Joined:</b> {user[4]}</blockquote>", parse_mode="HTML")
         return
         
     if text == "🔗 Referral":
         points = get_points(user_id)
         referral_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
-        bot.reply_to(message, f"⭐️ **Your Stats**\nCurrent Points: {points}\n\n💎 **Your Invite Link**\n`{referral_link}`\n\nFor every friend who joins, you get {REFERRAL_BONUS} extra points!", parse_mode="Markdown")
+        bot.reply_to(message, f"🎁 <b>Referral System</b>\n\n<blockquote>🏆 <b>Your Points:</b> {points}</blockquote>\n\n🔗 <b>Your Invite Link:</b>\n<code>{referral_link}</code>\n\n<i>Invite friends to earn +{REFERRAL_BONUS} points each!</i>", parse_mode="HTML")
         return
         
     if text == "👑 Admin Panel" and admin_mode:
-        bot.reply_to(message, "👑 **Admin Control Panel**\nSelect an operation below:", reply_markup=get_admin_panel_markup(user_id), parse_mode="Markdown")
+        bot.reply_to(message, "⚙️ <b>Admin Control Panel</b>\n<blockquote>Select an operation below to manage the bot.</blockquote>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
         return
 
     # 📝 Text upload during active session
@@ -1086,13 +1086,13 @@ def cb_fw_toggle(call):
 @bot.callback_query_handler(func=lambda call: call.data == "fw_edit_msg")
 def cb_fw_edit_msg(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
-    msg = bot.send_message(call.message.chat.id, "✍️ Send the new Firewall prompt message.\n\n_Note: The join buttons will be attached automatically.\nTip: Highlight text and use Telegram's formatting menu to add Quotes or Highlights!_")
+    msg = bot.send_message(call.message.chat.id, "✍️ Send the new Firewall prompt message.\n\n_Note: Buttons attached automatically.\nTip: Use HTML tags like <b>bold</b> or <blockquote>quote</blockquote>_")
     bot.register_next_step_handler(msg, process_fw_edit_msg)
     bot.answer_callback_query(call.id)
 
 def process_fw_edit_msg(message):
     if not is_admin(message.from_user.id): return
-    set_setting('firewall_message', getattr(message, 'html_text', message.text))
+    set_setting('firewall_message', message.text)
     bot.reply_to(message, "✅ Firewall message updated.")
     _show_firewall_menu(message.chat.id)
 
@@ -1154,7 +1154,16 @@ def cb_fw_check_join(call):
         bot.answer_callback_query(call.id, "✅ Thank you for joining!", show_alert=True)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        bot.send_message(call.message.chat.id, "🎉 **Access Granted!** You can now use the bot.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, "🎉 <b>Access Granted!</b>\n<blockquote>You can now use the bot.</blockquote>", reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+# ================= Chat Join Requests =================
+@bot.chat_join_request_handler()
+def handle_join_request(message):
+    """Automatically approve users who request to join firewall channels."""
+    try:
+        bot.approve_chat_join_request(message.chat.id, message.from_user.id)
+    except Exception as e:
+        print(f"Failed to auto-approve join request: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tools")
 def cb_admin_tools(call):
@@ -1169,7 +1178,7 @@ def cb_admin_tools(call):
 @bot.callback_query_handler(func=lambda call: call.data == "tool_edit_start")
 def cb_edit_start_init(call):
     if not is_admin(call.from_user.id): return
-    msg = bot.send_message(call.message.chat.id, "✍️ Please send the new **Start Message** text.\n\n_Tip: Highlight text and use Telegram's built-in formatting menu to add Bold, Blockquotes, Spoilers, and Code Blocks!_")
+    msg = bot.send_message(call.message.chat.id, "✍️ Please send the new **Start Message** text.\n\n_Tip: Use HTML tags! Example:\n<b>bold</b>, <i>italic</i>, <code>code</code>, <blockquote>quote</blockquote>_")
     bot.register_next_step_handler(msg, process_start_msg_edit)
     bot.answer_callback_query(call.id)
 
