@@ -755,7 +755,7 @@ def handle_start(message):
         except: pass
             
     if admin_mode:
-        bot.reply_to(message, "⚙️ <b>Admin Access Granted!</b>\n<blockquote>Welcome to your control center.</blockquote>", reply_markup=get_main_keyboard(admin=True), parse_mode="HTML")
+        bot.reply_to(message, "<b>❖ SYSTEM ACCESS ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Welcome to your control center.</i>", reply_markup=get_main_keyboard(admin=True), parse_mode="HTML")
     else:
         # 🛡️ Security Gate check for new/existing users on /start
         missing = check_user_firewall(user_id)
@@ -942,17 +942,17 @@ def handle_text(message):
     if text == "💰 Balance":
         user = get_user(user_id)
         if not user: return bot.reply_to(message, "Please type /start first.")
-        bot.reply_to(message, f"💼 <b>Account Information</b>\n\n<blockquote>💳 <b>Balance:</b> {user[2]} Points\n📅 <b>Joined:</b> {user[4]}</blockquote>", parse_mode="HTML")
+        bot.reply_to(message, f"<b>❖ ACCOUNT INFO ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>💳 Balance: {user[2]} Points\n📅 Joined: {user[4]}</i>", parse_mode="HTML")
         return
         
     if text == "🔗 Referral":
         points = get_points(user_id)
         referral_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
-        bot.reply_to(message, f"🎁 <b>Referral System</b>\n\n<blockquote>🏆 <b>Your Points:</b> {points}</blockquote>\n\n🔗 <b>Your Invite Link:</b>\n<code>{referral_link}</code>\n\n<i>Invite friends to earn +{REFERRAL_BONUS} points each!</i>", parse_mode="HTML")
+        bot.reply_to(message, f"<b>❖ REFERRAL SYSTEM ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>🏆 Your Points: {points}</i>\n\n<b>🔗 Invite Link:</b>\n<code>{referral_link}</code>\n\n<i>Invite friends to earn +{REFERRAL_BONUS} points each!</i>", parse_mode="HTML")
         return
         
     if text == "👑 Admin Panel" and admin_mode:
-        bot.reply_to(message, "<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
+        bot.reply_to(message, "<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
         return
 
     # 📝 Text upload during active session
@@ -1165,7 +1165,7 @@ def cb_fw_check_join(call):
         bot.answer_callback_query(call.id, "✅ Thank you for joining!", show_alert=True)
         try: bot.delete_message(call.message.chat.id, call.message.message_id)
         except: pass
-        bot.send_message(call.message.chat.id, "🎉 <b>Access Granted!</b>\n<blockquote>You can now use the bot.</blockquote>", reply_markup=get_main_keyboard(), parse_mode="HTML")
+        bot.send_message(call.message.chat.id, "<b>❖ ACCESS GRANTED ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>You can now use the bot.</i>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 # ================= Chat Join Requests =================
 @bot.chat_join_request_handler()
@@ -1626,7 +1626,7 @@ def cb_admin_limits(call):
         reqs = get_category_req(c_id)
         markup.add(InlineKeyboardButton(f"{c_name} (Req: {reqs} refs)", callback_data=f"manage_req_{c_id}"))
     markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
-    bot.edit_message_text("<b>❖ CATEGORY LIMITS ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Configure referral requirements.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    bot.edit_message_text("<b>❖ CATEGORY LIMITS ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Configure referral requirements.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_req_"))
@@ -1637,12 +1637,12 @@ def cb_manage_req(call):
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
     
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, f"⚙️ To change the referral requirement for **{cat_name}**, type:\n`/setreq {cat_id} <limit>`\n_Example: /setreq {cat_id} 5_", parse_mode="HTML")
+    bot.send_message(call.message.chat.id, f"<b>❖ UPDATE LIMITS ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>To change the requirement for <b>{cat_name}</b>, type:</i>\n<code>/setreq {cat_id} &lt;limit&gt;</code>", parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
-    bot.edit_message_text("<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
+    bot.edit_message_text("<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 # --- Media Management via Categories ---
@@ -1656,7 +1656,7 @@ def cb_manage_cats(call):
         markup.add(InlineKeyboardButton(f"{c_name} ({m_count} items)", callback_data=f"manage_divs_{c_id}"))
     markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
-    bot.edit_message_text("<b>❖ MEDIA LIBRARY ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select a category to view its content.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    bot.edit_message_text("<b>❖ MEDIA LIBRARY ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select a category to view its content.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_divs_"))
