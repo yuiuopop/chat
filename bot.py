@@ -1642,7 +1642,7 @@ def cb_manage_req(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
-    bot.edit_message_text("┌ <b>⚙️ Admin Control Panel</b>\\n├ <b>Status:</b> <code>Active</code>\\n└ <i>Select an operation below to manage the bot.</i>", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
+    bot.edit_message_text("<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 # --- Media Management via Categories ---
@@ -1656,7 +1656,7 @@ def cb_manage_cats(call):
         markup.add(InlineKeyboardButton(f"{c_name} ({m_count} items)", callback_data=f"manage_divs_{c_id}"))
     markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
-    bot.edit_message_text("┌ <b>🔮 Media Library</b>\\n├ <b>Status:</b> <code>Active</code>\\n└ <i>Select a category to view its content.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    bot.edit_message_text("<b>❖ MEDIA LIBRARY ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select a category to view its content.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_divs_"))
