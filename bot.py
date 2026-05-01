@@ -1082,7 +1082,7 @@ def _show_firewall_menu(chat_id, message_id=None):
     markup.add(InlineKeyboardButton("‹ Back to Admin Panel", callback_data="admin_panel_back"))
     
     if message_id:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
+        bot.edit_message_text("<b>❖ SECURITY GATE ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Manage forced-join channels.</i>", chat_id, message_id, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
     else:
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
 
