@@ -598,16 +598,27 @@ def get_main_keyboard(admin=False):
     return markup
 
 def get_admin_panel_markup(user_id=None):
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"))
-    markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"),
-               InlineKeyboardButton("🏷️ Set Upload Category", callback_data="admin_setcat"))
-    markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
-               InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
-    markup.row(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"),
-               InlineKeyboardButton("🔥 Firewall", callback_data="admin_firewall"))
+    markup = InlineKeyboardMarkup()
+    
+    # Aesthetic styling: 「 Emoji Original Name 」
+    markup.add(InlineKeyboardButton("「 📊 User Stats 」", callback_data="admin_stats"))
+    
+    markup.row(
+        InlineKeyboardButton("「 🛠️ Manage Categories 」", callback_data="admin_manage_categories"),
+        InlineKeyboardButton("「 📁 Manage Media 」", callback_data="manage_cats")
+    )
+    markup.row(
+        InlineKeyboardButton("「 🏷️ Set Upload Category 」", callback_data="admin_setcat"),
+        InlineKeyboardButton("「 ⚙️ Category Limits 」", callback_data="admin_limits")
+    )
+    markup.row(
+        InlineKeyboardButton("「 🔥 Firewall 」", callback_data="admin_firewall"),
+        InlineKeyboardButton("「 🛠️ Tools 」", callback_data="admin_tools")
+    )
+    
     if user_id and is_super_admin(user_id):
-        markup.add(InlineKeyboardButton("👥 Manage Admins", callback_data="admin_manage_admins"))
+        markup.add(InlineKeyboardButton("「 👥 Manage Admins 」", callback_data="admin_manage_admins"))
+        
     return markup
 
 def generate_divisions_markup(cat_id):
@@ -941,7 +952,7 @@ def handle_text(message):
         return
         
     if text == "👑 Admin Panel" and admin_mode:
-        bot.reply_to(message, "⚙️ <b>Admin Control Panel</b>\n<blockquote>Select an operation below to manage the bot.</blockquote>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
+        bot.reply_to(message, "⚙️ <b>Admin Control Panel</b>\n━━━━━━━━━━━━━━━━━━━━\n<blockquote>Select an operation below to manage the bot.</blockquote>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
         return
 
     # 📝 Text upload during active session
