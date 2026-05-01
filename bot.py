@@ -601,23 +601,23 @@ def get_admin_panel_markup(user_id=None):
     markup = InlineKeyboardMarkup()
     
     # Aesthetic styling: Emoji Original Name
-    markup.add(InlineKeyboardButton("📈 User Stats", callback_data="admin_stats"))
+    markup.add(InlineKeyboardButton("⚡️ Analytics", callback_data="admin_stats"))
     
     markup.row(
-        InlineKeyboardButton("🗂️ Manage Categories", callback_data="admin_manage_categories"),
-        InlineKeyboardButton("📂 Manage Media", callback_data="manage_cats")
+        InlineKeyboardButton("🗂️ Categories", callback_data="admin_manage_categories"),
+        InlineKeyboardButton("🔮 Media Library", callback_data="manage_cats")
     )
     markup.row(
-        InlineKeyboardButton("☁️ Set Upload Category", callback_data="admin_setcat"),
-        InlineKeyboardButton("🛡️ Category Limits", callback_data="admin_limits")
+        InlineKeyboardButton("📤 Upload Media", callback_data="admin_setcat"),
+        InlineKeyboardButton("🔐 Access Rules", callback_data="admin_limits")
     )
     markup.row(
-        InlineKeyboardButton("🚧 Firewall", callback_data="admin_firewall"),
-        InlineKeyboardButton("🎨 Tools", callback_data="admin_tools")
+        InlineKeyboardButton("🛡️ Security Gate", callback_data="admin_firewall"),
+        InlineKeyboardButton("⚙️ Settings", callback_data="admin_tools")
     )
     
     if user_id and is_super_admin(user_id):
-        markup.add(InlineKeyboardButton("👨‍💻 Manage Admins", callback_data="admin_manage_admins"))
+        markup.add(InlineKeyboardButton("👑 Admin Team", callback_data="admin_manage_admins"))
         
     return markup
 
@@ -627,7 +627,7 @@ def generate_divisions_markup(cat_id):
     
     if total_media == 0:
         markup.add(InlineKeyboardButton("No media in this category.", callback_data="ignore"))
-        markup.add(InlineKeyboardButton("⬅️ Back to Categories", callback_data="manage_cats"))
+        markup.add(InlineKeyboardButton("‹ Back to Categories", callback_data="manage_cats"))
         return markup
         
     chunk_size = 100
@@ -640,8 +640,8 @@ def generate_divisions_markup(cat_id):
         btn_text = f"📂 Media {start_count} - {end_count}"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"manage_page_{cat_id}_{target_page}"))
         
-    markup.add(InlineKeyboardButton("🧨 Wipe Category 🧨", callback_data=f"wipe_media_init_{cat_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back to Categories", callback_data="manage_cats"))
+    markup.add(InlineKeyboardButton("⚠️ Purge All", callback_data=f"wipe_media_init_{cat_id}"))
+    markup.add(InlineKeyboardButton("‹ Back to Categories", callback_data="manage_cats"))
     return markup
 
 def generate_manage_markup(cat_id, page):
@@ -656,8 +656,8 @@ def generate_manage_markup(cat_id, page):
     
     if media_items:
         for m_id, m_type in media_items:
-            preview_btn = InlineKeyboardButton(f"🔍 Preview [{m_type.upper()} {m_id}]", callback_data=f"preview_{m_id}_{cat_id}_{page}")
-            delete_btn = InlineKeyboardButton(f"🗑️ Delete", callback_data=f"delmedia_{m_id}_{cat_id}_{page}")
+            preview_btn = InlineKeyboardButton(f"👁️ Preview [{m_type.upper()} {m_id}]", callback_data=f"preview_{m_id}_{cat_id}_{page}")
+            delete_btn = InlineKeyboardButton(f"🗑️ Remove", callback_data=f"delmedia_{m_id}_{cat_id}_{page}")
             markup.add(preview_btn, delete_btn)
             
         nav_buttons = []
@@ -674,11 +674,11 @@ def generate_manage_markup(cat_id, page):
             nav_buttons.append(InlineKeyboardButton(" ", callback_data="ignore"))
             
         markup.row(*nav_buttons)
-        markup.add(InlineKeyboardButton("⬅️ Back to Folders", callback_data=f"manage_divs_{cat_id}"))
-        markup.add(InlineKeyboardButton("🧨 Wipe Category 🧨", callback_data=f"wipe_media_init_{cat_id}"))
+        markup.add(InlineKeyboardButton("‹ Back to Folders", callback_data=f"manage_divs_{cat_id}"))
+        markup.add(InlineKeyboardButton("⚠️ Purge All", callback_data=f"wipe_media_init_{cat_id}"))
     else:
         markup.add(InlineKeyboardButton("No media found.", callback_data="ignore"))
-        markup.add(InlineKeyboardButton("⬅️ Back to Folders", callback_data=f"manage_divs_{cat_id}"))
+        markup.add(InlineKeyboardButton("‹ Back to Folders", callback_data=f"manage_divs_{cat_id}"))
         
     return markup
 
@@ -757,7 +757,7 @@ def handle_start(message):
     if admin_mode:
         bot.reply_to(message, "⚙️ <b>Admin Access Granted!</b>\n<blockquote>Welcome to your control center.</blockquote>", reply_markup=get_main_keyboard(admin=True), parse_mode="HTML")
     else:
-        # 🚧 Firewall check for new/existing users on /start
+        # 🛡️ Security Gate check for new/existing users on /start
         missing = check_user_firewall(user_id)
         if missing:
             send_firewall_prompt(message.chat.id, missing)
@@ -819,14 +819,14 @@ def _build_session_text(cat_id, cat_name, ctype, admin_id=None):
         f"📄 Items in category: **{count}**\n"
         f"{stats_line}\n"
         f"ℹ️ {instruction}\n\n"
-        f"Press **✅ Done** when finished, or **⬅️ Back** to change category."
+        f"Press **✅ Done** when finished, or **‹ Back** to change category."
     )
 
 def _build_session_markup(cat_id):
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("✅ Done", callback_data=f"upload_done_{cat_id}"),
-        InlineKeyboardButton("⬅️ Back", callback_data="admin_setcat")
+        InlineKeyboardButton("‹ Back", callback_data="admin_setcat")
     )
     return markup
 
@@ -932,7 +932,7 @@ def handle_text(message):
     admin_mode = is_admin(user_id)
     text = message.text
 
-    # 🚧 Firewall check — blocks non-admins who haven't joined required channels
+    # 🛡️ Security Gate check — blocks non-admins who haven't joined required channels
     if not admin_mode:
         missing = check_user_firewall(user_id)
         if missing:
@@ -952,7 +952,7 @@ def handle_text(message):
         return
         
     if text == "👑 Admin Panel" and admin_mode:
-        bot.reply_to(message, "┌ <b>⚙️ Admin Control Panel</b>\n├ <b>Status:</b> <code>Active</code>\n└ <i>Select an operation below to manage the bot.</i>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
+        bot.reply_to(message, "<b>❖ ADMIN CONTROL PANEL ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Select an operation below to manage the bot.</i>", reply_markup=get_admin_panel_markup(user_id), parse_mode="HTML")
         return
 
     # 📝 Text upload during active session
@@ -1064,8 +1064,8 @@ def _show_firewall_menu(chat_id, message_id=None):
     else:
         markup.add(InlineKeyboardButton("🔴 Firewall: DISABLED (Click to Enable)", callback_data="fw_toggle_1"))
         
-    markup.add(InlineKeyboardButton("✏️ Edit Firewall Message", callback_data="fw_edit_msg"))
-    markup.add(InlineKeyboardButton("🔗 Add Channel/Group", callback_data="fw_add_channel"))
+    markup.add(InlineKeyboardButton("✍️ Edit Firewall Alert", callback_data="fw_edit_msg"))
+    markup.add(InlineKeyboardButton("➕ Add Channel", callback_data="fw_add_channel"))
     
     text = "🔥 **Firewall Management**\n\n"
     text += f"**Status:** {'Enabled' if enabled else 'Disabled'}\n"
@@ -1079,7 +1079,7 @@ def _show_firewall_menu(chat_id, message_id=None):
     else:
         text += "_None added yet._\n"
         
-    markup.add(InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back to Admin Panel", callback_data="admin_panel_back"))
     
     if message_id:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
@@ -1180,9 +1180,9 @@ def handle_join_request(message):
 def cb_admin_tools(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(InlineKeyboardButton("✏️ Edit Start Message", callback_data="tool_edit_start"))
-    markup.add(InlineKeyboardButton("📝 Edit Media Caption", callback_data="tool_edit_caption"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("✍️ Edit Greeting", callback_data="tool_edit_start"))
+    markup.add(InlineKeyboardButton("✍️ Edit Captions", callback_data="tool_edit_caption"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     bot.edit_message_text("🛠️ **Admin Tools**\nCustomize your bot's automated messages:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
@@ -1224,7 +1224,7 @@ def cb_admin_stats(call):
     
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(InlineKeyboardButton("👥 User List", callback_data="admin_user_list_0"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
     try: bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     except: pass
@@ -1253,7 +1253,7 @@ def cb_admin_user_list(call):
         if page < total_pages - 1: nav_btns.append(InlineKeyboardButton("➡️", callback_data=f"admin_user_list_{page+1}"))
         markup.row(*nav_btns)
         
-    markup.add(InlineKeyboardButton("⬅️ Back to Stats", callback_data="admin_stats"))
+    markup.add(InlineKeyboardButton("‹ Back to Stats", callback_data="admin_stats"))
     
     bot.edit_message_text("👥 **User Directory**\nSelect a user to view their full profile:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
@@ -1289,7 +1289,7 @@ def cb_admin_user_detail(call):
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("💰 Give Points", callback_data=f"givepoints_init_{user_id}_{back_page}"),
-        InlineKeyboardButton("⬅️ Back to List", callback_data=f"admin_user_list_{back_page}")
+        InlineKeyboardButton("‹ Back to List", callback_data=f"admin_user_list_{back_page}")
     )
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
@@ -1317,7 +1317,7 @@ def cb_manage_cats_main(call):
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(InlineKeyboardButton("➕ Create New Category", callback_data="admin_newcat"))
     markup.add(InlineKeyboardButton("✏️ Edit/Hide/Delete Categories", callback_data="admin_edit_cats_list"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     bot.edit_message_text("🛠️ **Category Management**\nWhat would you like to do?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
@@ -1329,7 +1329,7 @@ def cb_edit_cats_list(call):
     for c_id, c_name, c_hidden in cats:
         status = "👻 " if c_hidden else ""
         markup.add(InlineKeyboardButton(f"{status}{c_name}", callback_data=f"edit_cat_opts_{c_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_manage_categories"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_manage_categories"))
     bot.edit_message_text("✏️ **Select Category to Edit**\nGhost icon (👻) means category is hidden from users.", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
@@ -1361,12 +1361,12 @@ def cb_edit_cat_opts(call):
 
     # Visibility
     if c_hidden:
-        markup.add(InlineKeyboardButton("👀 Unhide Category", callback_data=f"toggle_hide_{c_id}_0"))
+        markup.add(InlineKeyboardButton("👁️ Unhide", callback_data=f"toggle_hide_{c_id}_0"))
     else:
-        markup.add(InlineKeyboardButton("🙈 Hide Category",   callback_data=f"toggle_hide_{c_id}_1"))
+        markup.add(InlineKeyboardButton("👻 Hide",   callback_data=f"toggle_hide_{c_id}_1"))
 
-    markup.add(InlineKeyboardButton("🧨 Delete Category", callback_data=f"del_cat_init_{c_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_edit_cats_list"))
+    markup.add(InlineKeyboardButton("❌ Delete Folder", callback_data=f"del_cat_init_{c_id}"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_edit_cats_list"))
 
     status_text = "HIDDEN" if c_hidden else "VISIBLE"
     bot.edit_message_text(
@@ -1428,7 +1428,7 @@ def cb_admin_setcat(call):
     
     markup = InlineKeyboardMarkup()
     for c_id, c_name, c_hidden in cats: markup.add(InlineKeyboardButton(c_name, callback_data=f"setactive_{c_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
     bot.edit_message_text("🏷️ **Select Upload Category**\n\nAll media you send to the bot will be automatically stored there:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
@@ -1451,7 +1451,7 @@ def cb_setactive(call):
             InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
             InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
             InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
-            InlineKeyboardButton("⬅️ Back",                         callback_data="admin_setcat")
+            InlineKeyboardButton("‹ Back",                         callback_data="admin_setcat")
         )
         bot.edit_message_text(
             f"🏷️ **Category: {cat_name}**\n\nThis is your first time setting up this category.\nWhat type of content will it hold?",
@@ -1485,11 +1485,11 @@ def _show_category_dashboard(call, cat_id):
 
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("📥 Add Content",    callback_data=f"cat_add_content_{cat_id}"),
-        InlineKeyboardButton("🗑️ Delete Content", callback_data=f"cat_delete_menu_{cat_id}")
+        InlineKeyboardButton("➕ Add Media",    callback_data=f"cat_add_content_{cat_id}"),
+        InlineKeyboardButton("🗑️ Remove Content", callback_data=f"cat_delete_menu_{cat_id}")
     )
-    markup.add(InlineKeyboardButton("⚙️ Change Type", callback_data=f"cat_change_type_{cat_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_setcat"))
+    markup.add(InlineKeyboardButton("🔄 Switch Type", callback_data=f"cat_change_type_{cat_id}"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_setcat"))
 
     try:
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
@@ -1529,7 +1529,7 @@ def cb_cat_change_type(call):
         InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
         InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
         InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
-        InlineKeyboardButton("⬅️ Back",                         callback_data=f"setactive_{cat_id}")
+        InlineKeyboardButton("‹ Back",                         callback_data=f"setactive_{cat_id}")
     )
     bot.edit_message_text(
         f"🏷️ **Change Type: {cat_name}**\n\n⚠️ Changing the content type will affect future uploads only.\nExisting content stays as-is.\n\nSelect new type:",
@@ -1550,7 +1550,7 @@ def cb_cat_delete_menu(call):
     markup.add(
         InlineKeyboardButton("📝 Delete Specific Content", callback_data=f"manage_divs_{cat_id}"),
         InlineKeyboardButton("🚨 Delete ALL Content 🚨",   callback_data=f"wipe_media_init_{cat_id}"),
-        InlineKeyboardButton("⬅️ Back",                        callback_data=f"setactive_{cat_id}")
+        InlineKeyboardButton("‹ Back",                        callback_data=f"setactive_{cat_id}")
     )
     bot.edit_message_text(
         f"🗑️ **Delete Content: {cat_name}**\n\n"
@@ -1607,7 +1607,7 @@ def cb_upload_done(call):
         InlineKeyboardButton("➕ Add More",        callback_data=f"cat_add_content_{cat_id}"),
         InlineKeyboardButton("📂 Dashboard",       callback_data=f"setactive_{cat_id}")
     )
-    markup.add(InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back to Admin Panel", callback_data="admin_panel_back"))
 
     bot.edit_message_text(
         summary,
@@ -1625,8 +1625,8 @@ def cb_admin_limits(call):
     for c_id, c_name, c_hidden in cats: 
         reqs = get_category_req(c_id)
         markup.add(InlineKeyboardButton(f"{c_name} (Req: {reqs} refs)", callback_data=f"manage_req_{c_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
-    bot.edit_message_text("┌ <b>🛡️ Category Limits</b>\n├ <b>Status:</b> <code>Active</code>\n└ <i>Configure referral requirements.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
+    bot.edit_message_text("<b>❖ CATEGORY LIMITS ❖</b>\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n<i>Configure referral requirements.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_req_"))
@@ -1642,7 +1642,7 @@ def cb_manage_req(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
-    bot.edit_message_text("👑 **Admin Control Panel**\nSelect an operation below:", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
+    bot.edit_message_text("┌ <b>⚙️ Admin Control Panel</b>\\n├ <b>Status:</b> <code>Active</code>\\n└ <i>Select an operation below to manage the bot.</i>", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 # --- Media Management via Categories ---
@@ -1654,9 +1654,9 @@ def cb_manage_cats(call):
     for c_id, c_name, c_hidden in cats: 
         m_count = get_cat_stats(c_id)
         markup.add(InlineKeyboardButton(f"{c_name} ({m_count} items)", callback_data=f"manage_divs_{c_id}"))
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
-    bot.edit_message_text("📁 **Manage Categories**\nSelect a category to explore its media:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    bot.edit_message_text("┌ <b>🔮 Media Library</b>\\n├ <b>Status:</b> <code>Active</code>\\n└ <i>Select a category to view its content.</i>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_divs_"))
@@ -1731,7 +1731,7 @@ def cb_wipe_confirm(call):
     bot.answer_callback_query(call.id, "Wiped!")
     
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("⬅️ Back to Categories", callback_data="manage_cats"))
+    markup.add(InlineKeyboardButton("‹ Back to Categories", callback_data="manage_cats"))
     bot.edit_message_text("✅ Category emptied successfully.", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "ignore")
@@ -1885,7 +1885,7 @@ def cb_manage_admins(call):
         text += "_No sub-admins added yet._\n"
     
     text += "\nℹ️ Use `/addadmin <user_id>` to add a new admin."
-    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="admin_panel_back"))
+    markup.add(InlineKeyboardButton("‹ Back", callback_data="admin_panel_back"))
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
     bot.answer_callback_query(call.id)
