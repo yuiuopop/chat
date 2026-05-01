@@ -123,11 +123,11 @@ def init_db():
                 WHERE categories.id = sub.id
             """)
 
-        cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("Welcome to the Media Bot! 📺\nUse the menu below to navigate.",))
-        cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("Enjoy this from {cat_name}! 🍿\nRemaining points: {points}",))
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('start_message', %s) ON CONFLICT (key) DO NOTHING", ("<b>Welcome to the Media Bot!</b> 📺\n<blockquote>Use the menu below to navigate.</blockquote>",))
+        cursor.execute("INSERT INTO settings (key, value) VALUES ('media_caption', %s) ON CONFLICT (key) DO NOTHING", ("<blockquote>Enjoy this from <b>{cat_name}</b>! 🍿</blockquote>\n<code>Remaining points: {points}</code>",))
         cursor.execute("INSERT INTO settings (key, value) VALUES ('firewall_enabled', 'false') ON CONFLICT (key) DO NOTHING")
         cursor.execute("INSERT INTO settings (key, value) VALUES ('firewall_message', %s) ON CONFLICT (key) DO NOTHING",
-                       ("🔒 **You must join our channel(s) to use this bot.**\n\nPlease join the channel(s) below, then press ✅ **I Joined**.",))
+                       ("<blockquote>🔒 <b>You must join our channel(s) to use this bot.</b></blockquote>\n\nPlease join the channel(s) below, then press ✅ <b>I Joined</b>.",))
 
         cursor.execute("SELECT id FROM categories LIMIT 1")
         if not cursor.fetchone():
@@ -581,7 +581,7 @@ def send_firewall_prompt(chat_id, missing_channels):
     for _fw_id, btn_name, invite_link in missing_channels:
         markup.add(InlineKeyboardButton(f"🔗 {btn_name}", url=invite_link))
     markup.add(InlineKeyboardButton("✅ I Joined — Check Again", callback_data="fw_check_join"))
-    bot.send_message(chat_id, fw_msg, reply_markup=markup, parse_mode="Markdown")
+    bot.send_message(chat_id, fw_msg, reply_markup=markup, parse_mode="HTML")
 
 # ================= UI & Keyboards =================
 def get_main_keyboard(admin=False):
@@ -592,20 +592,20 @@ def get_main_keyboard(admin=False):
     cat_buttons = [KeyboardButton(c[1]) for c in categories]
     markup.add(*cat_buttons)
     
-    markup.add(KeyboardButton("🔗 Referral Link"), KeyboardButton("👤 My Profile"))
+    markup.add(KeyboardButton("🔗 Referral"), KeyboardButton("💰 Balance"))
     if admin:
-        markup.add(KeyboardButton("🛠️ Admin Panel"))
+        markup.add(KeyboardButton("👑 Admin Panel"))
     return markup
 
 def get_admin_panel_markup(user_id=None):
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(InlineKeyboardButton("📊 Bot Analytics", callback_data="admin_stats"))
-    markup.row(InlineKeyboardButton("📁 Folders & Setup", callback_data="admin_manage_categories"),
-               InlineKeyboardButton("☁️ Upload Content", callback_data="admin_setcat"))
-    markup.row(InlineKeyboardButton("🗂️ Media Explorer", callback_data="manage_cats"),
-               InlineKeyboardButton("⚙️ Rate Limits", callback_data="admin_limits"))
-    markup.row(InlineKeyboardButton("📝 Edit Messages", callback_data="admin_tools"),
-               InlineKeyboardButton("🛡️ Firewall System", callback_data="admin_firewall"))
+    markup.add(InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"))
+    markup.row(InlineKeyboardButton("🛠️ Manage Categories", callback_data="admin_manage_categories"),
+               InlineKeyboardButton("🏷️ Set Upload Category", callback_data="admin_setcat"))
+    markup.row(InlineKeyboardButton("📁 Manage Media", callback_data="manage_cats"),
+               InlineKeyboardButton("⚙️ Category Limits", callback_data="admin_limits"))
+    markup.row(InlineKeyboardButton("🛠️ Tools", callback_data="admin_tools"),
+               InlineKeyboardButton("🔥 Firewall", callback_data="admin_firewall"))
     if user_id and is_super_admin(user_id):
         markup.add(InlineKeyboardButton("👥 Manage Admins", callback_data="admin_manage_admins"))
     return markup
@@ -629,7 +629,7 @@ def generate_divisions_markup(cat_id):
         btn_text = f"📂 Media {start_count} - {end_count}"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"manage_page_{cat_id}_{target_page}"))
         
-    markup.add(InlineKeyboardButton("⚠️ Wipe Category", callback_data=f"wipe_media_init_{cat_id}"))
+    markup.add(InlineKeyboardButton("🚨 Wipe Category 🚨", callback_data=f"wipe_media_init_{cat_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Categories", callback_data="manage_cats"))
     return markup
 
@@ -645,7 +645,7 @@ def generate_manage_markup(cat_id, page):
     
     if media_items:
         for m_id, m_type in media_items:
-            preview_btn = InlineKeyboardButton(f"👁️ Preview [{m_type.upper()} {m_id}]", callback_data=f"preview_{m_id}_{cat_id}_{page}")
+            preview_btn = InlineKeyboardButton(f"👀 Preview [{m_type.upper()} {m_id}]", callback_data=f"preview_{m_id}_{cat_id}_{page}")
             delete_btn = InlineKeyboardButton(f"🗑️ Delete", callback_data=f"delmedia_{m_id}_{cat_id}_{page}")
             markup.add(preview_btn, delete_btn)
             
@@ -664,7 +664,7 @@ def generate_manage_markup(cat_id, page):
             
         markup.row(*nav_buttons)
         markup.add(InlineKeyboardButton("🔙 Back to Folders", callback_data=f"manage_divs_{cat_id}"))
-        markup.add(InlineKeyboardButton("⚠️ Wipe Category", callback_data=f"wipe_media_init_{cat_id}"))
+        markup.add(InlineKeyboardButton("🚨 Wipe Category 🚨", callback_data=f"wipe_media_init_{cat_id}"))
     else:
         markup.add(InlineKeyboardButton("No media found.", callback_data="ignore"))
         markup.add(InlineKeyboardButton("🔙 Back to Folders", callback_data=f"manage_divs_{cat_id}"))
@@ -744,16 +744,16 @@ def handle_start(message):
         except: pass
             
     if admin_mode:
-        bot.reply_to(message, "🛠️ **Admin Panel Accessed!** System operations are now available.", reply_markup=get_main_keyboard(admin=True), parse_mode="Markdown")
+        bot.reply_to(message, "👑 **Admin Access Granted!** Welcome to your media bot.", reply_markup=get_main_keyboard(admin=True), parse_mode="Markdown")
     else:
-        # 🛡️ Firewall System check for new/existing users on /start
+        # 🔥 Firewall check for new/existing users on /start
         missing = check_user_firewall(user_id)
         if missing:
             send_firewall_prompt(message.chat.id, missing)
             return
 
-        start_msg = get_setting('start_message', "Welcome to the Media Bot! 📺\nUse the menu below to navigate.")
-        bot.reply_to(message, start_msg, reply_markup=get_main_keyboard())
+        start_msg = get_setting('start_message', "<b>Welcome to the Media Bot!</b> 📺\n<blockquote>Use the menu below to navigate.</blockquote>")
+        bot.reply_to(message, start_msg, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @bot.message_handler(commands=['newcategory'])
 def handle_newcategory(message):
@@ -784,7 +784,7 @@ def flush_upload_batch(chat_id):
 def _build_session_text(cat_id, cat_name, ctype, admin_id=None):
     """Build the live upload session message text."""
     count = get_cat_stats(cat_id)
-    type_labels = {'text': '📝 Text', 'gif_sticker': '🎬 GIFs & Stickers', 'media': '🖼️ Media / Docs'}
+    type_labels = {'text': '📝 Text', 'gif_sticker': '🎬 GIF & Stickers', 'media': '🖼️ Photo / Video / Document'}
     type_label = type_labels.get(ctype, ctype)
     type_instructions = {
         'text': 'Send any text messages to add them to this category.',
@@ -802,10 +802,10 @@ def _build_session_text(cat_id, cat_name, ctype, admin_id=None):
         )
 
     return (
-        f"📡 **Live Upload Session**\n\n"
+        f"📂 **Upload Session Active**\n\n"
         f"🏷️ Name: **{cat_name}**\n"
         f"📦 Type: **{type_label}**\n"
-        f"📄 Total Media: **{count}**\n"
+        f"📄 Items in category: **{count}**\n"
         f"{stats_line}\n"
         f"ℹ️ {instruction}\n\n"
         f"Press **✅ Done** when finished, or **🔙 Back** to change category."
@@ -921,27 +921,27 @@ def handle_text(message):
     admin_mode = is_admin(user_id)
     text = message.text
 
-    # 🛡️ Firewall System check — blocks non-admins who haven't joined required channels
+    # 🔥 Firewall check — blocks non-admins who haven't joined required channels
     if not admin_mode:
         missing = check_user_firewall(user_id)
         if missing:
             send_firewall_prompt(message.chat.id, missing)
             return
     
-    if text == "👤 My Profile":
+    if text == "💰 Balance":
         user = get_user(user_id)
         if not user: return bot.reply_to(message, "Please type /start first.")
         bot.reply_to(message, f"👤 **Account Information**\n\n💳 **Wallet Balance:** {user[2]} points\n📅 **Date of Joining:** {user[4]}", parse_mode="Markdown")
         return
         
-    if text == "🔗 Referral Link":
+    if text == "🔗 Referral":
         points = get_points(user_id)
         referral_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
         bot.reply_to(message, f"⭐️ **Your Stats**\nCurrent Points: {points}\n\n💎 **Your Invite Link**\n`{referral_link}`\n\nFor every friend who joins, you get {REFERRAL_BONUS} extra points!", parse_mode="Markdown")
         return
         
-    if text == "🛠️ Admin Panel" and admin_mode:
-        bot.reply_to(message, "🛠️ **Admin Panel**\nSelect an operation below:", reply_markup=get_admin_panel_markup(user_id), parse_mode="Markdown")
+    if text == "👑 Admin Panel" and admin_mode:
+        bot.reply_to(message, "👑 **Admin Control Panel**\nSelect an operation below:", reply_markup=get_admin_panel_markup(user_id), parse_mode="Markdown")
         return
 
     # 📝 Text upload during active session
@@ -997,7 +997,7 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
         update_media_received(user_id)
         increment_user_category_stat(user_id, cat_id)
         new_points = points - MEDIA_COST
-        caption_tmpl = get_setting('media_caption', "Enjoy this from {cat_name}! 🍿\nRemaining points: {points}")
+        caption_tmpl = get_setting('media_caption', "<blockquote>Enjoy this from <b>{cat_name}</b>! 🍿</blockquote>\n<code>Remaining points: {points}</code>")
         caption_text = caption_tmpl.replace("{cat_name}", cat_name).replace("{points}", str(new_points))
     elif not admin_mode and is_free:
         update_media_received(user_id)
@@ -1018,17 +1018,17 @@ def process_media_request(message, cat_id, cat_name, admin_mode):
 
     try:
         if media_type == 'text':
-            bot.send_message(user_id, content_text or "📝 (empty)")
+            bot.send_message(user_id, content_text or "📝 (empty)", parse_mode="HTML")
         elif media_type == 'animation':
-            bot.send_animation(user_id, file_id, caption=caption_text if not is_free else None)
+            bot.send_animation(user_id, file_id, caption=caption_text if not is_free else None, parse_mode="HTML")
         elif media_type == 'sticker':
             bot.send_sticker(user_id, file_id)
         elif media_type == 'photo':
-            bot.send_photo(user_id, file_id, caption=caption_text)
+            bot.send_photo(user_id, file_id, caption=caption_text, parse_mode="HTML")
         elif media_type == 'video':
-            bot.send_video(user_id, file_id, caption=caption_text)
+            bot.send_video(user_id, file_id, caption=caption_text, parse_mode="HTML")
         else:
-            bot.send_document(user_id, file_id, caption=caption_text)
+            bot.send_document(user_id, file_id, caption=caption_text, parse_mode="HTML")
     except:
         # Refund points on failure if it was a paid request
         if not admin_mode and not is_free:
@@ -1053,8 +1053,8 @@ def _show_firewall_menu(chat_id, message_id=None):
     else:
         markup.add(InlineKeyboardButton("🔴 Firewall: DISABLED (Click to Enable)", callback_data="fw_toggle_1"))
         
-    markup.add(InlineKeyboardButton("✏️ Edit Firewall Message", callback_data="fw_edit_msg"))
-    markup.add(InlineKeyboardButton("🔗 Add Channel/Group", callback_data="fw_add_channel"))
+    markup.add(InlineKeyboardButton("✍️ Edit Firewall Message", callback_data="fw_edit_msg"))
+    markup.add(InlineKeyboardButton("➕ Add Channel/Group", callback_data="fw_add_channel"))
     
     text = "🔥 **Firewall Management**\n\n"
     text += f"**Status:** {'Enabled' if enabled else 'Disabled'}\n"
@@ -1086,13 +1086,13 @@ def cb_fw_toggle(call):
 @bot.callback_query_handler(func=lambda call: call.data == "fw_edit_msg")
 def cb_fw_edit_msg(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
-    msg = bot.send_message(call.message.chat.id, "✍️ Send the new Firewall prompt message.\n\n_Note: The join buttons and 'I Joined' button will be attached automatically._")
+    msg = bot.send_message(call.message.chat.id, "✍️ Send the new Firewall prompt message.\n\n_Note: The join buttons will be attached automatically.\nTip: Highlight text and use Telegram's formatting menu to add Quotes or Highlights!_")
     bot.register_next_step_handler(msg, process_fw_edit_msg)
     bot.answer_callback_query(call.id)
 
 def process_fw_edit_msg(message):
     if not is_admin(message.from_user.id): return
-    set_setting('firewall_message', message.text)
+    set_setting('firewall_message', getattr(message, 'html_text', message.text))
     bot.reply_to(message, "✅ Firewall message updated.")
     _show_firewall_menu(message.chat.id)
 
@@ -1160,8 +1160,8 @@ def cb_fw_check_join(call):
 def cb_admin_tools(call):
     if not is_admin(call.from_user.id): return bot.answer_callback_query(call.id, "Unauthorized")
     markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(InlineKeyboardButton("✍️ Edit Start Msg", callback_data="tool_edit_start"))
-    markup.add(InlineKeyboardButton("✍️ Edit Media Msg", callback_data="tool_edit_caption"))
+    markup.add(InlineKeyboardButton("✍️ Edit Start Message", callback_data="tool_edit_start"))
+    markup.add(InlineKeyboardButton("🎞️ Edit Media Caption", callback_data="tool_edit_caption"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel_back"))
     bot.edit_message_text("🛠️ **Admin Tools**\nCustomize your bot's automated messages:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
     bot.answer_callback_query(call.id)
@@ -1169,7 +1169,7 @@ def cb_admin_tools(call):
 @bot.callback_query_handler(func=lambda call: call.data == "tool_edit_start")
 def cb_edit_start_init(call):
     if not is_admin(call.from_user.id): return
-    msg = bot.send_message(call.message.chat.id, "✍️ Please send the new **Start Message** text.\n\n_Tip: Use Markdown for bold/italics!_")
+    msg = bot.send_message(call.message.chat.id, "✍️ Please send the new **Start Message** text.\n\n_Tip: Highlight text and use Telegram's built-in formatting menu to add Bold, Blockquotes, Spoilers, and Code Blocks!_")
     bot.register_next_step_handler(msg, process_start_msg_edit)
     bot.answer_callback_query(call.id)
 
@@ -1341,9 +1341,9 @@ def cb_edit_cat_opts(call):
 
     # Visibility
     if c_hidden:
-        markup.add(InlineKeyboardButton("👁️ Show to Users", callback_data=f"toggle_hide_{c_id}_0"))
+        markup.add(InlineKeyboardButton("👁️ Unhide Category", callback_data=f"toggle_hide_{c_id}_0"))
     else:
-        markup.add(InlineKeyboardButton("👻 Hide from Users",   callback_data=f"toggle_hide_{c_id}_1"))
+        markup.add(InlineKeyboardButton("👻 Hide Category",   callback_data=f"toggle_hide_{c_id}_1"))
 
     markup.add(InlineKeyboardButton("🗑️ Delete Category", callback_data=f"del_cat_init_{c_id}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_edit_cats_list"))
@@ -1428,9 +1428,9 @@ def cb_setactive(call):
         cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
         markup = InlineKeyboardMarkup(row_width=1)
         markup.add(
-            InlineKeyboardButton("🖼️ Media / Docs", callback_data=f"set_ctype_{cat_id}_media"),
-            InlineKeyboardButton("🎬 GIFs & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
-            InlineKeyboardButton("📝 Text Content",                callback_data=f"set_ctype_{cat_id}_text"),
+            InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
+            InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
+            InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
             InlineKeyboardButton("🔙 Back",                         callback_data="admin_setcat")
         )
         bot.edit_message_text(
@@ -1449,9 +1449,9 @@ def _show_category_dashboard(call, cat_id):
     extractions = get_category_extractions(cat_id)
 
     type_labels = {
-        'text': '📝 Text Content',
-        'gif_sticker': '🎬 GIFs & Stickers',
-        'media': '🖼️ Media / Docs'
+        'text': '📝 Text Messages',
+        'gif_sticker': '🎬 GIF & Stickers',
+        'media': '🖼️ Photo / Video / Document'
     }
     type_label = type_labels.get(ctype, ctype)
 
@@ -1465,7 +1465,7 @@ def _show_category_dashboard(call, cat_id):
 
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("➕ Upload Content",    callback_data=f"cat_add_content_{cat_id}"),
+        InlineKeyboardButton("➕ Add Content",    callback_data=f"cat_add_content_{cat_id}"),
         InlineKeyboardButton("🗑️ Delete Content", callback_data=f"cat_delete_menu_{cat_id}")
     )
     markup.add(InlineKeyboardButton("🔄 Change Type", callback_data=f"cat_change_type_{cat_id}"))
@@ -1506,9 +1506,9 @@ def cb_cat_change_type(call):
     cat_name = next((c[1] for c in cats if c[0] == cat_id), "Unknown")
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
-        InlineKeyboardButton("🖼️ Media / Docs", callback_data=f"set_ctype_{cat_id}_media"),
-        InlineKeyboardButton("🎬 GIFs & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
-        InlineKeyboardButton("📝 Text Content",                callback_data=f"set_ctype_{cat_id}_text"),
+        InlineKeyboardButton("🖼️ Photo / Video / Document", callback_data=f"set_ctype_{cat_id}_media"),
+        InlineKeyboardButton("🎬 GIF & Stickers",             callback_data=f"set_ctype_{cat_id}_gif_sticker"),
+        InlineKeyboardButton("📝 Text Messages",                callback_data=f"set_ctype_{cat_id}_text"),
         InlineKeyboardButton("🔙 Back",                         callback_data=f"setactive_{cat_id}")
     )
     bot.edit_message_text(
@@ -1622,7 +1622,7 @@ def cb_manage_req(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_back")
 def cb_panel_back(call):
     if not is_admin(call.from_user.id): return
-    bot.edit_message_text("🛠️ **Admin Panel**\nSelect an operation below:", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="Markdown")
+    bot.edit_message_text("👑 **Admin Control Panel**\nSelect an operation below:", call.message.chat.id, call.message.message_id, reply_markup=get_admin_panel_markup(call.from_user.id), parse_mode="Markdown")
     bot.answer_callback_query(call.id)
 
 # --- Media Management via Categories ---
@@ -1671,9 +1671,9 @@ def cb_preview(call):
     
     try:
         msg = f"👀 **Preview ID: {media_id}**"
-        if media_type == 'photo': bot.send_photo(call.message.chat.id, file_id, caption=msg, parse_mode="Markdown")
-        elif media_type == 'video': bot.send_video(call.message.chat.id, file_id, caption=msg, parse_mode="Markdown")
-        else: bot.send_document(call.message.chat.id, file_id, caption=msg, parse_mode="Markdown")
+        if media_type == 'photo': bot.send_photo(call.message.chat.id, file_id, caption=msg, parse_mode="HTML")
+        elif media_type == 'video': bot.send_video(call.message.chat.id, file_id, caption=msg, parse_mode="HTML")
+        else: bot.send_document(call.message.chat.id, file_id, caption=msg, parse_mode="HTML")
     except: bot.send_message(call.message.chat.id, f"⚠️ Failed to preview Media ID {media_id}.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delmedia_"))
