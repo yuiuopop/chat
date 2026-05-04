@@ -850,7 +850,7 @@ if bot:
             )
             if sessions:
                 text += f"<i>{len(sessions)} Userbot account(s) registered.</i>"
-                for phone, session_str, api_id, api_hash in sessions:
+                for phone, _ in sessions:
                     is_live = phone in active_clients
                     status_icon = "✅" if is_live else "🔴"
                     markup.row(InlineKeyboardButton(f"{status_icon} {phone}", callback_data=f"acct_dash_{phone}"))
