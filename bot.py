@@ -1215,13 +1215,30 @@ if bot:
                 login_data[uid]["api_hash"] = None
                 start_otp_flow(call.message)
 
+        elif call.data == "skip_to_otp":
+            uid = call.from_user.id
+            admin_states[uid] = "awaiting_phone_simple"
+            bot.edit_message_text("📱 Please send your phone number (e.g. `+1234567890`):", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+        elif call.data == "resend_otp":
+            uid = call.from_user.id
+            if uid in login_data:
+                start_otp_flow(call.message)
+                bot.answer_callback_query(call.id, "🔄 Resending OTP...")
+
         elif call.data == "connect_userbot":
 
-            admin_states[call.from_user.id] = "awaiting_phone"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("✨ Skip to OTP (Use Defaults)", callback_data="skip_to_otp"))
             bot.send_message(
                 call.message.chat.id,
-                "📱 <b>Add Userbot Account</b>\n\nSend your phone number in international format:\n<code>+1234567890</code>\n\n"
-                "<i>Your number is only used to generate a session. You can add multiple accounts.</i>",
+                "📱 <b>Add Userbot Account</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "1️⃣ Send your phone number (e.g. <code>+1234567890</code>)\n"
+                "2️⃣ You will then be asked for your <b>API ID & Hash</b>\n"
+                "3️⃣ Finally, enter the <b>OTP</b> code\n\n"
+                "<i>Your number is only used to generate a secure session string.</i>",
+                reply_markup=markup,
                 parse_mode="HTML"
             )
             return
@@ -1627,10 +1644,15 @@ if bot:
                 login_data[uid]["client"] = tmp
                 login_data[uid]["phone_code_hash"] = sent.phone_code_hash
                 admin_states[uid] = "awaiting_otp"
+                
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp"))
+                
                 bot.send_message(
                     message.chat.id,
                     "✅ <b>OTP sent!</b> Please enter the code you received:\n"
                     "<i>(Send digits only, e.g. 12345)</i>",
+                    reply_markup=markup,
                     parse_mode="HTML"
                 )
             except Exception as e:
@@ -1640,8 +1662,9 @@ if bot:
 
         asyncio.run_coroutine_threadsafe(send_code(), loop)
 
-    @bot.message_handler(func=lambda m: m.from_user.id in admin_states)
+    @bot.message_handler(func=lambda m: m.from_user.id in admin_states, content_types=['text'])
     def handle_states(message):
+        logger.info(f"📩 Admin State Handler: {message.from_user.id} in state {admin_states.get(message.from_user.id)}")
 
         state = admin_states.get(message.from_user.id)
 
@@ -1653,6 +1676,12 @@ if bot:
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("✨ Use Default API ID", callback_data="default_api_id"))
             bot.reply_to(message, "🔢 Please enter your <b>API ID</b> from <a href='https://my.telegram.org'>my.telegram.org</a>:", reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
+            return
+
+        if state == "awaiting_phone_simple":
+            phone = message.text.strip()
+            login_data[message.from_user.id] = {"phone": phone, "client": None, "api_id": None, "api_hash": None}
+            start_otp_flow(message)
             return
 
         if state == "awaiting_api_id":
