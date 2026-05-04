@@ -13,6 +13,8 @@ from pyrogram.types import Message
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from flask import Flask
+
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
@@ -529,9 +531,26 @@ def release_media_thread(admin_chat_id):
 
 
 # ==========================================
+# 🌐 RENDER HEALTH CHECK SERVER
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Userbot Media Saver is running!", 200
+
+def run_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# ==========================================
 # 🚀 MAIN RUNNER
 # ==========================================
 async def start_services():
+    # Start Render Health Check Server IMMEDIATELY
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+    logger.info("🌐 Health Check Server started.")
+
     logger.info("Initializing Database...")
     try:
         init_db()
