@@ -447,6 +447,7 @@ if bot:
 
     @bot.callback_query_handler(func=lambda call: True)
     def callback_handler(call):
+        global user_client
         if not is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "Unauthorized", show_alert=True)
             return
@@ -483,7 +484,6 @@ if bot:
             return
 
         elif call.data == "disconnect_userbot":
-            global user_client
             if user_client:
                 asyncio.run_coroutine_threadsafe(user_client.stop(), loop)
                 user_client = None
