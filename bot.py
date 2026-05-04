@@ -104,9 +104,18 @@ def init_db():
                     min_file_size BIGINT DEFAULT 0,
                     caption_keywords TEXT DEFAULT '',
                     allowed_senders TEXT DEFAULT '',
-                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    live_forward BOOLEAN DEFAULT FALSE
                 )
             """)
+            try:
+                c.execute("ALTER TABLE monitored_sources ADD COLUMN live_forward BOOLEAN DEFAULT FALSE")
+            except Exception:
+                # Column likely already exists
+                conn.rollback()
+            else:
+                conn.commit()
+
             c.execute("""
                 CREATE TABLE IF NOT EXISTS target_groups (
                     target_id BIGINT PRIMARY KEY,
@@ -351,6 +360,49 @@ def save_session_string(session_str):
         logger.error(f"Failed to save session: {e}")
         return False
 
+def get_setting(key, default=None):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM bot_settings WHERE key = %s", (key,))
+                row = c.fetchone()
+                return row[0] if row else default
+    except:
+        return default
+
+def set_setting(key, value):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (key, str(value)))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to set setting {key}: {e}")
+        return False
+
+def get_live_forward(source_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT live_forward FROM monitored_sources WHERE source_id = %s", (source_id,))
+                row = c.fetchone()
+                return row[0] if row else False
+    except:
+        return False
+
+def toggle_live_forward(source_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE monitored_sources SET live_forward = NOT live_forward WHERE source_id = %s RETURNING live_forward", (source_id,))
+                return c.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Error toggling live forward: {e}")
+        return False
+
 # ==========================================
 # 🤖 PYROGRAM USERBOT (LISTENER & DOWNLOADER)
 # ==========================================
@@ -475,6 +527,16 @@ async def download_media(client: Client, message: Message):
             )
             if success:
                 logger.info(f"✅ Saved media record for {file_path}")
+                # Check for Live Forward
+                if get_live_forward(message.chat.id):
+                    # Fetch its ID for release
+                    with get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("SELECT id FROM saved_media WHERE file_path = %s", (file_path,))
+                            row = c.fetchone()
+                            m_id = row[0] if row else None
+                    if m_id:
+                        await release_single_media(m_id, file_path, media_type, caption, message.chat.id)
             else:
                 logger.warning(f"⚠️ Media record already exists or failed for {file_path}")
     except Exception as e:
@@ -589,6 +651,7 @@ if bot:
             InlineKeyboardButton("🔗 Mappings", callback_data="mappings")
         )
         markup.row(InlineKeyboardButton("🚀 Release Media", callback_data="release"))
+        markup.row(InlineKeyboardButton("⏱ Auto-Release Settings", callback_data="auto_release_menu"))
         markup.row(InlineKeyboardButton(f"🤖 Userbot: {userbot_status}", callback_data="userbot_menu"))
 
         text = (
@@ -688,13 +751,67 @@ if bot:
                 markup.row(InlineKeyboardButton("🕰 Scrape History (Userbot)", callback_data=f"scrape_{s_id}"))
             else:
                 markup.row(InlineKeyboardButton("⚠️ Scrape needs Userbot", callback_data="userbot_menu"))
+            
+            live_fwd = get_live_forward(s_id)
+            lf_status = "✅ ON" if live_fwd else "❌ OFF"
+            markup.row(InlineKeyboardButton(f"⚡ Live Forward: {lf_status}", callback_data=f"toggle_lf_{s_id}"))
+            
             markup.row(InlineKeyboardButton("🎛 Filter Settings", callback_data=f"filters_{s_id}"))
             markup.row(InlineKeyboardButton("🔙 Back", callback_data="sources"))
             bot.edit_message_text(
-                f"⚙️ *Source Options*\n\nID: `{s_id}`",
+                f"⚙️ *Source Options*\n\nID: `{s_id}`\n\n_Live Forward instantly sends media to targets without waiting for release._",
                 call.message.chat.id, call.message.message_id,
                 reply_markup=markup, parse_mode="Markdown"
             )
+
+        elif call.data.startswith("toggle_lf_"):
+            s_id = int(call.data[len("toggle_lf_"):])
+            toggle_live_forward(s_id)
+            
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Back to Source", callback_data=f"src_options_{s_id}"))
+            bot.edit_message_text("✅ Live Forward mode toggled.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        elif call.data == "auto_release_menu":
+            enabled = str(get_setting("auto_release_enabled", "False")) == "True"
+            interval = get_setting("auto_release_interval", 60)
+            batch = get_setting("auto_release_batch_size", 0)
+            batch_text = "All" if int(batch) == 0 else str(batch)
+            status = "✅ ON" if enabled else "❌ OFF"
+            
+            text = (
+                f"⏱ *Auto-Release Settings*\n\n"
+                f"Status: **{status}**\n"
+                f"Interval: **{interval} minutes**\n"
+                f"Batch Size: **{batch_text} items**\n\n"
+                f"_Auto-Release runs in the background and releases saved media to your target groups automatically._"
+            )
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton(f"Toggle Status ({status})", callback_data="toggle_ar"))
+            markup.row(InlineKeyboardButton("Edit Interval", callback_data="edit_ar_interval"))
+            markup.row(InlineKeyboardButton("Edit Batch Size", callback_data="edit_ar_batch"))
+            markup.row(InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data == "toggle_ar":
+            enabled = str(get_setting("auto_release_enabled", "False")) == "True"
+            set_setting("auto_release_enabled", not enabled)
+            bot.answer_callback_query(call.id, "Toggled Auto-Release.")
+            # Trigger menu update
+            call.data = "auto_release_menu"
+            callback_handler(call)
+
+        elif call.data == "edit_ar_interval":
+            admin_states[call.from_user.id] = "awaiting_ar_interval"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("⏱ Send the interval in minutes (e.g. `60` for 1 hour):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data == "edit_ar_batch":
+            admin_states[call.from_user.id] = "awaiting_ar_batch"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("📦 Send the batch size (number of items to release at once, `0` means release all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("filters_"):
             s_id = int(call.data[len("filters_"):])
@@ -915,8 +1032,23 @@ if bot:
                 with open(local_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-            save_media_record(message.message_id, message.chat.id, media_type, local_path, caption, media_group_id)
-            logger.info(f"✅ [Bot-Admin] Saved {media_type} from {message.chat.id}")
+            success = save_media_record(message.message_id, message.chat.id, media_type, local_path, caption, media_group_id)
+            if success:
+                logger.info(f"✅ [Bot-Admin] Saved {media_type} from {message.chat.id}")
+                if get_live_forward(message.chat.id):
+                    with get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute("SELECT id FROM saved_media WHERE file_path = %s", (local_path,))
+                            row = c.fetchone()
+                            m_id = row[0] if row else None
+                    if m_id:
+                        # Schedule it into the Pyrogram event loop
+                        asyncio.run_coroutine_threadsafe(
+                            release_single_media(m_id, local_path, media_type, caption, message.chat.id), 
+                            loop
+                        )
+            else:
+                logger.warning(f"⚠️ [Bot-Admin] Media record exists or failed for {local_path}")
         except Exception as e:
             logger.error(f"❌ [Bot-Admin] Failed to save media: {e}")
 
@@ -1059,6 +1191,30 @@ if bot:
                     asyncio.run_coroutine_threadsafe(scrape_history(s_id, message.chat.id, status_msg.message_id, start_date=start_date, end_date=end_date), loop)
                 return
 
+            if state == "awaiting_ar_interval":
+                try:
+                    val = int(message.text.strip())
+                    if val < 1:
+                        bot.reply_to(message, "❌ Interval must be at least 1 minute.")
+                        return
+                    set_setting("auto_release_interval", val)
+                    bot.reply_to(message, f"✅ Auto-Release interval set to {val} minutes.")
+                except ValueError:
+                    bot.reply_to(message, "❌ Invalid number.")
+                return
+
+            if state == "awaiting_ar_batch":
+                try:
+                    val = int(message.text.strip())
+                    if val < 0:
+                        bot.reply_to(message, "❌ Batch size cannot be negative.")
+                        return
+                    set_setting("auto_release_batch_size", val)
+                    bot.reply_to(message, f"✅ Auto-Release batch size set to {val} items (0 means all).")
+                except ValueError:
+                    bot.reply_to(message, "❌ Invalid number.")
+                return
+
             if state and state.startswith("editf_"):
                 parts = state.split("_")
                 f_type = parts[1]
@@ -1143,6 +1299,80 @@ if bot:
         except Exception as e:
             bot.reply_to(message, f"❌ Error: {e}")
 
+async def release_single_media(m_id, file_path, m_type, caption, source_id):
+    """Release a single media item to all its target groups."""
+    if not user_client or not user_client.is_connected:
+        return False
+        
+    targets = get_targets_for_source(source_id)
+    if not targets:
+        return False
+        
+    success = False
+    for target_id in targets:
+        try:
+            if os.path.exists(file_path):
+                if m_type == "photo":
+                    await user_client.send_photo(target_id, file_path, caption=caption)
+                elif m_type == "video":
+                    await user_client.send_video(target_id, file_path, caption=caption)
+                elif m_type == "document":
+                    await user_client.send_document(target_id, file_path, caption=caption)
+                else:
+                    await user_client.send_document(target_id, file_path, caption=caption)
+                success = True
+                logger.info(f"Released {file_path} to {target_id}")
+            else:
+                logger.warning(f"File missing during release: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to send to {target_id}: {e}")
+            
+    if success:
+        mark_media_released(m_id)
+    return success
+
+async def auto_release_loop():
+    """Background loop to handle scheduled releases."""
+    while True:
+        await asyncio.sleep(60) # Check every minute
+        enabled = str(get_setting("auto_release_enabled", "False")) == "True"
+        if not enabled:
+            continue
+            
+        interval = int(get_setting("auto_release_interval", 60))
+        last_run = get_setting("auto_release_last_run", None)
+        now = datetime.now()
+        
+        if last_run:
+            last_run_dt = datetime.fromisoformat(last_run)
+            diff_mins = (now - last_run_dt).total_seconds() / 60
+            if diff_mins < interval:
+                continue
+                
+        # Time to run
+        if not user_client or not user_client.is_connected:
+            continue
+            
+        batch_size = int(get_setting("auto_release_batch_size", 0))
+        media_items = get_unreleased_media()
+        if not media_items:
+            continue
+            
+        items_to_process = media_items[:batch_size] if batch_size > 0 else media_items
+        logger.info(f"⏱ Auto-Release triggered. Releasing {len(items_to_process)} items.")
+        
+        for item in items_to_process:
+            m_id, file_path, m_type, caption = item
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
+                    source_id = c.fetchone()[0]
+                    
+            await release_single_media(m_id, file_path, m_type, caption, source_id)
+            await asyncio.sleep(2) # Prevent flooding
+            
+        set_setting("auto_release_last_run", now.isoformat())
+
 def release_media_thread(admin_chat_id):
     media_items = get_unreleased_media()
     success_count = 0
@@ -1159,28 +1389,6 @@ def release_media_thread(admin_chat_id):
                     c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
                     source_id = c.fetchone()[0]
                     
-            targets = get_targets_for_source(source_id)
-            if not targets:
-                logger.warning(f"No targets mapped for source {source_id}. Skipping media {m_id}.")
-                continue
-                
-            for target_id in targets:
-                try:
-                    if os.path.exists(file_path):
-                        if m_type == "photo":
-                            await user_client.send_photo(target_id, file_path, caption=caption)
-                        elif m_type == "video":
-                            await user_client.send_video(target_id, file_path, caption=caption)
-                        elif m_type == "document":
-                            await user_client.send_document(target_id, file_path, caption=caption)
-                        else:
-                            await user_client.send_document(target_id, file_path, caption=caption)
-                        
-                        logger.info(f"Released {file_path} to {target_id}")
-                    else:
-                        logger.warning(f"File not found: {file_path}")
-                except Exception as e:
-                    logger.error(f"Failed to send to target: {e}")
                     
             mark_media_released(m_id)
             success_count += 1
@@ -1247,6 +1455,9 @@ async def start_services():
         logger.info("✅ Admin Bot Started successfully!")
     else:
         logger.warning("BOT_TOKEN not found. Admin UI will not start.")
+
+    # Start Auto-Release background loop
+    asyncio.create_task(auto_release_loop())
 
     logger.info("System is fully running. Press Ctrl+C to stop.")
     await idle()
