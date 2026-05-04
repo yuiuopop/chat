@@ -971,14 +971,71 @@ if bot:
             c_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             add_monitored_source(c_id, str(c_id), session_id=phone)
-            bot.answer_callback_query(call.id, f"\u2705 Added as Source for {phone}!", show_alert=True)
+            bot.answer_callback_query(call.id, f"✅ Added as Source for {phone}!", show_alert=True)
+            # Return to info page
+            call.data = f"chat_info_{phone}_{c_id}"
+            callback_handler(call)
+
+        elif call.data.startswith("acct_sources_"):
+            phone = call.data[len("acct_sources_"):]
+            sources = get_all_sources(session_id=phone)
+            markup = InlineKeyboardMarkup()
+            text = f"<b>📂 MONITORED SOURCES</b> \u2014 <code>{phone}</code>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            if not sources:
+                text += "<i>No sources added yet for this account.</i>"
+            else:
+                for s_id, title, active, _, _, _, _, _, _ in sources:
+                    status = "🟢" if active else "🔴"
+                    markup.row(
+                        InlineKeyboardButton(f"{status} {title or s_id}", callback_data=f"filters_{s_id}"),
+                        InlineKeyboardButton("🗑", callback_data=f"quick_rem_src_{phone}_{s_id}")
+                    )
+            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("quick_rem_src_"):
+            parts = call.data.split("_")
+            s_id = int(parts[-1])
+            phone = "_".join(parts[3:-1])
+            remove_monitored_source(s_id)
+            bot.answer_callback_query(call.id, "✅ Source removed.")
+            call.data = f"acct_sources_{phone}"
+            callback_handler(call)
 
         elif call.data.startswith("quick_add_tgt_"):
             parts = call.data.split("_")
             c_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             add_target_group(c_id, str(c_id), session_id=phone)
-            bot.answer_callback_query(call.id, f"\u2705 Added as Target for {phone}!", show_alert=True)
+            bot.answer_callback_query(call.id, f"✅ Added as Target for {phone}!", show_alert=True)
+            # Return to info page
+            call.data = f"chat_info_{phone}_{c_id}"
+            callback_handler(call)
+
+        elif call.data.startswith("acct_targets_"):
+            phone = call.data[len("acct_targets_"):]
+            targets = get_all_targets(session_id=phone)
+            markup = InlineKeyboardMarkup()
+            text = f"<b>🎯 TARGET CHANNELS</b> \u2014 <code>{phone}</code>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            if not targets:
+                text += "<i>No targets added yet for this account.</i>"
+            else:
+                for t_id, title, session_id in targets:
+                    markup.row(
+                        InlineKeyboardButton(f"🎯 {title or t_id}", callback_data="none"),
+                        InlineKeyboardButton("🗑", callback_data=f"quick_rem_tgt_{phone}_{t_id}")
+                    )
+            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("quick_rem_tgt_"):
+            parts = call.data.split("_")
+            t_id = int(parts[-1])
+            phone = "_".join(parts[3:-1])
+            remove_target_group(t_id)
+            bot.answer_callback_query(call.id, "✅ Target removed.")
+            call.data = f"acct_targets_{phone}"
+            callback_handler(call)
 
         elif call.data.startswith("media_stats_"):
             phone = call.data[len("media_stats_"):]
