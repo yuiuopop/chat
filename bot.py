@@ -1,5 +1,5 @@
-import os
 import asyncio
+import time
 
 # Fix for Pyrogram RuntimeError in Python 3.10+
 loop = asyncio.new_event_loop()
@@ -1312,10 +1312,16 @@ if bot:
                 f"<b>Batch Size:</b> {batch_text} items</blockquote>\n\n"
                 f"<i>Auto-Release runs in the background and releases saved media to your target groups automatically based on these settings.</i>"
             )
+            raw_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL") or get_setting("keep_alive_url", "")
+            ping_url = raw_url[:20] + "..." if raw_url else "Not Set"
+            if os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL"):
+                ping_url = "✨ Auto-Detected"
+                
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton(f"Toggle Status ({status})", callback_data="toggle_ar"))
             markup.row(InlineKeyboardButton("Edit Interval", callback_data="edit_ar_interval"))
             markup.row(InlineKeyboardButton("Edit Batch Size", callback_data="edit_ar_batch"))
+            markup.row(InlineKeyboardButton(f"📡 Keep-Alive: {ping_url[:20]}...", callback_data="edit_keep_alive"))
             markup.row(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="main_menu"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
@@ -1338,6 +1344,12 @@ if bot:
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
             bot.edit_message_text("📦 Send the batch size (number of items to release at once, `0` means release all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data == "edit_keep_alive":
+            admin_states[call.from_user.id] = "awaiting_ping_url"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("📡 Send your **App URL** to keep the bot awake (e.g. `https://my-bot.onrender.com`):\n\n_This will ping the URL every 10 minutes._", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("filters_"):
             s_id = int(call.data[len("filters_"):])
@@ -1803,6 +1815,15 @@ if bot:
                     bot.reply_to(message, "❌ Invalid number.")
                 return
 
+            if state == "awaiting_ping_url":
+                url = message.text.strip()
+                if not url.startswith("http"):
+                    bot.reply_to(message, "❌ Invalid URL. Must start with http:// or https://")
+                    return
+                set_setting("keep_alive_url", url)
+                bot.reply_to(message, f"✅ Keep-Alive URL set to:\n`{url}`", parse_mode="Markdown")
+                return
+
             if state and state.startswith("editf_"):
                 parts = state.split("_")
                 f_type = parts[1]
@@ -1934,6 +1955,28 @@ async def release_single_media(m_id, file_path, m_type, caption, source_id):
         mark_media_released(m_id)
     return success
 
+def keep_alive_worker():
+    """Background worker to ping the app URL periodically."""
+    logger.info("📡 Keep-alive worker started.")
+    while True:
+        # Auto-detect URL from environment (Render/Heroku/etc) or settings
+        url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL") or get_setting("keep_alive_url", "")
+        
+        if url:
+            try:
+                # Ensure URL is clean
+                url = url.strip().rstrip("/")
+                # Add a timestamp to avoid caching
+                ts_url = f"{url}?t={int(time.time())}" if "?" not in url else f"{url}&t={int(time.time())}"
+                requests.get(ts_url, timeout=15)
+                logger.info(f"📡 Keep-alive ping sent to {url}")
+            except Exception as e:
+                logger.error(f"❌ Keep-alive ping failed: {e}")
+        else:
+            logger.warning("📡 Keep-alive URL not set. Bot may sleep on free hosting.")
+            
+        time.sleep(600) # 10 minutes
+
 async def auto_release_loop():
     """Background loop to handle scheduled releases."""
     while True:
@@ -2026,6 +2069,10 @@ async def start_services():
     # Start Render Health Check Server IMMEDIATELY
     threading.Thread(target=run_health_check_server, daemon=True).start()
     logger.info("🌐 Health Check Server started.")
+    
+    # Start Keep-Alive Pinger
+    threading.Thread(target=keep_alive_worker, daemon=True).start()
+
 
     logger.info("Initializing Database...")
     try:
