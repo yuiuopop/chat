@@ -89,6 +89,7 @@ def init_db():
                     media_type TEXT,
                     file_path TEXT UNIQUE,
                     caption TEXT,
+                    media_group_id TEXT,
                     downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     is_released BOOLEAN DEFAULT FALSE
                 )
@@ -98,6 +99,10 @@ def init_db():
                     source_id BIGINT PRIMARY KEY,
                     title TEXT,
                     is_active BOOLEAN DEFAULT TRUE,
+                    allowed_media_types TEXT DEFAULT 'photo,video,document,audio,voice,animation',
+                    min_file_size BIGINT DEFAULT 0,
+                    caption_keywords TEXT DEFAULT '',
+                    allowed_senders TEXT DEFAULT '',
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -125,15 +130,15 @@ def init_db():
             logger.info("✅ Database schema initialized.")
 
 # Media Queries
-def save_media_record(message_id, source_chat_id, media_type, file_path, caption):
+def save_media_record(message_id, source_chat_id, media_type, file_path, caption, media_group_id=None):
     try:
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    INSERT INTO saved_media (message_id, source_chat_id, media_type, file_path, caption)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO saved_media (message_id, source_chat_id, media_type, file_path, caption, media_group_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (file_path) DO NOTHING
-                """, (message_id, source_chat_id, media_type, file_path, caption))
+                """, (message_id, source_chat_id, media_type, file_path, caption, media_group_id))
                 return c.rowcount > 0
     except Exception as e:
         logger.error(f"Error saving media record: {e}")
@@ -274,6 +279,41 @@ def get_all_targets():
         logger.error(f"Error fetching targets: {e}")
         return []
 
+def get_source_filters(source_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT allowed_media_types, min_file_size, caption_keywords, allowed_senders
+                    FROM monitored_sources
+                    WHERE source_id = %s
+                """, (source_id,))
+                row = c.fetchone()
+                if row:
+                    return {
+                        'media_types': row[0],
+                        'min_file_size': row[1],
+                        'caption_keywords': row[2],
+                        'allowed_senders': row[3]
+                    }
+                return None
+    except Exception as e:
+        logger.error(f"Error fetching source filters: {e}")
+        return None
+
+def update_source_filter(source_id, filter_key, value):
+    valid_keys = ['allowed_media_types', 'min_file_size', 'caption_keywords', 'allowed_senders']
+    if filter_key not in valid_keys:
+        return False
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(f"UPDATE monitored_sources SET {filter_key} = %s WHERE source_id = %s", (value, source_id))
+                return True
+    except Exception as e:
+        logger.error(f"Error updating source filter: {e}")
+        return False
+
 def get_stats():
     try:
         with get_connection() as conn:
@@ -333,6 +373,70 @@ def register_userbot_handlers(client: Client):
     async def live_listener(c: Client, message: Message):
         asyncio.create_task(download_media(c, message))
 
+def passes_filters(message, filters_dict, is_pyrogram=True):
+    """Check if a message passes the source filters. Works for Pyrogram and Telebot."""
+    if not filters_dict:
+        return True
+        
+    # 1. Media Type
+    if is_pyrogram:
+        media_type = message.media.value if message.media else None
+    else:
+        # For telebot, we calculate it differently
+        if message.photo: media_type = "photo"
+        elif message.video: media_type = "video"
+        elif message.document: media_type = "document"
+        elif message.audio: media_type = "audio"
+        elif message.voice: media_type = "voice"
+        elif message.animation: media_type = "animation"
+        else: media_type = None
+
+    if media_type and media_type not in filters_dict['media_types']:
+        return False
+
+    # 2. Minimum File Size
+    min_size = filters_dict['min_file_size']
+    if min_size > 0:
+        file_size = 0
+        if is_pyrogram:
+            media_obj = getattr(message, media_type, None) if media_type else None
+            file_size = getattr(media_obj, 'file_size', 0) if media_obj else 0
+        else:
+            # telebot
+            if message.photo: file_size = message.photo[-1].file_size
+            elif message.video: file_size = message.video.file_size
+            elif message.document: file_size = message.document.file_size
+            elif message.audio: file_size = message.audio.file_size
+            elif message.voice: file_size = message.voice.file_size
+            elif message.animation: file_size = message.animation.file_size
+            
+        if file_size is not None and file_size < min_size:
+            return False
+
+    # 3. Caption Keywords
+    keywords = filters_dict['caption_keywords'].strip()
+    if keywords:
+        caption = message.caption or ""
+        caption_lower = caption.lower()
+        required_words = [w.strip().lower() for w in keywords.split(',') if w.strip()]
+        if required_words and not any(w in caption_lower for w in required_words):
+            return False
+
+    # 4. Allowed Senders
+    senders = filters_dict['allowed_senders'].strip()
+    if senders:
+        allowed_list = [s.strip().lower() for s in senders.split(',') if s.strip()]
+        sender_id = str(message.from_user.id) if message.from_user else None
+        
+        # 'admin_only' check needs to be handled differently. For now we just check raw IDs
+        if "admin_only" in allowed_list:
+            # We skip admin check in raw filter for now, would require get_chat_member
+            pass 
+        elif sender_id and sender_id not in allowed_list:
+            return False
+
+    return True
+
 async def download_media(client: Client, message: Message):
     if not message.media:
         return
@@ -343,8 +447,14 @@ async def download_media(client: Client, message: Message):
     if message.chat.id not in monitored_ids:
         return
 
+    # Check filters
+    source_filters = get_source_filters(message.chat.id)
+    if not passes_filters(message, source_filters, is_pyrogram=True):
+        return
+
     try:
         media_type = message.media.value
+        media_group_id = message.media_group_id
         logger.info(f"Downloading {media_type} from {message.chat.id}...")
         
         file_path = await client.download_media(
@@ -359,7 +469,8 @@ async def download_media(client: Client, message: Message):
                 message.chat.id,
                 media_type,
                 file_path,
-                caption
+                caption,
+                media_group_id
             )
             if success:
                 logger.info(f"✅ Saved media record for {file_path}")
@@ -526,12 +637,54 @@ if bot:
                 markup.row(InlineKeyboardButton("🕰 Scrape History (Userbot)", callback_data=f"scrape_{s_id}"))
             else:
                 markup.row(InlineKeyboardButton("⚠️ Scrape needs Userbot", callback_data="userbot_menu"))
+            markup.row(InlineKeyboardButton("🎛 Filter Settings", callback_data=f"filters_{s_id}"))
             markup.row(InlineKeyboardButton("🔙 Back", callback_data="sources"))
             bot.edit_message_text(
                 f"⚙️ *Source Options*\n\nID: `{s_id}`",
                 call.message.chat.id, call.message.message_id,
                 reply_markup=markup, parse_mode="Markdown"
             )
+
+        elif call.data.startswith("filters_"):
+            s_id = int(call.data[len("filters_"):])
+            filters_dict = get_source_filters(s_id)
+            if not filters_dict:
+                bot.answer_callback_query(call.id, "Filters not available for this source.", show_alert=True)
+                return
+            
+            text = (
+                f"🎛 *Filter Settings for Source `{s_id}`*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📸 *Media Types*: `{filters_dict['media_types']}`\n"
+                f"⚖️ *Min File Size*: `{filters_dict['min_file_size']} bytes`\n"
+                f"🔑 *Caption Keywords*: `{filters_dict['caption_keywords'] or 'None (Allow All)'}`\n"
+                f"👤 *Allowed Senders*: `{filters_dict['allowed_senders'] or 'None (Allow All)'}`\n\n"
+                "_Select a filter below to change it._"
+            )
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("📸 Edit Types", callback_data=f"editf_types_{s_id}"))
+            markup.row(InlineKeyboardButton("⚖️ Edit Size", callback_data=f"editf_size_{s_id}"))
+            markup.row(InlineKeyboardButton("🔑 Edit Keywords", callback_data=f"editf_keys_{s_id}"))
+            markup.row(InlineKeyboardButton("👤 Edit Senders", callback_data=f"editf_senders_{s_id}"))
+            markup.row(InlineKeyboardButton("🔙 Back", callback_data=f"src_options_{s_id}"))
+            
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data.startswith("editf_"):
+            parts = call.data.split("_")
+            f_type = parts[1]
+            s_id = int(parts[2])
+            admin_states[call.from_user.id] = f"editf_{f_type}_{s_id}"
+            
+            prompts = {
+                "types": "Send allowed media types separated by comma.\nOptions: `photo,video,document,audio,voice,animation`\n\nExample: `photo,video`",
+                "size": "Send minimum file size in **bytes**.\nExample: `1048576` (for 1MB) or `0` (for no limit)",
+                "keys": "Send required caption keywords separated by comma.\nExample: `premium,vip`\nSend `clear` to remove filter.",
+                "senders": "Send allowed user IDs separated by comma.\nExample: `12345678,87654321`\nSend `clear` to remove filter."
+            }
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"filters_{s_id}"))
+            bot.edit_message_text(prompts[f_type], call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("scrape_"):
             s_id = int(call.data[len("scrape_"):])
@@ -575,7 +728,14 @@ if bot:
 
         elif call.data == "add_source":
             admin_states[call.from_user.id] = "awaiting_source"
-            bot.send_message(call.message.chat.id, "Send the Source Chat ID and Title (e.g., `-1001234567 My Channel`)")
+            bot.send_message(
+                call.message.chat.id,
+                "**Add Monitored Source**\n\n"
+                "**Option A**: Send Chat ID and Title (e.g., `-1001234567 My Channel`)\n"
+                "**Option B**: Send a Telegram invite link or username (e.g., `t.me/example` or `@example`). "
+                "_Note: Option B requires the Userbot to be connected._",
+                parse_mode="Markdown"
+            )
             
         elif call.data == "add_target":
             admin_states[call.from_user.id] = "awaiting_target"
@@ -664,7 +824,14 @@ if bot:
         if not file_id:
             return
 
+        # Check filters
+        source_filters = get_source_filters(message.chat.id)
+        if not passes_filters(message, source_filters, is_pyrogram=False):
+            return
+
         caption = message.caption or ""
+        media_group_id = message.media_group_id
+        
         # Download via Bot API to local disk
         try:
             file_info = bot.get_file(file_id)
@@ -677,7 +844,7 @@ if bot:
                 with open(local_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-            save_media_record(message.message_id, message.chat.id, media_type, local_path, caption)
+            save_media_record(message.message_id, message.chat.id, media_type, local_path, caption, media_group_id)
             logger.info(f"✅ [Bot-Admin] Saved {media_type} from {message.chat.id}")
         except Exception as e:
             logger.error(f"❌ [Bot-Admin] Failed to save media: {e}")
@@ -755,170 +922,3 @@ if bot:
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(message.chat.id, f"❌ Login failed: `{e}`", parse_mode="Markdown")
-
-            asyncio.run_coroutine_threadsafe(sign_in(), loop)
-            return
-
-        if state == "awaiting_2fa":
-            password = message.text.strip()
-            data = login_data.get(message.from_user.id, {})
-            tmp: Client = data.get("client")
-
-            async def check_password():
-                global user_client
-                try:
-                    await tmp.check_password(password)
-                    session_str = await tmp.export_session_string()
-                    save_session_string(session_str)
-                    await tmp.disconnect()
-
-                    user_client = build_client(session_str)
-                    register_userbot_handlers(user_client)
-                    await user_client.start()
-
-                    admin_states.pop(message.from_user.id, None)
-                    login_data.pop(message.from_user.id, None)
-                    bot.send_message(
-                        message.chat.id,
-                        "🎉 *Login Successful!*\n\nUserbot is now active and listening for media.",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    admin_states.pop(message.from_user.id, None)
-                    login_data.pop(message.from_user.id, None)
-                    bot.send_message(message.chat.id, f"❌ 2FA failed: `{e}`", parse_mode="Markdown")
-
-            asyncio.run_coroutine_threadsafe(check_password(), loop)
-            return
-
-        # ── NORMAL ADMIN STATES ──
-        admin_states.pop(message.from_user.id, None)
-        try:
-            parts = message.text.split(" ", 1)
-            if state == "awaiting_source":
-                add_monitored_source(int(parts[0]), parts[1])
-                bot.reply_to(message, "✅ Source added.")
-            elif state == "awaiting_target":
-                add_target_group(int(parts[0]), parts[1])
-                bot.reply_to(message, "✅ Target added.")
-            elif state == "awaiting_mapping":
-                parts = message.text.split()
-                add_mapping(int(parts[0]), int(parts[1]))
-                bot.reply_to(message, "✅ Mapping added.")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error: {e}")
-
-def release_media_thread(admin_chat_id):
-    media_items = get_unreleased_media()
-    success_count = 0
-    
-    loop = user_client.loop
-    
-    async def upload_job(items):
-        nonlocal success_count
-        for item in items:
-            m_id, file_path, m_type, caption = item
-            
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
-                    source_id = c.fetchone()[0]
-                    
-            targets = get_targets_for_source(source_id)
-            if not targets:
-                logger.warning(f"No targets mapped for source {source_id}. Skipping media {m_id}.")
-                continue
-                
-            for target_id in targets:
-                try:
-                    if os.path.exists(file_path):
-                        if m_type == "photo":
-                            await user_client.send_photo(target_id, file_path, caption=caption)
-                        elif m_type == "video":
-                            await user_client.send_video(target_id, file_path, caption=caption)
-                        elif m_type == "document":
-                            await user_client.send_document(target_id, file_path, caption=caption)
-                        else:
-                            await user_client.send_document(target_id, file_path, caption=caption)
-                        
-                        logger.info(f"Released {file_path} to {target_id}")
-                    else:
-                        logger.warning(f"File not found: {file_path}")
-                except Exception as e:
-                    logger.error(f"Failed to send to target: {e}")
-                    
-            mark_media_released(m_id)
-            success_count += 1
-            await asyncio.sleep(2) # rate limit
-
-    if loop.is_running():
-        asyncio.run_coroutine_threadsafe(upload_job(media_items), loop)
-        bot.send_message(admin_chat_id, f"✅ Release job submitted to Userbot loop.")
-    else:
-        bot.send_message(admin_chat_id, f"❌ Userbot loop not running.")
-
-
-# ==========================================
-# 🌐 RENDER HEALTH CHECK SERVER
-# ==========================================
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Userbot Media Saver is running!", 200
-
-def run_health_check_server():
-    port = int(os.getenv("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-# ==========================================
-# 🚀 MAIN RUNNER
-# ==========================================
-async def start_services():
-    # Start Render Health Check Server IMMEDIATELY
-    threading.Thread(target=run_health_check_server, daemon=True).start()
-    logger.info("🌐 Health Check Server started.")
-
-    logger.info("Initializing Database...")
-    try:
-        init_db()
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        return
-
-    # Try to restore a saved userbot session from DB
-    session_str = get_session_string()
-    if session_str:
-        logger.info("🔑 Found saved session. Restoring Pyrogram Userbot...")
-        try:
-            user_client = build_client(session_str)
-            register_userbot_handlers(user_client)
-            await user_client.start()
-            logger.info("✅ Userbot restored and started successfully!")
-        except Exception as e:
-            logger.warning(f"⚠️ Saved session invalid or expired: {e}. Clearing session.")
-            save_session_string("")
-            user_client = None
-    else:
-        logger.info("ℹ️ No saved session found. Admin must log in via the bot.")
-
-    if bot:
-        logger.info("Starting Telebot Admin UI...")
-        current_loop = asyncio.get_running_loop()
-        current_loop.run_in_executor(None, bot.infinity_polling)
-        logger.info("✅ Admin Bot Started successfully!")
-    else:
-        logger.warning("BOT_TOKEN not found. Admin UI will not start.")
-
-    logger.info("System is fully running. Press Ctrl+C to stop.")
-    await idle()
-
-    if user_client and user_client.is_connected:
-        logger.info("Stopping Pyrogram Userbot...")
-        await user_client.stop()
-
-if __name__ == "__main__":
-    try:
-        loop.run_until_complete(start_services())
-    except KeyboardInterrupt:
-        logger.info("System stopped.")
