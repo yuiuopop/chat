@@ -3,3 +3,4 @@ tgcrypto
 pyTelegramBotAPI
 psycopg2-binary
 python-dotenv
+flask
