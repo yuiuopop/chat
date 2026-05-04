@@ -1089,19 +1089,43 @@ if bot:
                         bot.reply_to(message, "❌ Userbot is not connected. Cannot join via link. Please provide Chat ID instead.")
                         return
                     
-                    bot.reply_to(message, "⏳ Attempting to join chat via Userbot...")
+                    bot.reply_to(message, "⏳ Resolving chat via Userbot...")
                     async def join_and_save():
+                        frozen_hint = (
+                            "\n\n⚠️ *Why did this happen?*\n"
+                            "Telegram restricts joining via invite links for accounts that are new or flagged\\. "
+                            "Your userbot account needs to be older/more active\\.\n\n"
+                            "👉 *Workaround*: Get the Chat ID manually \\(e\\.g\\. via @username\\_to\\_id\\_bot\\) "
+                            "and add the source as: `-1001234567 Channel Name`"
+                        )
                         try:
-                            chat = await user_client.join_chat(text)
-                            add_monitored_source(chat.id, chat.title)
-                            bot.send_message(message.chat.id, f"✅ Userbot joined and added source: *{chat.title}* (`{chat.id}`)", parse_mode="Markdown")
-                        except Exception as e:
-                            try:
+                            # Detect if it's a private invite link (t.me/+xxx or joinchat)
+                            is_private_link = "+joinchat" in text or "/+" in text
+                            if not is_private_link:
+                                # Public @username or t.me/username — use get_chat, no join needed
                                 chat = await user_client.get_chat(text)
                                 add_monitored_source(chat.id, chat.title)
-                                bot.send_message(message.chat.id, f"✅ Source added (already joined): *{chat.title}* (`{chat.id}`)", parse_mode="Markdown")
-                            except Exception as inner_e:
-                                bot.send_message(message.chat.id, f"❌ Failed to join or fetch chat: `{e}` / `{inner_e}`", parse_mode="Markdown")
+                                bot.send_message(message.chat.id, f"✅ *Source added\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                            else:
+                                # Private invite link — must join
+                                chat = await user_client.join_chat(text)
+                                add_monitored_source(chat.id, chat.title)
+                                bot.send_message(message.chat.id, f"✅ *Userbot joined source\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                        except Exception as e:
+                            err_str = str(e)
+                            if "FROZEN_METHOD_INVALID" in err_str:
+                                bot.send_message(
+                                    message.chat.id,
+                                    "❌ *Telegram blocked the join request*\n\n"
+                                    "`FROZEN_METHOD_INVALID` — Telegram has restricted your userbot from joining via invite links\\. "
+                                    "This is a Telegram account trust restriction \\(not a bug\\)\\."
+                                    + frozen_hint,
+                                    parse_mode="MarkdownV2"
+                                )
+                            elif "FloodWait" in err_str:
+                                bot.send_message(message.chat.id, "⏳ *Flood wait triggered\\.* Please wait a few minutes and try again\\.", parse_mode="MarkdownV2")
+                            else:
+                                bot.send_message(message.chat.id, f"❌ *Failed to add source\\.*\n\n`{err_str}`" + frozen_hint, parse_mode="MarkdownV2")
                     
                     asyncio.run_coroutine_threadsafe(join_and_save(), loop)
                 else:
