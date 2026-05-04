@@ -984,10 +984,9 @@ if bot:
             if not sources:
                 text += "<i>No sources added yet for this account.</i>"
             else:
-                for s_id, title, active, _, _, _, _, _, _ in sources:
-                    status = "🟢" if active else "🔴"
+                for s_id, title in sources:
                     markup.row(
-                        InlineKeyboardButton(f"{status} {title or s_id}", callback_data=f"filters_{s_id}"),
+                        InlineKeyboardButton(f"📂 {title or s_id}", callback_data=f"filters_{s_id}"),
                         InlineKeyboardButton("🗑", callback_data=f"quick_rem_src_{phone}_{s_id}")
                     )
             markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
@@ -1020,7 +1019,7 @@ if bot:
             if not targets:
                 text += "<i>No targets added yet for this account.</i>"
             else:
-                for t_id, title, session_id in targets:
+                for t_id, title in targets:
                     markup.row(
                         InlineKeyboardButton(f"🎯 {title or t_id}", callback_data="none"),
                         InlineKeyboardButton("🗑", callback_data=f"quick_rem_tgt_{phone}_{t_id}")
