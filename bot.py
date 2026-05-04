@@ -1676,6 +1676,7 @@ if bot:
         # ── LOGIN FLOW ──
         if state == "awaiting_phone":
             phone = message.text.strip()
+            logger.info(f"📱 Received phone: {phone} for {message.from_user.id}")
             login_data[message.from_user.id] = {"phone": phone, "client": None}
             admin_states[message.from_user.id] = "awaiting_api_id"
             markup = InlineKeyboardMarkup()
@@ -1683,13 +1684,15 @@ if bot:
             bot.reply_to(message, "🔢 Please enter your <b>API ID</b> from <a href='https://my.telegram.org'>my.telegram.org</a>:", reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
             return
 
-        if state == "awaiting_phone_simple":
+        elif state == "awaiting_phone_simple":
             phone = message.text.strip()
+            logger.info(f"📱 Received simple phone: {phone} for {message.from_user.id}")
             login_data[message.from_user.id] = {"phone": phone, "client": None, "api_id": None, "api_hash": None}
             start_otp_flow(message)
             return
 
-        if state == "awaiting_api_id":
+        elif state == "awaiting_api_id":
+            logger.info(f"🔢 Received API ID for {message.from_user.id}")
             try:
                 api_id = int(message.text.strip())
                 login_data[message.from_user.id]["api_id"] = api_id
@@ -1701,13 +1704,15 @@ if bot:
                 bot.reply_to(message, "❌ Invalid API ID. Please send numbers only.")
             return
 
-        if state == "awaiting_api_hash":
+        elif state == "awaiting_api_hash":
+            logger.info(f"🔑 Received API HASH for {message.from_user.id}")
             api_hash = message.text.strip()
             login_data[message.from_user.id]["api_hash"] = api_hash
             start_otp_flow(message)
             return
 
-        if state == "awaiting_otp":
+        elif state == "awaiting_otp":
+            logger.info(f"🔐 Received OTP for {message.from_user.id}")
             otp = message.text.strip().replace(" ", "")
             data = login_data.get(message.from_user.id, {})
             tmp: Client = data.get("client")
@@ -1747,6 +1752,7 @@ if bot:
                         parse_mode="HTML"
                     )
                 except Exception as e:
+                    logger.error(f"❌ Login failed: {e}")
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(message.chat.id, f"❌ Login failed: <code>{e}</code>", parse_mode="HTML")
@@ -1754,7 +1760,8 @@ if bot:
             asyncio.run_coroutine_threadsafe(sign_in(), loop)
             return
 
-        if state == "awaiting_2fa":
+        elif state == "awaiting_2fa":
+            logger.info(f"🔐 Received 2FA for {message.from_user.id}")
             password = message.text.strip()
             data = login_data.get(message.from_user.id, {})
             tmp: Client = data.get("client")
@@ -1783,6 +1790,7 @@ if bot:
                         parse_mode="HTML"
                     )
                 except Exception as e:
+                    logger.error(f"❌ 2FA failed: {e}")
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(message.chat.id, f"❌ 2FA failed: <code>{e}</code>", parse_mode="HTML")
