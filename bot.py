@@ -519,16 +519,27 @@ if bot:
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("src_options_"):
-            s_id = int(call.data.split("_")[2])
+            # callback_data = "src_options_{s_id}" where s_id can be negative
+            s_id = int(call.data[len("src_options_"):])
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🕰 Scrape History", callback_data=f"scrape_{s_id}"))
+            if user_client:
+                markup.row(InlineKeyboardButton("🕰 Scrape History (Userbot)", callback_data=f"scrape_{s_id}"))
+            else:
+                markup.row(InlineKeyboardButton("⚠️ Scrape needs Userbot", callback_data="userbot_menu"))
             markup.row(InlineKeyboardButton("🔙 Back", callback_data="sources"))
-            bot.edit_message_text(f"Options for source `{s_id}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                f"⚙️ *Source Options*\n\nID: `{s_id}`",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=markup, parse_mode="Markdown"
+            )
 
         elif call.data.startswith("scrape_"):
-            s_id = int(call.data.split("_")[1])
-            bot.send_message(call.message.chat.id, f"🕰 Started historical scrape for `{s_id}`. Check terminal for progress.")
-            asyncio.run_coroutine_threadsafe(scrape_history(s_id, limit=50), user_client.loop)
+            s_id = int(call.data[len("scrape_"):])
+            if not user_client:
+                bot.answer_callback_query(call.id, "⚠️ Userbot not connected. Go to Userbot menu to connect.", show_alert=True)
+                return
+            bot.send_message(call.message.chat.id, f"🕰 Historical scrape started for `{s_id}` (limit: 100 messages). This runs in the background.")
+            asyncio.run_coroutine_threadsafe(scrape_history(s_id, limit=100), loop)
 
         elif call.data == "targets":
             targets = get_all_targets()
