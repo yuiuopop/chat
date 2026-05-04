@@ -1,5 +1,10 @@
 import os
 import asyncio
+
+# Fix for Pyrogram RuntimeError in Python 3.10+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 import threading
 import logging
 import psycopg2
@@ -583,6 +588,6 @@ async def start_services():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(start_services())
+        loop.run_until_complete(start_services())
     except KeyboardInterrupt:
         logger.info("System stopped.")
