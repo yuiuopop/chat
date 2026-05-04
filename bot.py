@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
+from pyrogram.errors import SessionPasswordNeeded
+from pyrogram.storage import MemoryStorage
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -110,6 +112,13 @@ def init_db():
                     source_id BIGINT REFERENCES monitored_sources(source_id) ON DELETE CASCADE,
                     target_id BIGINT REFERENCES target_groups(target_id) ON DELETE CASCADE,
                     UNIQUE(source_id, target_id)
+                )
+            """)
+            # Table to store the Pyrogram StringSession
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 )
             """)
             logger.info("✅ Database schema initialized.")
@@ -262,13 +271,52 @@ def get_stats():
     except:
         return 0, 0
 
+# Session helpers
+def get_session_string():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM bot_settings WHERE key = 'session_string'")
+                row = c.fetchone()
+                return row[0] if row else None
+    except:
+        return None
+
+def save_session_string(session_str):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO bot_settings (key, value) VALUES ('session_string', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (session_str,))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save session: {e}")
+        return False
+
 # ==========================================
 # 🤖 PYROGRAM USERBOT (LISTENER & DOWNLOADER)
 # ==========================================
-if API_ID and API_HASH:
-    user_client = Client("my_userbot", api_id=API_ID, api_hash=API_HASH)
-else:
-    user_client = None
+
+# Global user_client — created after login
+user_client = None
+
+def build_client(session_str):
+    """Build a Pyrogram Client from a saved session string."""
+    from pyrogram.storage import MemoryStorage
+    return Client(
+        name="userbot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=session_str
+    )
+
+def register_userbot_handlers(client: Client):
+    """Attach live listener to the client."""
+    @client.on_message(filters.media & ~filters.me)
+    async def live_listener(c: Client, message: Message):
+        asyncio.create_task(download_media(c, message))
 
 async def download_media(client: Client, message: Message):
     if not message.media:
@@ -305,11 +353,7 @@ async def download_media(client: Client, message: Message):
     except Exception as e:
         logger.error(f"❌ Failed to download media: {e}")
 
-if user_client:
-    @user_client.on_message(filters.media & ~filters.me)
-    async def live_listener(client: Client, message: Message):
-        """Listens for new incoming media in the background."""
-        asyncio.create_task(download_media(client, message))
+# live_listener is registered dynamically via register_userbot_handlers() after login
 
 async def scrape_history(chat_id: int, limit: int = 100):
     """Scrape historical media from a specific chat."""
@@ -335,7 +379,13 @@ if BOT_TOKEN:
 else:
     bot = None
 
+# admin_states stores per-user state
+# Values: 'awaiting_phone', 'awaiting_otp', 'awaiting_2fa',
+#         'awaiting_source', 'awaiting_target', 'awaiting_mapping'
 admin_states = {}
+
+# Temporary login data keyed by user_id
+login_data = {}
 
 def is_admin(user_id):
     if ADMIN_ID == 0:
@@ -347,6 +397,19 @@ if bot:
     def start_cmd(message):
         if not is_admin(message.from_user.id):
             bot.reply_to(message, "❌ Unauthorized.")
+            return
+
+        # If no active userbot session, prompt login first
+        if user_client is None:
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔑 Login Userbot", callback_data="login_userbot"))
+            bot.send_message(
+                message.chat.id,
+                "⚠️ *Userbot Not Logged In*\n\n"
+                "The Userbot needs to be authenticated with your Telegram account before it can monitor groups.\n\n"
+                "Press the button below to begin the login process.",
+                reply_markup=markup, parse_mode="Markdown"
+            )
             return
             
         markup = InlineKeyboardMarkup()
@@ -374,6 +437,15 @@ if bot:
             return
 
         bot.answer_callback_query(call.id)
+
+        if call.data == "login_userbot":
+            admin_states[call.from_user.id] = "awaiting_phone"
+            bot.send_message(
+                call.message.chat.id,
+                "📱 Please send your phone number in international format:\n`+1234567890`",
+                parse_mode="Markdown"
+            )
+            return
         
         if call.data == "stats":
             unreleased, released = get_stats()
@@ -469,7 +541,115 @@ if bot:
 
     @bot.message_handler(func=lambda m: m.from_user.id in admin_states)
     def handle_states(message):
-        state = admin_states.pop(message.from_user.id)
+        global user_client
+        state = admin_states.get(message.from_user.id)
+
+        # ── LOGIN FLOW ──
+        if state == "awaiting_phone":
+            phone = message.text.strip()
+            login_data[message.from_user.id] = {"phone": phone, "client": None}
+            bot.reply_to(message, "⏳ Sending OTP to your Telegram account...")
+
+            async def send_code():
+                tmp = Client(
+                    name=":memory:",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    in_memory=True
+                )
+                await tmp.connect()
+                sent = await tmp.send_code(phone)
+                login_data[message.from_user.id]["client"] = tmp
+                login_data[message.from_user.id]["phone_code_hash"] = sent.phone_code_hash
+                admin_states[message.from_user.id] = "awaiting_otp"
+                bot.send_message(
+                    message.chat.id,
+                    "✅ OTP sent! Please enter the code you received:\n"
+                    "_(Send digits only, e.g. `12345`)_",
+                    parse_mode="Markdown"
+                )
+
+            asyncio.run_coroutine_threadsafe(send_code(), loop)
+            return
+
+        if state == "awaiting_otp":
+            otp = message.text.strip().replace(" ", "")
+            data = login_data.get(message.from_user.id, {})
+            tmp: Client = data.get("client")
+
+            async def sign_in():
+                global user_client
+                try:
+                    await tmp.sign_in(
+                        phone_number=data["phone"],
+                        phone_code_hash=data["phone_code_hash"],
+                        phone_code=otp
+                    )
+                    session_str = await tmp.export_session_string()
+                    save_session_string(session_str)
+                    await tmp.disconnect()
+
+                    # Build and start the real userbot
+                    user_client = build_client(session_str)
+                    register_userbot_handlers(user_client)
+                    await user_client.start()
+
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(
+                        message.chat.id,
+                        "🎉 *Login Successful!*\n\nUserbot is now active and listening for media.",
+                        parse_mode="Markdown"
+                    )
+                except SessionPasswordNeeded:
+                    admin_states[message.from_user.id] = "awaiting_2fa"
+                    bot.send_message(
+                        message.chat.id,
+                        "🔐 Two-Factor Authentication is enabled.\nPlease send your *2FA password*:",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(message.chat.id, f"❌ Login failed: `{e}`", parse_mode="Markdown")
+
+            asyncio.run_coroutine_threadsafe(sign_in(), loop)
+            return
+
+        if state == "awaiting_2fa":
+            password = message.text.strip()
+            data = login_data.get(message.from_user.id, {})
+            tmp: Client = data.get("client")
+
+            async def check_password():
+                global user_client
+                try:
+                    await tmp.check_password(password)
+                    session_str = await tmp.export_session_string()
+                    save_session_string(session_str)
+                    await tmp.disconnect()
+
+                    user_client = build_client(session_str)
+                    register_userbot_handlers(user_client)
+                    await user_client.start()
+
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(
+                        message.chat.id,
+                        "🎉 *Login Successful!*\n\nUserbot is now active and listening for media.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(message.chat.id, f"❌ 2FA failed: `{e}`", parse_mode="Markdown")
+
+            asyncio.run_coroutine_threadsafe(check_password(), loop)
+            return
+
+        # ── NORMAL ADMIN STATES ──
+        admin_states.pop(message.from_user.id, None)
         try:
             parts = message.text.split(" ", 1)
             if state == "awaiting_source":
@@ -563,28 +743,36 @@ async def start_services():
         logger.error(f"Failed to initialize database: {e}")
         return
 
-    if not user_client:
-        logger.error("API_ID and API_HASH not found. Cannot start Pyrogram Userbot.")
-        return
-
-    logger.info("Starting Pyrogram Userbot...")
-    await user_client.start()
-    logger.info("✅ Userbot Started successfully!")
+    # Try to restore a saved userbot session from DB
+    session_str = get_session_string()
+    if session_str:
+        logger.info("🔑 Found saved session. Restoring Pyrogram Userbot...")
+        try:
+            user_client = build_client(session_str)
+            register_userbot_handlers(user_client)
+            await user_client.start()
+            logger.info("✅ Userbot restored and started successfully!")
+        except Exception as e:
+            logger.warning(f"⚠️ Saved session invalid or expired: {e}. Clearing session.")
+            save_session_string("")
+            user_client = None
+    else:
+        logger.info("ℹ️ No saved session found. Admin must log in via the bot.")
 
     if bot:
         logger.info("Starting Telebot Admin UI...")
-        # Run polling in an executor so it doesn't block the async loop
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, bot.infinity_polling)
+        current_loop = asyncio.get_running_loop()
+        current_loop.run_in_executor(None, bot.infinity_polling)
         logger.info("✅ Admin Bot Started successfully!")
     else:
         logger.warning("BOT_TOKEN not found. Admin UI will not start.")
 
     logger.info("System is fully running. Press Ctrl+C to stop.")
     await idle()
-    
-    logger.info("Stopping Pyrogram Userbot...")
-    await user_client.stop()
+
+    if user_client and user_client.is_connected:
+        logger.info("Stopping Pyrogram Userbot...")
+        await user_client.stop()
 
 if __name__ == "__main__":
     try:
