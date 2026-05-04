@@ -7,6 +7,7 @@ asyncio.set_event_loop(loop)
 
 import threading
 import logging
+import requests
 import psycopg2
 from psycopg2 import pool as pg_pool
 from contextlib import contextmanager
@@ -184,6 +185,20 @@ def add_monitored_source(source_id, title):
                 return True
     except Exception as e:
         logger.error(f"Error adding monitored source: {e}")
+        return False
+
+def unregister_source(source_id):
+    """Soft-delete a source when the bot is removed from it."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "UPDATE monitored_sources SET is_active = FALSE WHERE source_id = %s",
+                    (source_id,)
+                )
+                return True
+    except Exception as e:
+        logger.error(f"Error unregistering source: {e}")
         return False
 
 def add_target_group(target_id, title):
@@ -398,20 +413,10 @@ if bot:
         if not is_admin(message.from_user.id):
             bot.reply_to(message, "❌ Unauthorized.")
             return
+        show_main_menu(message.chat.id)
 
-        # If no active userbot session, prompt login first
-        if user_client is None:
-            markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔑 Login Userbot", callback_data="login_userbot"))
-            bot.send_message(
-                message.chat.id,
-                "⚠️ *Userbot Not Logged In*\n\n"
-                "The Userbot needs to be authenticated with your Telegram account before it can monitor groups.\n\n"
-                "Press the button below to begin the login process.",
-                reply_markup=markup, parse_mode="Markdown"
-            )
-            return
-            
+    def show_main_menu(chat_id, message_id=None):
+        userbot_status = "✅ Connected" if user_client else "❌ Not Connected"
         markup = InlineKeyboardMarkup()
         markup.row(
             InlineKeyboardButton("📊 Stats", callback_data="stats"),
@@ -422,13 +427,23 @@ if bot:
             InlineKeyboardButton("🔗 Mappings", callback_data="mappings")
         )
         markup.row(InlineKeyboardButton("🚀 Release Media", callback_data="release"))
-        
+        markup.row(InlineKeyboardButton(f"🤖 Userbot: {userbot_status}", callback_data="userbot_menu"))
+
         text = (
-            "💎 *Userbot Media Saver Dashboard*\n"
+            "💎 *Media Saver Pro — Dashboard*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Welcome! Manage your Pyrogram userbot here."
+            "🟢 *Bot-as-Admin Mode*: Always active.\n"
+            "  ↳ Add this bot as an admin to any group or channel to start saving media automatically.\n\n"
+            f"🤖 *Userbot Mode*: {userbot_status}\n"
+            "  ↳ Optional. Enables monitoring of restricted channels you cannot add the bot to."
         )
-        bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+        try:
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+            else:
+                bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+        except:
+            bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
 
     @bot.callback_query_handler(func=lambda call: True)
     def callback_handler(call):
@@ -438,12 +453,44 @@ if bot:
 
         bot.answer_callback_query(call.id)
 
-        if call.data == "login_userbot":
+        if call.data == "userbot_menu":
+            userbot_status = "✅ Connected" if user_client else "❌ Not Connected"
+            markup = InlineKeyboardMarkup()
+            if user_client:
+                markup.row(InlineKeyboardButton("🔴 Disconnect Userbot", callback_data="disconnect_userbot"))
+            else:
+                markup.row(InlineKeyboardButton("🔗 Connect Userbot", callback_data="connect_userbot"))
+            markup.row(InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
+            text = (
+                "🤖 *Userbot Mode*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Status: *{userbot_status}*\n\n"
+                "The Userbot logs into your personal Telegram account to monitor *restricted channels* "
+                "that don't allow bots.\n\n"
+                "⚠️ *Bot-as-Admin mode works without this.* \n"
+                "Only enable Userbot if you need to monitor channels where you cannot add the bot as admin."
+            )
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data == "connect_userbot":
             admin_states[call.from_user.id] = "awaiting_phone"
             bot.send_message(
                 call.message.chat.id,
-                "📱 Please send your phone number in international format:\n`+1234567890`",
+                "📱 *Connect Userbot*\n\nSend your phone number in international format:\n`+1234567890`\n\n"
+                "_Your number will only be used to generate a Telegram session._",
                 parse_mode="Markdown"
+            )
+            return
+
+        elif call.data == "disconnect_userbot":
+            global user_client
+            if user_client:
+                asyncio.run_coroutine_threadsafe(user_client.stop(), loop)
+                user_client = None
+            save_session_string("")
+            bot.edit_message_text(
+                "✅ *Userbot Disconnected.*\n\nBot-as-Admin mode is still active.",
+                call.message.chat.id, call.message.message_id, parse_mode="Markdown"
             )
             return
         
@@ -537,7 +584,92 @@ if bot:
             threading.Thread(target=release_media_thread, args=(call.message.chat.id,)).start()
 
         elif call.data == "main_menu":
-            start_cmd(call.message)
+            show_main_menu(call.message.chat.id, call.message.message_id)
+
+    # ── BOT-AS-ADMIN: Auto-register when bot is added to a group/channel ──
+    @bot.my_chat_member_handler()
+    def handle_bot_member_update(update):
+        new_status = update.new_chat_member.status
+        chat = update.chat
+        if new_status in ['administrator', 'member']:
+            add_monitored_source(chat.id, chat.title or f"Chat {chat.id}")
+            logger.info(f"✅ Auto-registered source: {chat.title} ({chat.id})")
+            if ADMIN_ID:
+                try:
+                    bot.send_message(
+                        ADMIN_ID,
+                        f"📢 *New Source Registered!*\n\n"
+                        f"🏷 *Name*: {chat.title}\n"
+                        f"🆔 *ID*: `{chat.id}`\n"
+                        f"ℹ️ Bot was added as *{new_status}*. Media will now be saved automatically.",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+        elif new_status in ['kicked', 'left']:
+            unregister_source(chat.id)
+            logger.info(f"❌ Auto-unregistered source: {chat.title} ({chat.id})")
+
+    # ── BOT-AS-ADMIN: Capture media from groups where bot is admin ──
+    @bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'animation'],
+                         func=lambda m: m.chat.type in ['group', 'supergroup'])
+    def capture_group_media(message):
+        sources = get_all_sources()
+        monitored_ids = [s[0] for s in sources]
+        if message.chat.id not in monitored_ids:
+            return
+        _save_bot_media(message)
+
+    @bot.channel_post_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'animation'])
+    def capture_channel_media(message):
+        sources = get_all_sources()
+        monitored_ids = [s[0] for s in sources]
+        if message.chat.id not in monitored_ids:
+            return
+        _save_bot_media(message)
+
+    def _save_bot_media(message):
+        """Extract file_id from a telebot message and download it via Bot API."""
+        file_id, media_type = None, None
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            media_type = "photo"
+        elif message.video:
+            file_id = message.video.file_id
+            media_type = "video"
+        elif message.document:
+            file_id = message.document.file_id
+            media_type = "document"
+        elif message.audio:
+            file_id = message.audio.file_id
+            media_type = "audio"
+        elif message.voice:
+            file_id = message.voice.file_id
+            media_type = "voice"
+        elif message.animation:
+            file_id = message.animation.file_id
+            media_type = "animation"
+
+        if not file_id:
+            return
+
+        caption = message.caption or ""
+        # Download via Bot API to local disk
+        try:
+            file_info = bot.get_file(file_id)
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+            local_dir = os.path.join(DOWNLOAD_DIR, str(message.chat.id))
+            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, os.path.basename(file_info.file_path))
+            if not os.path.exists(local_path):
+                response = requests.get(file_url, stream=True)
+                with open(local_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            save_media_record(message.message_id, message.chat.id, media_type, local_path, caption)
+            logger.info(f"✅ [Bot-Admin] Saved {media_type} from {message.chat.id}")
+        except Exception as e:
+            logger.error(f"❌ [Bot-Admin] Failed to save media: {e}")
 
     @bot.message_handler(func=lambda m: m.from_user.id in admin_states)
     def handle_states(message):
