@@ -16,7 +16,7 @@ from datetime import datetime
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import SessionPasswordNeeded
+from pyrogram.errors import SessionPasswordNeeded, Unauthorized
 from pyrogram.storage import MemoryStorage
 
 import telebot
@@ -1206,9 +1206,12 @@ async def start_services():
             register_userbot_handlers(user_client)
             await user_client.start()
             logger.info("✅ Userbot restored and started successfully!")
-        except Exception as e:
-            logger.warning(f"⚠️ Saved session invalid or expired: {e}. Clearing session.")
+        except Unauthorized as e:
+            logger.warning(f"⚠️ Saved session is invalid or expired (Unauthorized): {e}. Clearing session from database.")
             save_session_string("")
+            user_client = None
+        except Exception as e:
+            logger.error(f"❌ Could not start Userbot due to a network or connection error: {e}")
             user_client = None
     else:
         logger.info("ℹ️ No saved session found. Admin must log in via the bot.")
