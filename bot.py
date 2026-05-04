@@ -143,15 +143,17 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS user_sessions (
                     phone TEXT PRIMARY KEY,
                     session_string TEXT,
+                    api_id INTEGER,
+                    api_hash TEXT,
                     is_active BOOLEAN DEFAULT TRUE,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
-            # Add session_id to existing tables
-            for table in ["monitored_sources", "target_groups"]:
+            # Migration: Add api_id and api_hash to existing sessions if missing
+            for col, col_type in [("api_id", "INTEGER"), ("api_hash", "TEXT")]:
                 try:
-                    c.execute(f"ALTER TABLE {table} ADD COLUMN session_id TEXT DEFAULT 'Legacy'")
+                    c.execute(f"ALTER TABLE user_sessions ADD COLUMN {col} {col_type}")
                 except Exception:
                     conn.rollback()
                 else:
@@ -375,25 +377,115 @@ def get_stats():
     except:
         return 0, 0
 
+def get_media_stats_by_source(session_id=None):
+    """Return list of (source_id, title, unreleased_count, released_count) per source."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                if session_id:
+                    c.execute("""
+                        SELECT ms.source_id, ms.title,
+                            COUNT(sm.id) FILTER (WHERE sm.is_released = FALSE) AS unreleased,
+                            COUNT(sm.id) FILTER (WHERE sm.is_released = TRUE) AS released
+                        FROM monitored_sources ms
+                        LEFT JOIN saved_media sm ON ms.source_id = sm.source_chat_id
+                        WHERE ms.is_active = TRUE AND ms.session_id = %s
+                        GROUP BY ms.source_id, ms.title
+                        ORDER BY unreleased DESC
+                    """, (session_id,))
+                else:
+                    c.execute("""
+                        SELECT ms.source_id, ms.title,
+                            COUNT(sm.id) FILTER (WHERE sm.is_released = FALSE) AS unreleased,
+                            COUNT(sm.id) FILTER (WHERE sm.is_released = TRUE) AS released
+                        FROM monitored_sources ms
+                        LEFT JOIN saved_media sm ON ms.source_id = sm.source_chat_id
+                        WHERE ms.is_active = TRUE
+                        GROUP BY ms.source_id, ms.title
+                        ORDER BY unreleased DESC
+                    """)
+                return c.fetchall()
+    except Exception as e:
+        logger.error(f"Error fetching media stats by source: {e}")
+        return []
+
+def get_unreleased_media_for_source(source_id):
+    """Return all unreleased media items for a specific source."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT id, file_path, media_type, caption
+                    FROM saved_media
+                    WHERE source_chat_id = %s AND is_released = FALSE
+                    ORDER BY downloaded_at ASC
+                """, (source_id,))
+                return c.fetchall()
+    except Exception as e:
+        logger.error(f"Error fetching unreleased media for source {source_id}: {e}")
+        return []
+
+def get_all_media_for_source(source_id, limit=6, offset=0):
+    """Return paginated media items for a source (all statuses)."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT id, file_path, media_type, caption, is_released, downloaded_at
+                    FROM saved_media
+                    WHERE source_chat_id = %s
+                    ORDER BY downloaded_at DESC
+                    LIMIT %s OFFSET %s
+                """, (source_id, limit, offset))
+                rows = c.fetchall()
+                c.execute("SELECT COUNT(*) FROM saved_media WHERE source_chat_id = %s", (source_id,))
+                total = c.fetchone()[0]
+                return rows, total
+    except Exception as e:
+        logger.error(f"Error fetching media for source {source_id}: {e}")
+        return [], 0
+
+def delete_media_record(media_id):
+    """Delete a media record and its local file."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT file_path FROM saved_media WHERE id = %s", (media_id,))
+                row = c.fetchone()
+                if row and row[0] and os.path.exists(row[0]):
+                    try:
+                        os.remove(row[0])
+                    except:
+                        pass
+                c.execute("DELETE FROM saved_media WHERE id = %s", (media_id,))
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting media {media_id}: {e}")
+        return False
+
 def get_all_sessions():
     try:
         with get_connection() as conn:
             with conn.cursor() as c:
-                c.execute("SELECT phone, session_string FROM user_sessions WHERE is_active = TRUE")
+                c.execute("SELECT phone, session_string, api_id, api_hash FROM user_sessions WHERE is_active = TRUE")
                 return c.fetchall()
     except Exception as e:
         logger.error(f"Error fetching sessions: {e}")
         return []
 
-def save_session(phone, session_str):
+def save_session(phone, session_str, api_id=None, api_hash=None):
     try:
         with get_connection() as conn:
             with conn.cursor() as c:
                 c.execute("""
-                    INSERT INTO user_sessions (phone, session_string, is_active) 
-                    VALUES (%s, %s, TRUE)
-                    ON CONFLICT (phone) DO UPDATE SET session_string = EXCLUDED.session_string, is_active = TRUE
-                """, (phone, session_str))
+                    INSERT INTO user_sessions (phone, session_string, api_id, api_hash, is_active) 
+                    VALUES (%s, %s, %s, %s, TRUE)
+                    ON CONFLICT (phone) DO UPDATE SET 
+                        session_string = EXCLUDED.session_string,
+                        api_id = EXCLUDED.api_id,
+                        api_hash = EXCLUDED.api_hash,
+                        is_active = TRUE
+                """, (phone, session_str, api_id, api_hash))
         return True
     except Exception as e:
         logger.error(f"Failed to save session: {e}")
@@ -459,25 +551,39 @@ def toggle_live_forward(source_id):
 # Multi-session: dict of phone -> Pyrogram Client
 active_clients = {}  # phone -> Client
 
-def build_client(phone, session_str):
-    """Build a Pyrogram Client from a saved session string."""
+def build_client(phone, session_str, api_id=None, api_hash=None):
+    """Factory to create a Pyrogram client from a session string with custom API credentials."""
+    # Fallback to global defaults if not provided per-session
+    final_api_id = api_id if api_id else API_ID
+    final_api_hash = api_hash if api_hash else API_HASH
+    
     c = Client(
-        name=f"userbot_{phone}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=session_str
+        name=f"sessions/{phone}",
+        api_id=final_api_id,
+        api_hash=final_api_hash,
+        session_string=session_str,
+        plugins=None,
+        workers=4,
+        storage=MemoryStorage()
     )
     c._phone = phone  # tag for identification
     return c
 
 def register_userbot_handlers(client: Client):
     """Attach live listener to the client."""
-    @client.on_message(filters.media & ~filters.me)
+    @client.on_message(filters.media)
     async def live_listener(c: Client, message: Message):
-        # Only handle if source is mapped to this session
+        # Allow self-sent media only if it's in a monitored source (like Saved Messages)
+        if message.from_user and message.from_user.is_self:
+            # We don't use ~filters.me anymore, but we must be careful not to loop
+            # Check if this chat is specifically monitored
+            pass 
+        
         sources = get_all_sources(session_id=c._phone)
         monitored_ids = [s[0] for s in sources]
         if message.chat.id in monitored_ids:
+            # Avoid processing messages sent by the bot to targets (if any)
+            # but usually filters.media takes care of it.
             asyncio.create_task(download_media(c, message))
 
 def passes_filters(message, filters_dict, is_pyrogram=True):
@@ -600,7 +706,7 @@ async def download_media(client: Client, message: Message):
 
 active_scrapes = {}
 
-async def scrape_history(chat_id: int, admin_chat_id: int, status_msg_id: int, limit: int = 0, start_date=None, end_date=None):
+async def scrape_history(client: Client, chat_id: int, admin_chat_id: int, status_msg_id: int, limit: int = 0, start_date=None, end_date=None):
     """Scrape historical media from a specific chat with progress and cancellation."""
     scrape_id = f"{chat_id}_{status_msg_id}"
     active_scrapes[scrape_id] = False
@@ -613,7 +719,7 @@ async def scrape_history(chat_id: int, admin_chat_id: int, status_msg_id: int, l
     try:
         if start_date and end_date:
             # Date mode
-            async for message in user_client.get_chat_history(chat_id, offset_date=end_date):
+            async for message in client.get_chat_history(chat_id, offset_date=end_date):
                 if active_scrapes.get(scrape_id, False):
                     break
                 
@@ -623,7 +729,7 @@ async def scrape_history(chat_id: int, admin_chat_id: int, status_msg_id: int, l
                     
                 scanned += 1
                 if message.media:
-                    await download_media(user_client, message)
+                    await download_media(client, message)
                     count += 1
                     await asyncio.sleep(0.5)
                 
@@ -635,13 +741,13 @@ async def scrape_history(chat_id: int, admin_chat_id: int, status_msg_id: int, l
                     except: pass
         else:
             # Limit mode
-            async for message in user_client.get_chat_history(chat_id, limit=limit):
+            async for message in client.get_chat_history(chat_id, limit=limit if limit > 0 else None):
                 if active_scrapes.get(scrape_id, False):
                     break
                     
                 scanned += 1
                 if message.media:
-                    await download_media(user_client, message)
+                    await download_media(client, message)
                     count += 1
                     await asyncio.sleep(0.5)
                 
@@ -757,15 +863,19 @@ if bot:
             phone = call.data[len("acct_dash_"):]
             is_live = phone in active_clients
             status = "✅ Active" if is_live else "🔴 Offline"
-            src_count = len(get_all_sources(session_id=phone))
+            src_stats = get_media_stats_by_source(session_id=phone)
+            src_count = len(src_stats)
             tgt_count = len(get_all_targets(session_id=phone))
+            total_unreleased = sum(s[2] for s in src_stats)
             markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("📊 Media Statistics", callback_data=f"media_stats_{phone}"))
             markup.row(InlineKeyboardButton("📁 Browse Joined Chats", callback_data=f"browse_chats_{phone}_0"))
             markup.row(
                 InlineKeyboardButton(f"📂 Sources ({src_count})", callback_data=f"acct_sources_{phone}"),
                 InlineKeyboardButton(f"🎯 Targets ({tgt_count})", callback_data=f"acct_targets_{phone}")
             )
             if is_live:
+                markup.row(InlineKeyboardButton("✨ Monitor Saved Messages", callback_data=f"quick_add_saved_{phone}"))
                 markup.row(InlineKeyboardButton("🔴 Disconnect Account", callback_data=f"acct_disconnect_{phone}"))
             markup.row(InlineKeyboardButton("🔙 Back to Accounts", callback_data="account_manager"))
             text = (
@@ -773,8 +883,9 @@ if bot:
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"<blockquote><b>Status:</b> {status}\n"
                 f"<b>Sources Monitored:</b> {src_count}\n"
-                f"<b>Target Channels:</b> {tgt_count}</blockquote>\n\n"
-                f"<i>Browse Joined Chats to quickly add sources or targets for this account.</i>"
+                f"<b>Target Channels:</b> {tgt_count}\n"
+                f"<b>Pending Release:</b> {total_unreleased} items</blockquote>\n\n"
+                f"<i>Tap 📊 Media Statistics to see a breakdown per source and release media.</i>"
             )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
@@ -804,6 +915,8 @@ if bot:
                 async for dialog in client.get_dialogs():
                     if dialog.chat.type.name in ["GROUP", "SUPERGROUP", "CHANNEL"]:
                         chats.append((dialog.chat.id, dialog.chat.title or str(dialog.chat.id)))
+                    elif dialog.chat.type.name == "PRIVATE" and dialog.chat.id == (await client.get_me()).id:
+                        chats.append((dialog.chat.id, "✨ Saved Messages"))
                 return chats
 
             all_chats = asyncio.run_coroutine_threadsafe(fetch_chats(), loop).result(timeout=30)
@@ -861,7 +974,248 @@ if bot:
             add_target_group(c_id, str(c_id), session_id=phone)
             bot.answer_callback_query(call.id, f"\u2705 Added as Target for {phone}!", show_alert=True)
 
+        elif call.data.startswith("media_stats_"):
+            phone = call.data[len("media_stats_"):]
+            src_stats = get_media_stats_by_source(session_id=phone)
+            markup = InlineKeyboardMarkup()
+            text = (
+                f"<b>📊 MEDIA STATISTICS</b> \u2014 <code>{phone}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            )
+            if not src_stats:
+                text += "<i>No sources configured for this account.</i>"
+            else:
+                for src_id, title, unreleased, released in src_stats:
+                    title_short = (title or str(src_id))[:30]
+                    total_src = unreleased + released
+                    text += f"<blockquote><b>{title_short}</b>\n📦 Unreleased: {unreleased} \u2022 ✅ Released: {released} \u2022 🗂 Total: {total_src}</blockquote>\n"
+                    row = []
+                    if total_src > 0:
+                        row.append(InlineKeyboardButton(
+                            f"📁 Browse ({total_src})",
+                            callback_data=f"browse_media_{src_id}_0"
+                        ))
+                    if unreleased > 0:
+                        row.append(InlineKeyboardButton(
+                            f"🚀 Release ({unreleased})",
+                            callback_data=f"release_src_{src_id}"
+                        ))
+                    if row:
+                        markup.row(*row)
+            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("release_src_"):
+            src_id = int(call.data[len("release_src_"):])
+            media_items = get_unreleased_media_for_source(src_id)
+            if not media_items:
+                bot.answer_callback_query(call.id, "No unreleased media for this source.", show_alert=True)
+                return
+            targets = get_targets_for_source(src_id)
+            if not targets:
+                bot.answer_callback_query(call.id, "\u274c No targets mapped for this source!", show_alert=True)
+                return
+
+            status_msg = bot.send_message(
+                call.message.chat.id,
+                f"⏳ <b>Releasing {len(media_items)} items...</b>",
+                parse_mode="HTML"
+            )
+
+            async def do_release(items, source_id, chat_id, msg_id):
+                done = 0
+                for m_id, file_path, m_type, caption in items:
+                    result = await release_single_media(m_id, file_path, m_type, caption or "", source_id)
+                    if result:
+                        done += 1
+                    await asyncio.sleep(1.5)
+                try:
+                    bot.edit_message_text(
+                        f"✅ <b>Release Complete!</b>\n\n<b>{done}</b> / {len(items)} items sent to targets.",
+                        chat_id, msg_id, parse_mode="HTML"
+                    )
+                except:
+                    pass
+
+            asyncio.run_coroutine_threadsafe(
+                do_release(media_items, src_id, call.message.chat.id, status_msg.message_id), loop
+            )
+
+        elif call.data.startswith("browse_media_"):
+            parts = call.data.split("_")
+            page = int(parts[-1])
+            src_id = int(parts[2])
+            per_page = 6
+            offset = page * per_page
+            media_items, total = get_all_media_for_source(src_id, limit=per_page, offset=offset)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+
+            markup = InlineKeyboardMarkup()
+            type_icons = {"photo": "\ud83d\uddbc", "video": "\ud83c\udfa5", "document": "\ud83d\udcce", "audio": "\ud83c\udfa7", "voice": "\ud83c\udfa4", "animation": "\ud83c\udfac"}
+            for m_id, file_path, m_type, caption, is_released, downloaded_at in media_items:
+                icon = type_icons.get(m_type, "\ud83d\udcc4")
+                status = "\u2705" if is_released else "\ud83d\udfe1"
+                dt_str = downloaded_at.strftime("%d %b %H:%M") if downloaded_at else ""
+                label = f"{icon} {status} {m_type.capitalize()} \u2022 {dt_str}"
+                markup.row(InlineKeyboardButton(label, callback_data=f"view_media_{src_id}_{m_id}_{page}"))
+
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("\u25c0 Prev", callback_data=f"browse_media_{src_id}_{page-1}"))
+            if (page + 1) * per_page < total:
+                nav_row.append(InlineKeyboardButton("Next \u25b6", callback_data=f"browse_media_{src_id}_{page+1}"))
+            if nav_row:
+                markup.row(*nav_row)
+            markup.row(InlineKeyboardButton("\ud83d\udd19 Back to Stats", callback_data=f"back_to_stats_{src_id}"))
+
+            bot.edit_message_text(
+                f"<b>\ud83d\udcc1 MEDIA BROWSER</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+                f"<blockquote><b>Source ID:</b> <code>{src_id}</code>\n"
+                f"<b>Total Items:</b> {total} | <b>Page:</b> {page+1}/{total_pages}</blockquote>\n\n"
+                f"<i>Tap any item to view and manage it.</i>",
+                call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML"
+            )
+
+        elif call.data.startswith("view_media_"):
+            parts = call.data.split("_")
+            m_id = int(parts[3])
+            src_id = int(parts[2])
+            back_page = int(parts[4])
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT id, file_path, media_type, caption, is_released, downloaded_at FROM saved_media WHERE id = %s", (m_id,))
+                        row = c.fetchone()
+            except:
+                row = None
+
+            if not row:
+                bot.answer_callback_query(call.id, "Media not found.", show_alert=True)
+                return
+
+            _, file_path, m_type, caption, is_released, downloaded_at = row
+            file_exists = os.path.exists(file_path) if file_path else False
+            status = "\u2705 Released" if is_released else "\ud83d\udfe1 Unreleased"
+            dt_str = downloaded_at.strftime("%Y-%m-%d %H:%M") if downloaded_at else "Unknown"
+
+            markup = InlineKeyboardMarkup()
+            if file_exists:
+                markup.row(InlineKeyboardButton("\ud83d\udce4 Send to Me", callback_data=f"send_media_{m_id}"))
+            if not is_released:
+                markup.row(InlineKeyboardButton("\ud83d\ude80 Release to Targets", callback_data=f"release_one_{m_id}_{src_id}"))
+            markup.row(InlineKeyboardButton("\ud83d\uddd1 Delete", callback_data=f"del_media_{m_id}_{src_id}_{back_page}"))
+            markup.row(InlineKeyboardButton("\ud83d\udd19 Back to List", callback_data=f"browse_media_{src_id}_{back_page}"))
+
+            file_status = 'Present ✅' if file_exists else 'Missing ❌'
+            text = (
+                f"<b>\ud83d\udcc4 MEDIA DETAILS</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+                f"<blockquote><b>ID:</b> <code>{m_id}</code>\n"
+                f"<b>Type:</b> {m_type}\n"
+                f"<b>Status:</b> {status}\n"
+                f"<b>Saved:</b> {dt_str}\n"
+                f'<b>File:</b> {file_status}</blockquote>\n'
+            )
+            if caption:
+                text += f"\n<blockquote><b>Caption:</b>\n<i>{caption[:200]}</i></blockquote>"
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("send_media_"):
+            m_id = int(call.data[len("send_media_"):])
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT file_path, media_type, caption FROM saved_media WHERE id = %s", (m_id,))
+                        row = c.fetchone()
+            except:
+                row = None
+
+            if not row or not os.path.exists(row[0]):
+                bot.answer_callback_query(call.id, "\u274c File not found on server.", show_alert=True)
+                return
+
+            file_path, m_type, caption = row
+            bot.answer_callback_query(call.id, "\ud83d\udce4 Sending...")
+            try:
+                if m_type == "photo":
+                    bot.send_photo(call.message.chat.id, open(file_path, "rb"), caption=caption)
+                elif m_type == "video":
+                    bot.send_video(call.message.chat.id, open(file_path, "rb"), caption=caption)
+                else:
+                    bot.send_document(call.message.chat.id, open(file_path, "rb"), caption=caption)
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"\u274c Failed to send: <code>{e}</code>", parse_mode="HTML")
+
+        elif call.data.startswith("release_one_"):
+            parts = call.data.split("_")
+            m_id = int(parts[2])
+            src_id = int(parts[3])
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT file_path, media_type, caption FROM saved_media WHERE id = %s", (m_id,))
+                        row = c.fetchone()
+            except:
+                row = None
+            if row:
+                asyncio.run_coroutine_threadsafe(
+                    release_single_media(m_id, row[0], row[1], row[2] or "", src_id), loop
+                )
+                bot.answer_callback_query(call.id, "\u2705 Queued for release!", show_alert=True)
+            else:
+                bot.answer_callback_query(call.id, "\u274c Media not found.", show_alert=True)
+
+        elif call.data.startswith("del_media_"):
+            parts = call.data.split("_")
+            m_id = int(parts[2])
+            src_id = int(parts[3])
+            back_page = int(parts[4])
+            delete_media_record(m_id)
+            bot.answer_callback_query(call.id, "\ud83d\uddd1 Deleted.", show_alert=True)
+            call.data = f"browse_media_{src_id}_{back_page}"
+            callback_handler(call)
+
+        elif call.data.startswith("back_to_stats_"):
+            src_id = int(call.data[len("back_to_stats_"):])
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT session_id FROM monitored_sources WHERE source_id = %s", (src_id,))
+                        row = c.fetchone()
+                phone = row[0] if row else "Legacy"
+            except:
+                phone = "Legacy"
+            call.data = f"media_stats_{phone}"
+            callback_handler(call)
+
+        elif call.data.startswith("quick_add_saved_"):
+            phone = call.data[len("quick_add_saved_"):]
+            client = active_clients.get(phone)
+            if not client: return
+            async def add_saved():
+                me = await client.get_me()
+                add_monitored_source(me.id, "✨ Saved Messages", session_id=phone)
+                bot.answer_callback_query(call.id, "✅ Saved Messages added as Source!", show_alert=True)
+            asyncio.run_coroutine_threadsafe(add_saved(), loop)
+
+        elif call.data == "default_api_id":
+            uid = call.from_user.id
+            if uid in login_data:
+                login_data[uid]["api_id"] = None
+                admin_states[uid] = "awaiting_api_hash"
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("✨ Use Default API Hash", callback_data="default_api_hash"))
+                bot.edit_message_text("🔑 Please enter your <b>API HASH</b>:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data == "default_api_hash":
+            uid = call.from_user.id
+            if uid in login_data:
+                login_data[uid]["api_hash"] = None
+                start_otp_flow(call.message)
+
         elif call.data == "connect_userbot":
+
             admin_states[call.from_user.id] = "awaiting_phone"
             bot.send_message(
                 call.message.chat.id,
@@ -902,13 +1256,23 @@ if bot:
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("src_options_"):
-            # callback_data = "src_options_{s_id}" where s_id can be negative
             s_id = int(call.data[len("src_options_"):])
+            
+            # Check if we have an active session for this source
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT session_id FROM monitored_sources WHERE source_id = %s", (s_id,))
+                        row = c.fetchone()
+                phone = row[0] if row else None
+            except:
+                phone = None
+
             markup = InlineKeyboardMarkup()
-            if user_client:
-                markup.row(InlineKeyboardButton("🕰 Scrape History (Userbot)", callback_data=f"scrape_{s_id}"))
+            if phone and phone in active_clients:
+                markup.row(InlineKeyboardButton("🕰 Scrape History", callback_data=f"scrape_{s_id}"))
             else:
-                markup.row(InlineKeyboardButton("⚠️ Scrape needs Userbot", callback_data="userbot_menu"))
+                markup.row(InlineKeyboardButton("⚠️ Scrape (Account Offline)", callback_data="account_manager"))
             
             live_fwd = get_live_forward(s_id)
             lf_status = "✅ ON" if live_fwd else "❌ OFF"
@@ -1018,12 +1382,23 @@ if bot:
 
         elif call.data.startswith("scrape_"):
             s_id = int(call.data[len("scrape_"):])
-            if not user_client:
-                bot.answer_callback_query(call.id, "⚠️ Userbot not connected. Go to Userbot menu to connect.", show_alert=True)
+            # Find which session owns this source
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT session_id FROM monitored_sources WHERE source_id = %s", (s_id,))
+                        row = c.fetchone()
+                phone = row[0] if row else None
+            except:
+                phone = None
+
+            if not phone or phone not in active_clients:
+                bot.answer_callback_query(call.id, "⚠️ Account for this source is offline.", show_alert=True)
                 return
+                
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔢 By Message Limit", callback_data=f"scrmode_limit_{s_id}"))
-            markup.row(InlineKeyboardButton("📅 By Date Range", callback_data=f"scrmode_date_{s_id}"))
+            markup.row(InlineKeyboardButton("🔢 By Message Limit", callback_data=f"scrmode_limit_{s_id}_{phone}"))
+            markup.row(InlineKeyboardButton("📅 By Date Range", callback_data=f"scrmode_date_{s_id}_{phone}"))
             markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"src_options_{s_id}"))
             bot.edit_message_text(f"🕰 *Scrape History for `{s_id}`*\n\nChoose scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -1031,7 +1406,8 @@ if bot:
             parts = call.data.split("_")
             mode = parts[1]
             s_id = int(parts[2])
-            admin_states[call.from_user.id] = f"awaiting_scrape_{mode}_{s_id}"
+            phone = parts[3]
+            admin_states[call.from_user.id] = f"awaiting_scrape_{mode}_{s_id}_{phone}"
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"scrape_{s_id}"))
             if mode == "limit":
@@ -1214,37 +1590,74 @@ if bot:
         except Exception as e:
             logger.error(f"❌ [Bot-Admin] Failed to save media: {e}")
 
+    def start_otp_flow(message):
+        uid = message.from_user.id
+        data = login_data.get(uid)
+        if not data: return
+        
+        phone = data["phone"]
+        aid = data.get("api_id") or API_ID
+        ahash = data.get("api_hash") or API_HASH
+        
+        bot.send_message(message.chat.id, "⏳ Sending OTP to your Telegram account...")
+
+        async def send_code():
+            try:
+                tmp = Client(
+                    name=":memory:",
+                    api_id=aid,
+                    api_hash=ahash,
+                    in_memory=True
+                )
+                await tmp.connect()
+                sent = await tmp.send_code(phone)
+                login_data[uid]["client"] = tmp
+                login_data[uid]["phone_code_hash"] = sent.phone_code_hash
+                admin_states[uid] = "awaiting_otp"
+                bot.send_message(
+                    message.chat.id,
+                    "✅ <b>OTP sent!</b> Please enter the code you received:\n"
+                    "<i>(Send digits only, e.g. 12345)</i>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ <b>Failed to send OTP:</b>\n<code>{e}</code>", parse_mode="HTML")
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+
+        asyncio.run_coroutine_threadsafe(send_code(), loop)
+
     @bot.message_handler(func=lambda m: m.from_user.id in admin_states)
     def handle_states(message):
-        global user_client
+
         state = admin_states.get(message.from_user.id)
 
         # ── LOGIN FLOW ──
         if state == "awaiting_phone":
             phone = message.text.strip()
             login_data[message.from_user.id] = {"phone": phone, "client": None}
-            bot.reply_to(message, "⏳ Sending OTP to your Telegram account...")
+            admin_states[message.from_user.id] = "awaiting_api_id"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("✨ Use Default API ID", callback_data="default_api_id"))
+            bot.reply_to(message, "🔢 Please enter your <b>API ID</b> from <a href='https://my.telegram.org'>my.telegram.org</a>:", reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
+            return
 
-            async def send_code():
-                tmp = Client(
-                    name=":memory:",
-                    api_id=API_ID,
-                    api_hash=API_HASH,
-                    in_memory=True
-                )
-                await tmp.connect()
-                sent = await tmp.send_code(phone)
-                login_data[message.from_user.id]["client"] = tmp
-                login_data[message.from_user.id]["phone_code_hash"] = sent.phone_code_hash
-                admin_states[message.from_user.id] = "awaiting_otp"
-                bot.send_message(
-                    message.chat.id,
-                    "✅ OTP sent! Please enter the code you received:\n"
-                    "_(Send digits only, e.g. `12345`)_",
-                    parse_mode="Markdown"
-                )
+        if state == "awaiting_api_id":
+            try:
+                api_id = int(message.text.strip())
+                login_data[message.from_user.id]["api_id"] = api_id
+                admin_states[message.from_user.id] = "awaiting_api_hash"
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("✨ Use Default API Hash", callback_data="default_api_hash"))
+                bot.reply_to(message, "🔑 Please enter your <b>API HASH</b>:", reply_markup=markup, parse_mode="HTML")
+            except:
+                bot.reply_to(message, "❌ Invalid API ID. Please send numbers only.")
+            return
 
-            asyncio.run_coroutine_threadsafe(send_code(), loop)
+        if state == "awaiting_api_hash":
+            api_hash = message.text.strip()
+            login_data[message.from_user.id]["api_hash"] = api_hash
+            start_otp_flow(message)
             return
 
         if state == "awaiting_otp":
@@ -1261,11 +1674,13 @@ if bot:
                     )
                     session_str = await tmp.export_session_string()
                     phone = data["phone"]
-                    save_session(phone, session_str)
+                    aid = data.get("api_id")
+                    ahash = data.get("api_hash")
+                    
+                    save_session(phone, session_str, aid, ahash)
                     await tmp.disconnect()
 
-                    # Build and start the real userbot for this account
-                    new_client = build_client(phone, session_str)
+                    new_client = build_client(phone, session_str, aid, ahash)
                     register_userbot_handlers(new_client)
                     await new_client.start()
                     active_clients[phone] = new_client
@@ -1274,7 +1689,7 @@ if bot:
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(
                         message.chat.id,
-                        f"🎉 <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active and listening for media.",
+                        f"🎉 <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active.",
                         parse_mode="HTML"
                     )
                 except SessionPasswordNeeded:
@@ -1302,10 +1717,13 @@ if bot:
                     await tmp.check_password(password)
                     session_str = await tmp.export_session_string()
                     phone = data["phone"]
-                    save_session(phone, session_str)
+                    aid = data.get("api_id")
+                    ahash = data.get("api_hash")
+
+                    save_session(phone, session_str, aid, ahash)
                     await tmp.disconnect()
 
-                    new_client = build_client(phone, session_str)
+                    new_client = build_client(phone, session_str, aid, ahash)
                     register_userbot_handlers(new_client)
                     await new_client.start()
                     active_clients[phone] = new_client
@@ -1332,12 +1750,18 @@ if bot:
                 parts = state.split("_")
                 mode = parts[2]
                 s_id = int(parts[3])
+                phone = parts[4]
                 
+                client = active_clients.get(phone)
+                if not client:
+                    bot.reply_to(message, "❌ Account is no longer active.")
+                    return
+
                 status_msg = bot.reply_to(message, "⏳ Initializing scraper...")
                 
                 if mode == "limit":
                     limit = int(message.text.strip())
-                    asyncio.run_coroutine_threadsafe(scrape_history(s_id, message.chat.id, status_msg.message_id, limit=limit), loop)
+                    asyncio.run_coroutine_threadsafe(scrape_history(client, s_id, message.chat.id, status_msg.message_id, limit=limit), loop)
                 elif mode == "date":
                     dates = message.text.strip().split()
                     if len(dates) != 2:
@@ -1352,7 +1776,7 @@ if bot:
                         bot.edit_message_text("❌ Start date cannot be after end date.", message.chat.id, status_msg.message_id)
                         return
                         
-                    asyncio.run_coroutine_threadsafe(scrape_history(s_id, message.chat.id, status_msg.message_id, start_date=start_date, end_date=end_date), loop)
+                    asyncio.run_coroutine_threadsafe(scrape_history(client, s_id, message.chat.id, status_msg.message_id, start_date=start_date, end_date=end_date), loop)
                 return
 
             if state == "awaiting_ar_interval":
@@ -1405,11 +1829,14 @@ if bot:
             if state == "awaiting_source":
                 text = message.text.strip()
                 if "t.me" in text or text.startswith("@"):
-                    if not user_client:
-                        bot.reply_to(message, "❌ Userbot is not connected. Cannot join via link. Please provide Chat ID instead.")
+                    if not active_clients:
+                        bot.reply_to(message, "❌ No active userbots connected. Please connect an account in the Account Manager first.")
                         return
                     
-                    bot.reply_to(message, "⏳ Resolving chat via Userbot...")
+                    # Pick the first active client for manual joining
+                    phone, client = next(iter(active_clients.items()))
+                    
+                    bot.reply_to(message, f"⏳ Resolving chat via <code>{phone}</code>...", parse_mode="HTML")
                     async def join_and_save():
                         frozen_hint = (
                             "\n\n⚠️ *Why did this happen?*\n"
@@ -1423,14 +1850,14 @@ if bot:
                             is_private_link = "+joinchat" in text or "/+" in text
                             if not is_private_link:
                                 # Public @username or t.me/username — use get_chat, no join needed
-                                chat = await user_client.get_chat(text)
-                                add_monitored_source(chat.id, chat.title)
-                                bot.send_message(message.chat.id, f"✅ *Source added\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                                chat = await client.get_chat(text)
+                                add_monitored_source(chat.id, chat.title, session_id=phone)
+                                bot.send_message(message.chat.id, f"✅ *Source added to {phone}\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
                             else:
                                 # Private invite link — must join
-                                chat = await user_client.join_chat(text)
-                                add_monitored_source(chat.id, chat.title)
-                                bot.send_message(message.chat.id, f"✅ *Userbot joined source\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                                chat = await client.join_chat(text)
+                                add_monitored_source(chat.id, chat.title, session_id=phone)
+                                bot.send_message(message.chat.id, f"✅ *Userbot {phone} joined source\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
                         except Exception as e:
                             err_str = str(e)
                             if "FROZEN_METHOD_INVALID" in err_str:
@@ -1450,8 +1877,10 @@ if bot:
                     asyncio.run_coroutine_threadsafe(join_and_save(), loop)
                 else:
                     parts = text.split(" ", 1)
-                    add_monitored_source(int(parts[0]), parts[1])
-                    bot.reply_to(message, "✅ Source added.")
+                    # If ID is provided manually, we don't strictly need a session but it's better to have one
+                    phone = next(iter(active_clients.keys())) if active_clients else "Legacy"
+                    add_monitored_source(int(parts[0]), parts[1], session_id=phone)
+                    bot.reply_to(message, f"✅ Source added (assigned to {phone}).")
             elif state == "awaiting_target":
                 parts = message.text.split(" ", 1)
                 add_target_group(int(parts[0]), parts[1])
@@ -1526,9 +1955,6 @@ async def auto_release_loop():
                 continue
                 
         # Time to run
-        if not user_client or not user_client.is_connected:
-            continue
-            
         batch_size = int(get_setting("auto_release_batch_size", 0))
         media_items = get_unreleased_media()
         if not media_items:
@@ -1553,22 +1979,25 @@ def release_media_thread(admin_chat_id):
     media_items = get_unreleased_media()
     success_count = 0
     
-    loop = user_client.loop
-    
     async def upload_job(items):
         nonlocal success_count
         for item in items:
             m_id, file_path, m_type, caption = item
-            
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
-                    source_id = c.fetchone()[0]
-                    
-                    
-            mark_media_released(m_id)
-            success_count += 1
-            await asyncio.sleep(2) # rate limit
+            try:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
+                        row = c.fetchone()
+                        source_id = row[0] if row else None
+                
+                if source_id:
+                    await release_single_media(m_id, file_path, m_type, caption, source_id)
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Error in mass release for item {m_id}: {e}")
+            await asyncio.sleep(1.5)
+        
+        bot.send_message(admin_chat_id, f"✅ <b>Release Complete!</b> Released <code>{success_count}</code> items.", parse_mode="HTML")
 
     if loop.is_running():
         asyncio.run_coroutine_threadsafe(upload_job(media_items), loop)
@@ -1609,9 +2038,9 @@ async def start_services():
     saved_sessions = get_all_sessions()
     if saved_sessions:
         logger.info(f"🔑 Found {len(saved_sessions)} saved session(s). Restoring...")
-        for phone, session_str in saved_sessions:
+        for phone, session_str, api_id, api_hash in saved_sessions:
             try:
-                client = build_client(phone, session_str)
+                client = build_client(phone, session_str, api_id, api_hash)
                 register_userbot_handlers(client)
                 await client.start()
                 active_clients[phone] = client
