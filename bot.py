@@ -1232,6 +1232,7 @@ if bot:
                 bot.answer_callback_query(call.id, "🔄 Resending OTP...")
 
         elif call.data == "connect_userbot":
+            admin_states[call.from_user.id] = "awaiting_phone"
 
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("✨ Skip to OTP (Use Defaults)", callback_data="skip_to_otp"))
