@@ -12,6 +12,7 @@ import psycopg2
 from psycopg2 import pool as pg_pool
 from contextlib import contextmanager
 from dotenv import load_dotenv
+from datetime import datetime
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
@@ -481,21 +482,71 @@ async def download_media(client: Client, message: Message):
 
 # live_listener is registered dynamically via register_userbot_handlers() after login
 
-async def scrape_history(chat_id: int, limit: int = 100):
-    """Scrape historical media from a specific chat."""
-    logger.info(f"Starting historical scrape for {chat_id} (limit: {limit})")
+active_scrapes = {}
+
+async def scrape_history(chat_id: int, admin_chat_id: int, status_msg_id: int, limit: int = 0, start_date=None, end_date=None):
+    """Scrape historical media from a specific chat with progress and cancellation."""
+    scrape_id = f"{chat_id}_{status_msg_id}"
+    active_scrapes[scrape_id] = False
+    
+    mode_text = f"dates: {start_date} to {end_date}" if start_date else f"limit: {limit}"
+    logger.info(f"Starting historical scrape for {chat_id} ({mode_text})")
+    
     count = 0
+    scanned = 0
     try:
-        async for message in user_client.get_chat_history(chat_id, limit=limit):
-            if message.media:
-                await download_media(user_client, message)
-                count += 1
-                await asyncio.sleep(1) # Delay to avoid flooding
+        if start_date and end_date:
+            # Date mode
+            async for message in user_client.get_chat_history(chat_id, offset_date=end_date):
+                if active_scrapes.get(scrape_id, False):
+                    break
+                
+                # Check if we passed the start date (Pyrogram iterates backward)
+                if message.date < start_date:
+                    break
+                    
+                scanned += 1
+                if message.media:
+                    await download_media(user_client, message)
+                    count += 1
+                    await asyncio.sleep(0.5)
+                
+                if scanned % 20 == 0:
+                    markup = InlineKeyboardMarkup()
+                    markup.row(InlineKeyboardButton("🛑 Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
+                    try:
+                        bot.edit_message_text(f"⏳ *Scraping Progress...*\n\nScanned: `{scanned}` messages\nSaved: `{count}` media items\n\n_Scanning backwards by date..._", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+                    except: pass
+        else:
+            # Limit mode
+            async for message in user_client.get_chat_history(chat_id, limit=limit):
+                if active_scrapes.get(scrape_id, False):
+                    break
+                    
+                scanned += 1
+                if message.media:
+                    await download_media(user_client, message)
+                    count += 1
+                    await asyncio.sleep(0.5)
+                
+                if scanned % 20 == 0:
+                    markup = InlineKeyboardMarkup()
+                    markup.row(InlineKeyboardButton("🛑 Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
+                    limit_text = f"`{limit}`" if limit > 0 else "All"
+                    try:
+                        bot.edit_message_text(f"⏳ *Scraping Progress...*\n\nScanned: `{scanned}` / {limit_text}\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+                    except: pass
+                    
     except Exception as e:
         logger.error(f"Error scraping history for {chat_id}: {e}")
     
+    active_scrapes.pop(scrape_id, None)
+    try:
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🔙 Back to Source Options", callback_data=f"src_options_{chat_id}"))
+        bot.edit_message_text(f"✅ *Scrape Finished*\n\nScanned: `{scanned}`\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+    except: pass
     logger.info(f"Finished scraping {chat_id}. Downloaded {count} media items.")
-    return count
 
 # ==========================================
 # 🎛️ TELEBOT ADMIN DASHBOARD
@@ -691,8 +742,28 @@ if bot:
             if not user_client:
                 bot.answer_callback_query(call.id, "⚠️ Userbot not connected. Go to Userbot menu to connect.", show_alert=True)
                 return
-            bot.send_message(call.message.chat.id, f"🕰 Historical scrape started for `{s_id}` (limit: 100 messages). This runs in the background.")
-            asyncio.run_coroutine_threadsafe(scrape_history(s_id, limit=100), loop)
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔢 By Message Limit", callback_data=f"scrmode_limit_{s_id}"))
+            markup.row(InlineKeyboardButton("📅 By Date Range", callback_data=f"scrmode_date_{s_id}"))
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"src_options_{s_id}"))
+            bot.edit_message_text(f"🕰 *Scrape History for `{s_id}`*\n\nChoose scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data.startswith("scrmode_"):
+            parts = call.data.split("_")
+            mode = parts[1]
+            s_id = int(parts[2])
+            admin_states[call.from_user.id] = f"awaiting_scrape_{mode}_{s_id}"
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"scrape_{s_id}"))
+            if mode == "limit":
+                bot.edit_message_text("🔢 Send the number of messages to scan (e.g. `100` or `0` for all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            elif mode == "date":
+                bot.edit_message_text("📅 Send Start Date and End Date in format `YYYY-MM-DD YYYY-MM-DD`.\n\nExample: `2024-01-01 2024-01-31`", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif call.data.startswith("cancel_scrape_"):
+            scrape_id = call.data[len("cancel_scrape_"):]
+            active_scrapes[scrape_id] = True
+            bot.answer_callback_query(call.id, "🛑 Cancelling scrape...", show_alert=False)
 
         elif call.data == "targets":
             targets = get_all_targets()
@@ -922,3 +993,243 @@ if bot:
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(message.chat.id, f"❌ Login failed: `{e}`", parse_mode="Markdown")
+
+            asyncio.run_coroutine_threadsafe(sign_in(), loop)
+            return
+
+        if state == "awaiting_2fa":
+            password = message.text.strip()
+            data = login_data.get(message.from_user.id, {})
+            tmp: Client = data.get("client")
+
+            async def check_password():
+                global user_client
+                try:
+                    await tmp.check_password(password)
+                    session_str = await tmp.export_session_string()
+                    save_session_string(session_str)
+                    await tmp.disconnect()
+
+                    user_client = build_client(session_str)
+                    register_userbot_handlers(user_client)
+                    await user_client.start()
+
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(
+                        message.chat.id,
+                        "🎉 *Login Successful!*\n\nUserbot is now active and listening for media.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    admin_states.pop(message.from_user.id, None)
+                    login_data.pop(message.from_user.id, None)
+                    bot.send_message(message.chat.id, f"❌ 2FA failed: `{e}`", parse_mode="Markdown")
+
+            asyncio.run_coroutine_threadsafe(check_password(), loop)
+            return
+
+        # ── NORMAL ADMIN STATES ──
+        admin_states.pop(message.from_user.id, None)
+        try:
+            if state and state.startswith("awaiting_scrape_"):
+                parts = state.split("_")
+                mode = parts[2]
+                s_id = int(parts[3])
+                
+                status_msg = bot.reply_to(message, "⏳ Initializing scraper...")
+                
+                if mode == "limit":
+                    limit = int(message.text.strip())
+                    asyncio.run_coroutine_threadsafe(scrape_history(s_id, message.chat.id, status_msg.message_id, limit=limit), loop)
+                elif mode == "date":
+                    dates = message.text.strip().split()
+                    if len(dates) != 2:
+                        bot.edit_message_text("❌ Invalid format. Please provide exactly two dates.", message.chat.id, status_msg.message_id)
+                        return
+                    start_date = datetime.strptime(dates[0], "%Y-%m-%d")
+                    end_date = datetime.strptime(dates[1], "%Y-%m-%d")
+                    # Ensure end_date includes the entire day
+                    end_date = end_date.replace(hour=23, minute=59, second=59)
+                    
+                    if start_date > end_date:
+                        bot.edit_message_text("❌ Start date cannot be after end date.", message.chat.id, status_msg.message_id)
+                        return
+                        
+                    asyncio.run_coroutine_threadsafe(scrape_history(s_id, message.chat.id, status_msg.message_id, start_date=start_date, end_date=end_date), loop)
+                return
+
+            if state and state.startswith("editf_"):
+                parts = state.split("_")
+                f_type = parts[1]
+                s_id = int(parts[2])
+                
+                val = message.text.strip()
+                if val.lower() == 'clear': val = ''
+                
+                db_key = ""
+                if f_type == "types": db_key = "allowed_media_types"
+                elif f_type == "size": 
+                    db_key = "min_file_size"
+                    val = int(val)
+                elif f_type == "keys": db_key = "caption_keywords"
+                elif f_type == "senders": db_key = "allowed_senders"
+                
+                update_source_filter(s_id, db_key, val)
+                
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filters_{s_id}"))
+                bot.reply_to(message, "✅ Filter updated successfully.", reply_markup=markup)
+                return
+
+            if state == "awaiting_source":
+                text = message.text.strip()
+                if "t.me" in text or text.startswith("@"):
+                    if not user_client:
+                        bot.reply_to(message, "❌ Userbot is not connected. Cannot join via link. Please provide Chat ID instead.")
+                        return
+                    
+                    bot.reply_to(message, "⏳ Attempting to join chat via Userbot...")
+                    async def join_and_save():
+                        try:
+                            chat = await user_client.join_chat(text)
+                            add_monitored_source(chat.id, chat.title)
+                            bot.send_message(message.chat.id, f"✅ Userbot joined and added source: *{chat.title}* (`{chat.id}`)", parse_mode="Markdown")
+                        except Exception as e:
+                            try:
+                                chat = await user_client.get_chat(text)
+                                add_monitored_source(chat.id, chat.title)
+                                bot.send_message(message.chat.id, f"✅ Source added (already joined): *{chat.title}* (`{chat.id}`)", parse_mode="Markdown")
+                            except Exception as inner_e:
+                                bot.send_message(message.chat.id, f"❌ Failed to join or fetch chat: `{e}` / `{inner_e}`", parse_mode="Markdown")
+                    
+                    asyncio.run_coroutine_threadsafe(join_and_save(), loop)
+                else:
+                    parts = text.split(" ", 1)
+                    add_monitored_source(int(parts[0]), parts[1])
+                    bot.reply_to(message, "✅ Source added.")
+            elif state == "awaiting_target":
+                parts = message.text.split(" ", 1)
+                add_target_group(int(parts[0]), parts[1])
+                bot.reply_to(message, "✅ Target added.")
+            elif state == "awaiting_mapping":
+                parts = message.text.split()
+                add_mapping(int(parts[0]), int(parts[1]))
+                bot.reply_to(message, "✅ Mapping added.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Error: {e}")
+
+def release_media_thread(admin_chat_id):
+    media_items = get_unreleased_media()
+    success_count = 0
+    
+    loop = user_client.loop
+    
+    async def upload_job(items):
+        nonlocal success_count
+        for item in items:
+            m_id, file_path, m_type, caption = item
+            
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT source_chat_id FROM saved_media WHERE id = %s", (m_id,))
+                    source_id = c.fetchone()[0]
+                    
+            targets = get_targets_for_source(source_id)
+            if not targets:
+                logger.warning(f"No targets mapped for source {source_id}. Skipping media {m_id}.")
+                continue
+                
+            for target_id in targets:
+                try:
+                    if os.path.exists(file_path):
+                        if m_type == "photo":
+                            await user_client.send_photo(target_id, file_path, caption=caption)
+                        elif m_type == "video":
+                            await user_client.send_video(target_id, file_path, caption=caption)
+                        elif m_type == "document":
+                            await user_client.send_document(target_id, file_path, caption=caption)
+                        else:
+                            await user_client.send_document(target_id, file_path, caption=caption)
+                        
+                        logger.info(f"Released {file_path} to {target_id}")
+                    else:
+                        logger.warning(f"File not found: {file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to send to target: {e}")
+                    
+            mark_media_released(m_id)
+            success_count += 1
+            await asyncio.sleep(2) # rate limit
+
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(upload_job(media_items), loop)
+        bot.send_message(admin_chat_id, f"✅ Release job submitted to Userbot loop.")
+    else:
+        bot.send_message(admin_chat_id, f"❌ Userbot loop not running.")
+
+
+# ==========================================
+# 🌐 RENDER HEALTH CHECK SERVER
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Userbot Media Saver is running!", 200
+
+def run_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# ==========================================
+# 🚀 MAIN RUNNER
+# ==========================================
+async def start_services():
+    # Start Render Health Check Server IMMEDIATELY
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+    logger.info("🌐 Health Check Server started.")
+
+    logger.info("Initializing Database...")
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        return
+
+    # Try to restore a saved userbot session from DB
+    session_str = get_session_string()
+    if session_str:
+        logger.info("🔑 Found saved session. Restoring Pyrogram Userbot...")
+        try:
+            user_client = build_client(session_str)
+            register_userbot_handlers(user_client)
+            await user_client.start()
+            logger.info("✅ Userbot restored and started successfully!")
+        except Exception as e:
+            logger.warning(f"⚠️ Saved session invalid or expired: {e}. Clearing session.")
+            save_session_string("")
+            user_client = None
+    else:
+        logger.info("ℹ️ No saved session found. Admin must log in via the bot.")
+
+    if bot:
+        logger.info("Starting Telebot Admin UI...")
+        current_loop = asyncio.get_running_loop()
+        current_loop.run_in_executor(None, bot.infinity_polling)
+        logger.info("✅ Admin Bot Started successfully!")
+    else:
+        logger.warning("BOT_TOKEN not found. Admin UI will not start.")
+
+    logger.info("System is fully running. Press Ctrl+C to stop.")
+    await idle()
+
+    if user_client and user_client.is_connected:
+        logger.info("Stopping Pyrogram Userbot...")
+        await user_client.stop()
+
+if __name__ == "__main__":
+    try:
+        loop.run_until_complete(start_services())
+    except KeyboardInterrupt:
+        logger.info("System stopped.")
