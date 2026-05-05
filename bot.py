@@ -153,6 +153,10 @@ def set_setting(key, value):
         )
 
 
+def get_target_ref():
+    return (get_setting("target_chat_ref", "") or get_setting("target_chat_id", "") or "").strip()
+
+
 def already_sent(source_message_id):
     with db_conn() as conn:
         c = conn.cursor()
@@ -339,19 +343,19 @@ def get_heartbeats():
 def main_menu_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
-        KeyboardButton("⚙️ Setup"),
-        KeyboardButton("📡 Userbot")
+        KeyboardButton("âš™ï¸ Setup"),
+        KeyboardButton("ðŸ“¡ Userbot")
     )
     kb.add(
-        KeyboardButton("📂 Sources"),
-        KeyboardButton("🎯 Target")
+        KeyboardButton("ðŸ“‚ Sources"),
+        KeyboardButton("ðŸŽ¯ Target")
     )
     kb.add(
-        KeyboardButton("🧲 Monitor"),
-        KeyboardButton("🚀 Transfer"),
-        KeyboardButton("📊 Status")
+        KeyboardButton("ðŸ§² Monitor"),
+        KeyboardButton("ðŸš€ Transfer"),
+        KeyboardButton("ðŸ“Š Status")
     )
-    kb.add(KeyboardButton("❓ Help"))
+    kb.add(KeyboardButton("â“ Help"))
     return kb
 
 
@@ -369,7 +373,7 @@ async def forward_from_saved_message(msg: Message) -> bool:
     global userbot
     if userbot is None:
         return False
-    target_raw = get_setting("target_chat_id", "")
+    target_raw = get_target_ref()
     if not target_raw:
         return False
     if str(get_setting("auto_forward", "false")).lower() != "true":
@@ -379,7 +383,7 @@ async def forward_from_saved_message(msg: Message) -> bool:
     if already_sent(msg.id):
         return False
 
-    target_id = int(target_raw)
+    target_id = target_raw
     source_chat_id = msg.chat.id if msg.chat else None
     if source_chat_id is None:
         return False
@@ -390,7 +394,10 @@ async def forward_from_saved_message(msg: Message) -> bool:
             from_chat_id=source_chat_id,
             message_id=msg.id
         )
-        mark_sent(msg.id, target_id)
+        try:
+            mark_sent(msg.id, int(target_raw))
+        except Exception:
+            mark_sent(msg.id, 0)
         logger.info(f"Forwarded saved media {msg.id} -> {target_id}")
         return True
     except RPCError as e:
@@ -479,14 +486,14 @@ def cmd_start(message):
     bot.reply_to(
         message,
         (
-            "Welcome to Source ➜ Target Forward Bot\n\n"
+            "Welcome to Source âžœ Target Forward Bot\n\n"
             "Use the buttons below for guided actions.\n"
             "Quick start:\n"
-            "1) ⚙️ Setup (API + Session)\n"
-            "2) 📡 Userbot (start it)\n"
-            "3) 🎯 Target (set target chat)\n"
-            "4) 📂 Sources (add source chats)\n"
-            "5) 🚀 Transfer (live or bulk transfer)\n"
+            "1) âš™ï¸ Setup (API + Session)\n"
+            "2) ðŸ“¡ Userbot (start it)\n"
+            "3) ðŸŽ¯ Target (set target chat)\n"
+            "4) ðŸ“‚ Sources (add source chats)\n"
+            "5) ðŸš€ Transfer (live or bulk transfer)\n"
         ),
         reply_markup=main_menu_keyboard()
     )
@@ -499,12 +506,12 @@ def cmd_menu(message):
     bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
 
 
-@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
+@bot.message_handler(func=lambda m: m.text in ["â“ Help", "âš™ï¸ Setup", "ðŸ“¡ Userbot", "ðŸ“‚ Sources", "ðŸŽ¯ Target", "ðŸ§² Monitor", "ðŸš€ Transfer", "ðŸ“Š Status"])
 def menu_router(message):
     if not is_admin(message.from_user.id):
         return
     text = message.text
-    if text == "❓ Help":
+    if text == "â“ Help":
         bot.reply_to(
             message,
             (
@@ -519,43 +526,43 @@ def menu_router(message):
             ),
             reply_markup=main_menu_keyboard()
         )
-    elif text == "⚙️ Setup":
+    elif text == "âš™ï¸ Setup":
         bot.reply_to(
             message,
             "Setup:\n1) /setapiid <id>\n2) /setapihash <hash>\n3) /login (recommended) or /setsession <session>\n4) /showapi",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "📡 Userbot":
+    elif text == "ðŸ“¡ Userbot":
         bot.reply_to(
             message,
             "Userbot controls:\n/startuserbot\n/status",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "📂 Sources":
+    elif text == "ðŸ“‚ Sources":
         bot.reply_to(
             message,
             "Source controls:\n/listgroups\n/setsource <chat_id>\n/showsources\n/delsource <chat_id>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "🎯 Target":
+    elif text == "ðŸŽ¯ Target":
         bot.reply_to(
             message,
             "Target controls:\n/settarget <chat_id>\n/showtarget",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "🧲 Monitor":
+    elif text == "ðŸ§² Monitor":
         bot.reply_to(
             message,
             "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/collectfull <source_chat_id>\n/cancelcollect <source_chat_id>\n/release <source_chat_id> <N>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "🚀 Transfer":
+    elif text == "ðŸš€ Transfer":
         bot.reply_to(
             message,
             "Transfer controls:\n/autoon (live forward)\n/autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "📊 Status":
+    elif text == "ðŸ“Š Status":
         cmd_status(message)
 
 
@@ -565,22 +572,55 @@ def cmd_settarget(message):
         return
     parts = message.text.split()
     if len(parts) != 2:
-        bot.reply_to(message, "Usage: /settarget -1001234567890")
+        bot.reply_to(message, "Usage: /settarget -1001234567890 OR /settarget @channelusername")
         return
+    target_ref = parts[1].strip()
+    if target_ref.startswith("https://t.me/"):
+        target_ref = "@" + target_ref.split("/")[-1]
+    if target_ref.startswith("t.me/"):
+        target_ref = "@" + target_ref.split("/")[-1]
+    set_setting("target_chat_ref", target_ref)
     try:
-        target_id = int(parts[1])
-        set_setting("target_chat_id", target_id)
-        bot.reply_to(message, f"✅ Target set to: `{target_id}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    except ValueError:
-        bot.reply_to(message, "Invalid target id.")
-
+        set_setting("target_chat_id", int(target_ref))
+    except Exception:
+        pass
+    bot.reply_to(message, f"✅ Target set to: `{target_ref}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 @bot.message_handler(commands=["showtarget"])
 def cmd_showtarget(message):
     if not is_admin(message.from_user.id):
         return
-    t = get_setting("target_chat_id", "Not set")
-    bot.reply_to(message, f"🎯 Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    t = get_target_ref() or "Not set"
+    bot.reply_to(message, f"ðŸŽ¯ Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+
+@bot.message_handler(commands=["checktarget"])
+def cmd_checktarget(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+    target_ref = get_target_ref()
+    if not target_ref:
+        bot.reply_to(message, "Set target first with /settarget.")
+        return
+
+    async def run_check():
+        try:
+            me = await userbot.get_me()
+            chat = await userbot.get_chat(target_ref)
+            title = chat.title or chat.first_name or str(chat.id)
+            bot.reply_to(
+                message,
+                f"✅ Target reachable.\nUserbot ID: `{me.id}`\nTarget: `{title}`\nResolved ID: `{chat.id}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            bot.reply_to(message, f"❌ Target access failed for current userbot session:\n`{e}`", parse_mode="Markdown")
+
+    asyncio.run_coroutine_threadsafe(run_check(), loop)
 
 
 @bot.message_handler(commands=["setapiid"])
@@ -596,7 +636,7 @@ def cmd_setapiid(message):
         if api_id <= 0:
             raise ValueError
         set_setting("api_id", api_id)
-        bot.reply_to(message, "✅ API ID saved.", reply_markup=main_menu_keyboard())
+        bot.reply_to(message, "âœ… API ID saved.", reply_markup=main_menu_keyboard())
     except ValueError:
         bot.reply_to(message, "Invalid API ID.")
 
@@ -610,7 +650,7 @@ def cmd_setapihash(message):
         bot.reply_to(message, "Usage: /setapihash <api_hash>")
         return
     set_setting("api_hash", parts[1].strip())
-    bot.reply_to(message, "✅ API Hash saved.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "âœ… API Hash saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["setsession"])
@@ -622,7 +662,7 @@ def cmd_setsession(message):
         bot.reply_to(message, "Usage: /setsession <string_session>")
         return
     set_setting("user_session_string", parts[1].strip())
-    bot.reply_to(message, "✅ User session saved.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "âœ… User session saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["showapi"])
@@ -650,7 +690,7 @@ def cmd_clearapi(message):
     set_setting("api_id", "")
     set_setting("api_hash", "")
     set_setting("user_session_string", "")
-    bot.reply_to(message, "🧹 Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "ðŸ§¹ Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["startuserbot"])
@@ -804,7 +844,7 @@ def cmd_autooff(message):
 def cmd_status(message):
     if not is_admin(message.from_user.id):
         return
-    t = get_setting("target_chat_id", "Not set")
+    t = get_target_ref() or "Not set"
     a = get_setting("auto_forward", "false")
     with db_conn() as conn:
         c = conn.cursor()
@@ -942,7 +982,7 @@ def cmd_monitoron(message):
         bot.reply_to(message, "Add this as source first: /setsource <chat_id>")
         return
     set_monitor_enabled(chat_id, True)
-    bot.reply_to(message, "✅ Monitoring enabled for this source.")
+    bot.reply_to(message, "âœ… Monitoring enabled for this source.")
 
 
 @bot.message_handler(commands=["monitoroff"])
@@ -962,7 +1002,7 @@ def cmd_monitoroff(message):
         bot.reply_to(message, "This chat is not in sources.")
         return
     set_monitor_enabled(chat_id, False)
-    bot.reply_to(message, "🛑 Monitoring disabled for this source.")
+    bot.reply_to(message, "ðŸ›‘ Monitoring disabled for this source.")
 
 
 @bot.message_handler(commands=["monitorstatus"])
@@ -1012,18 +1052,18 @@ def cmd_release(message):
         bot.reply_to(message, "Invalid source chat id or N.")
         return
 
-    target_raw = get_setting("target_chat_id", "")
+    target_raw = get_target_ref()
     if not target_raw:
         bot.reply_to(message, "Set target first with /settarget")
         return
-    target_id = int(target_raw)
+    target_id = target_raw
 
     async def run_release():
         # Validate target access early
         try:
             await userbot.get_chat(target_id)
         except Exception as e:
-            bot.reply_to(message, f"❌ Cannot access target chat `{target_id}`: {e}", parse_mode="Markdown")
+            bot.reply_to(message, f"âŒ Cannot access target chat `{target_id}`: {e}", parse_mode="Markdown")
             return
 
         items = get_unreleased_collected(source_chat_id, n)
@@ -1053,7 +1093,7 @@ def cmd_release(message):
                             fail_reasons.append(reason)
 
                 if delivered:
-                    mark_collected_released(row_id, target_id)
+                    (mark_collected_released(row_id, int(target_raw)) if str(target_raw).lstrip("-").isdigit() else mark_collected_released(row_id, 0))
                     sent += 1
                 await asyncio.sleep(0.7)
             except Exception as e:
@@ -1062,9 +1102,9 @@ def cmd_release(message):
                 if len(fail_reasons) < 5:
                     fail_reasons.append(f"{source_message_id}: {e}")
 
-        summary = f"✅ Released {sent}/{len(items)} media to target."
+        summary = f"âœ… Released {sent}/{len(items)} media to target."
         if failed > 0:
-            summary += f"\n❌ Failed: {failed}"
+            summary += f"\nâŒ Failed: {failed}"
             if fail_reasons:
                 summary += "\n\nFirst errors:\n" + "\n".join(f"- {r}" for r in fail_reasons)
         bot.reply_to(message, summary)
@@ -1111,7 +1151,7 @@ def cmd_collecthistory(message):
                 collected += 1
             await asyncio.sleep(0.05)
         title = get_source_title(source_chat_id) or str(source_chat_id)
-        bot.reply_to(message, f"✅ Collected `{collected}` new media from `{title}` (scanned `{scanned}` messages).", parse_mode="Markdown")
+        bot.reply_to(message, f"âœ… Collected `{collected}` new media from `{title}` (scanned `{scanned}` messages).", parse_mode="Markdown")
 
     asyncio.run_coroutine_threadsafe(run_collect(), loop)
     bot.reply_to(message, "Started history collection...")
@@ -1172,7 +1212,7 @@ def cmd_collectall(message):
             per_source_results.append((source_title, source_chat_id, source_collected, source_scanned))
 
         lines = [
-            f"✅ CollectAll done.",
+            f"âœ… CollectAll done.",
             f"Sources: {len(per_source_results)}",
             f"Collected: {total_collected}",
             f"Scanned: {total_scanned}",
@@ -1233,7 +1273,7 @@ def cmd_collectfull(message):
             bot.reply_to(message, f"CollectFull error: {e}")
         finally:
             active_collect_full.pop(key, None)
-            bot.reply_to(message, f"✅ CollectFull finished for `{source_chat_id}`. Scanned `{scanned}`, collected `{collected}`.", parse_mode="Markdown")
+            bot.reply_to(message, f"âœ… CollectFull finished for `{source_chat_id}`. Scanned `{scanned}`, collected `{collected}`.", parse_mode="Markdown")
 
     asyncio.run_coroutine_threadsafe(run_collect_full(), loop)
     bot.reply_to(message, f"Started full history collection for `{source_chat_id}`. Use /cancelcollect {source_chat_id} to stop.", parse_mode="Markdown")
@@ -1288,11 +1328,11 @@ def cmd_sendsource(message):
         return
 
     async def run_send_source():
-        target_raw = get_setting("target_chat_id", "")
+        target_raw = get_target_ref()
         if not target_raw:
             bot.reply_to(message, "Set target first with /settarget")
             return
-        target_id = int(target_raw)
+        target_id = target_raw
         count = 0
         scan_limit = max(50, n * 15)
         async for m in userbot.get_chat_history(src_chat_id, limit=scan_limit):
@@ -1304,7 +1344,7 @@ def cmd_sendsource(message):
                 continue
             try:
                 await userbot.copy_message(target_id, src_chat_id, m.id)
-                mark_sent(m.id, target_id)
+                (mark_sent(m.id, int(target_raw)) if str(target_raw).lstrip("-").isdigit() else mark_sent(m.id, 0))
                 count += 1
                 await asyncio.sleep(0.7)
             except Exception as e:
@@ -1337,11 +1377,11 @@ def cmd_sendlast(message):
         return
 
     async def run_sendlast(force=False):
-        target_raw = get_setting("target_chat_id", "")
+        target_raw = get_target_ref()
         if not target_raw:
             bot.reply_to(message, "Set target first with /settarget")
             return
-        target_id = int(target_raw)
+        target_id = target_raw
         me = await userbot.get_me()
         count = 0
         scan_limit = max(50, n * 15)
@@ -1354,7 +1394,7 @@ def cmd_sendlast(message):
                 continue
             try:
                 await userbot.copy_message(target_id, me.id, m.id)
-                mark_sent(m.id, target_id)
+                (mark_sent(m.id, int(target_raw)) if str(target_raw).lstrip("-").isdigit() else mark_sent(m.id, 0))
                 count += 1
                 await asyncio.sleep(0.7)
             except Exception as e:
@@ -1388,11 +1428,11 @@ def cmd_resendlast(message):
         return
 
     async def run_resend():
-        target_raw = get_setting("target_chat_id", "")
+        target_raw = get_target_ref()
         if not target_raw:
             bot.reply_to(message, "Set target first with /settarget")
             return
-        target_id = int(target_raw)
+        target_id = target_raw
         me = await userbot.get_me()
         count = 0
         scan_limit = max(50, n * 15)
@@ -1404,7 +1444,7 @@ def cmd_resendlast(message):
             try:
                 await userbot.copy_message(target_id, me.id, m.id)
                 # keep history updated even in force mode
-                mark_sent(m.id, target_id)
+                (mark_sent(m.id, int(target_raw)) if str(target_raw).lstrip("-").isdigit() else mark_sent(m.id, 0))
                 count += 1
                 await asyncio.sleep(0.7)
             except Exception as e:
@@ -1651,3 +1691,7 @@ if __name__ == "__main__":
     # Always start pinger; it auto-detects URL (or uses KEEP_ALIVE_URL override)
     threading.Thread(target=keep_alive_worker, daemon=True).start()
     loop.run_until_complete(start_async())
+
+
+
+
