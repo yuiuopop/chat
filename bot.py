@@ -307,6 +307,7 @@ userbot = None
 bot = telebot.TeleBot(BOT_TOKEN)
 admin_states = {}
 login_data = {}
+active_collect_full = {}
 
 # Heartbeats for watchdog supervision
 last_poll_heartbeat = time.time()
@@ -512,8 +513,8 @@ def menu_router(message):
                 "/startuserbot\n/showapi\n/clearapi\n\n"
                 "/settarget <chat_id>\n/showtarget\n"
                 "/setsource <chat_id>\n/delsource <chat_id>\n/showsources\n/listgroups [page]\n\n"
-                "/monitoron <chat_id>\n/monitoroff <chat_id>\n/monitorstatus <chat_id>\n/release <chat_id> <N>\n\n"
-                "/collecthistory <chat_id> <N>\n/collectall <N_per_source>\n\n"
+            "/monitoron <chat_id>\n/monitoroff <chat_id>\n/monitorstatus <chat_id>\n/release <chat_id> <N>\n\n"
+                "/collecthistory <chat_id> <N>\n/collectall <N_per_source>\n/collectfull <chat_id>\n/cancelcollect <chat_id>\n\n"
                 "/autoon /autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>\n/showmedia <N>\n/clearsent"
             ),
             reply_markup=main_menu_keyboard()
@@ -545,7 +546,7 @@ def menu_router(message):
     elif text == "🧲 Monitor":
         bot.reply_to(
             message,
-            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/release <source_chat_id> <N>",
+            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/collectfull <source_chat_id>\n/cancelcollect <source_chat_id>\n/release <source_chat_id> <N>",
             reply_markup=main_menu_keyboard()
         )
     elif text == "🚀 Transfer":
@@ -1018,20 +1019,55 @@ def cmd_release(message):
     target_id = int(target_raw)
 
     async def run_release():
+        # Validate target access early
+        try:
+            await userbot.get_chat(target_id)
+        except Exception as e:
+            bot.reply_to(message, f"❌ Cannot access target chat `{target_id}`: {e}", parse_mode="Markdown")
+            return
+
         items = get_unreleased_collected(source_chat_id, n)
         if not items:
             bot.reply_to(message, "No unreleased collected media for this source.")
             return
         sent = 0
+        failed = 0
+        fail_reasons = []
         for row_id, source_message_id, media_type in items:
             try:
-                await userbot.copy_message(target_id, source_chat_id, source_message_id)
-                mark_collected_released(row_id, target_id)
-                sent += 1
+                delivered = False
+                # 1) Try copy (keeps source clean, common success path)
+                try:
+                    await userbot.copy_message(target_id, source_chat_id, source_message_id)
+                    delivered = True
+                except Exception as e1:
+                    # 2) Fallback: try forward
+                    try:
+                        await userbot.forward_messages(target_id, source_chat_id, source_message_id)
+                        delivered = True
+                    except Exception as e2:
+                        failed += 1
+                        reason = f"{source_message_id}: copy={e1} | forward={e2}"
+                        logger.error(f"Release failed for {source_chat_id}:{reason}")
+                        if len(fail_reasons) < 5:
+                            fail_reasons.append(reason)
+
+                if delivered:
+                    mark_collected_released(row_id, target_id)
+                    sent += 1
                 await asyncio.sleep(0.7)
             except Exception as e:
+                failed += 1
                 logger.error(f"Release failed for {source_chat_id}:{source_message_id}: {e}")
-        bot.reply_to(message, f"✅ Released {sent}/{len(items)} media to target.")
+                if len(fail_reasons) < 5:
+                    fail_reasons.append(f"{source_message_id}: {e}")
+
+        summary = f"✅ Released {sent}/{len(items)} media to target."
+        if failed > 0:
+            summary += f"\n❌ Failed: {failed}"
+            if fail_reasons:
+                summary += "\n\nFirst errors:\n" + "\n".join(f"- {r}" for r in fail_reasons)
+        bot.reply_to(message, summary)
 
     asyncio.run_coroutine_threadsafe(run_release(), loop)
     bot.reply_to(message, "Started release job...")
@@ -1151,6 +1187,77 @@ def cmd_collectall(message):
 
     asyncio.run_coroutine_threadsafe(run_collectall(), loop)
     bot.reply_to(message, f"Started collect-all for {len(sources)} source(s)...")
+
+
+@bot.message_handler(commands=["collectfull"])
+def cmd_collectfull(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /collectfull -1001234567890")
+        return
+    try:
+        source_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid source chat id.")
+        return
+    if not is_source_chat(source_chat_id):
+        bot.reply_to(message, "Add this source first with /setsource <chat_id>.")
+        return
+
+    key = str(source_chat_id)
+    active_collect_full[key] = True
+
+    async def run_collect_full():
+        collected = 0
+        scanned = 0
+        try:
+            async for m in userbot.get_chat_history(source_chat_id):
+                if not active_collect_full.get(key, False):
+                    break
+                scanned += 1
+                if m.media:
+                    media_type = m.media.value if m.media else "unknown"
+                    ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or "")
+                    if ok:
+                        collected += 1
+                if scanned % 500 == 0:
+                    bot.reply_to(message, f"CollectFull progress for `{source_chat_id}`: scanned `{scanned}`, collected `{collected}`", parse_mode="Markdown")
+                await asyncio.sleep(0.01)
+        except Exception as e:
+            bot.reply_to(message, f"CollectFull error: {e}")
+        finally:
+            active_collect_full.pop(key, None)
+            bot.reply_to(message, f"✅ CollectFull finished for `{source_chat_id}`. Scanned `{scanned}`, collected `{collected}`.", parse_mode="Markdown")
+
+    asyncio.run_coroutine_threadsafe(run_collect_full(), loop)
+    bot.reply_to(message, f"Started full history collection for `{source_chat_id}`. Use /cancelcollect {source_chat_id} to stop.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["cancelcollect"])
+def cmd_cancelcollect(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /cancelcollect -1001234567890")
+        return
+    try:
+        source_chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid source chat id.")
+        return
+    key = str(source_chat_id)
+    if active_collect_full.get(key, False):
+        active_collect_full[key] = False
+        bot.reply_to(message, f"Stopping full collection for `{source_chat_id}`...", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, "No active full-collection job for that source.")
 
 
 @bot.message_handler(commands=["sendsource"])
