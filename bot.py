@@ -306,6 +306,7 @@ def cmd_start(message):
             "/setsource <chat_id>\n"
             "/delsource <chat_id>\n"
             "/showsources\n"
+            "/sendsource <chat_id> <N> (send last N media from a source chat)\n"
             "/sendlast <N>  (send last N media from Saved Messages)\n"
             "/resendlast <N> (force resend, ignore sent-history)\n"
             "/clearsent (clear sent-history)\n"
@@ -676,6 +677,61 @@ def cmd_showsources(message):
     if len(text) > 3500:
         text = text[:3500] + "\n..."
     bot.reply_to(message, f"<pre>{text}</pre>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["sendsource"])
+def cmd_sendsource(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /sendsource -1001234567890 20")
+        return
+    try:
+        src_chat_id = int(parts[1])
+        n = int(parts[2])
+        if n < 1:
+            bot.reply_to(message, "N must be >= 1")
+            return
+    except ValueError:
+        bot.reply_to(message, "Invalid chat_id or N.")
+        return
+
+    if not is_source_chat(src_chat_id):
+        bot.reply_to(message, "This chat is not configured as source. Add with /setsource <chat_id> first.")
+        return
+
+    async def run_send_source():
+        target_raw = get_setting("target_chat_id", "")
+        if not target_raw:
+            bot.reply_to(message, "Set target first with /settarget")
+            return
+        target_id = int(target_raw)
+        count = 0
+        scan_limit = max(50, n * 15)
+        async for m in userbot.get_chat_history(src_chat_id, limit=scan_limit):
+            if count >= n:
+                break
+            if not m.media:
+                continue
+            if already_sent(m.id):
+                continue
+            try:
+                await userbot.copy_message(target_id, src_chat_id, m.id)
+                mark_sent(m.id, target_id)
+                count += 1
+                await asyncio.sleep(0.7)
+            except Exception as e:
+                logger.error(f"sendsource failed for {src_chat_id}:{m.id}: {e}")
+        bot.reply_to(message, f"Done. Sent {count} media from `{src_chat_id}` to target.", parse_mode="Markdown")
+
+    asyncio.run_coroutine_threadsafe(run_send_source(), loop)
+    bot.reply_to(message, "Started source transfer...")
 
 
 @bot.message_handler(commands=["sendlast"])
