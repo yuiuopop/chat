@@ -522,10 +522,12 @@ def build_temp_client(api_id: int, api_hash: str) -> Client:
 @bot.callback_query_handler(func=lambda call: True)
 
 def handle_callbacks(call):
+    global userbot
     uid = call.from_user.id
     if not is_admin(uid):
         bot.answer_callback_query(call.id, "Unauthorized.")
         return
+
 
     data = call.data
     
@@ -606,8 +608,8 @@ def handle_callbacks(call):
         bot.send_message(call.message.chat.id, "Please send the chat ID of the new source.\n(Use /listgroups to find IDs)")
 
     elif data == "sources_add_saved":
-        global userbot
         if userbot is None or not userbot.is_connected:
+
             bot.answer_callback_query(call.id, "❌ Userbot not connected", show_alert=True)
             return
         
@@ -688,8 +690,8 @@ def handle_callbacks(call):
         bot.edit_message_text("🔴 *Confirm Logout*\n\nAre you sure you want to remove the current session string? This will stop the userbot.", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
 
     elif data == "setup_session_remove_do":
-        global userbot
         if userbot:
+
             try:
                 asyncio.run_coroutine_threadsafe(userbot.stop(), loop)
             except: pass
