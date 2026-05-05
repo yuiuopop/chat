@@ -26,7 +26,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# âš™ï¸ CONFIGURATION
 # ==========================================
 load_dotenv()
 
@@ -51,7 +51,7 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ==========================================
-# 🗄️ DATABASE OPERATIONS
+# ðŸ—„ï¸ DATABASE OPERATIONS
 # ==========================================
 db_pool = None
 
@@ -60,9 +60,9 @@ def init_db_pool():
     if db_pool is None and DATABASE_URL:
         try:
             db_pool = pg_pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
-            logger.info("✅ Database connection pool initialized.")
+            logger.info("âœ… Database connection pool initialized.")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize database pool: {e}")
+            logger.error(f"âŒ Failed to initialize database pool: {e}")
             raise
 
 @contextmanager
@@ -159,6 +159,24 @@ def init_db():
                     conn.rollback()
                 else:
                     conn.commit()
+
+            # Migration: Add session_id to sources/targets for multi-session routing
+            for table_name in ["monitored_sources", "target_groups"]:
+                try:
+                    c.execute(f"ALTER TABLE {table_name} ADD COLUMN session_id TEXT DEFAULT 'Legacy'")
+                except Exception:
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+            # Normalize old rows so legacy sources/targets remain visible after multi-session upgrade
+            try:
+                c.execute("UPDATE monitored_sources SET session_id = 'Legacy' WHERE session_id IS NULL OR session_id = ''")
+                c.execute("UPDATE target_groups SET session_id = 'Legacy' WHERE session_id IS NULL OR session_id = ''")
+            except Exception:
+                conn.rollback()
+            else:
+                conn.commit()
             
             # Migrate legacy session
             try:
@@ -173,7 +191,7 @@ def init_db():
             else:
                 conn.commit()
 
-            logger.info("✅ Database schema initialized.")
+            logger.info("âœ… Database schema initialized.")
 
 # Media Queries
 def save_media_record(message_id, source_chat_id, media_type, file_path, caption, media_group_id=None):
@@ -328,7 +346,17 @@ def get_all_sources(session_id=None):
         with get_connection() as conn:
             with conn.cursor() as c:
                 if session_id:
-                    c.execute("SELECT source_id, title FROM monitored_sources WHERE is_active = TRUE AND session_id = %s", (session_id,))
+                    c.execute("""
+                        SELECT source_id, title
+                        FROM monitored_sources
+                        WHERE is_active = TRUE
+                          AND (
+                            session_id = %s
+                            OR session_id = 'Legacy'
+                            OR session_id IS NULL
+                            OR session_id = ''
+                          )
+                    """, (session_id,))
                 else:
                     c.execute("SELECT source_id, title FROM monitored_sources WHERE is_active = TRUE")
                 return c.fetchall()
@@ -341,7 +369,15 @@ def get_all_targets(session_id=None):
         with get_connection() as conn:
             with conn.cursor() as c:
                 if session_id:
-                    c.execute("SELECT target_id, title FROM target_groups WHERE session_id = %s", (session_id,))
+                    c.execute("""
+                        SELECT target_id, title
+                        FROM target_groups
+                        WHERE
+                            session_id = %s
+                            OR session_id = 'Legacy'
+                            OR session_id IS NULL
+                            OR session_id = ''
+                    """, (session_id,))
                 else:
                     c.execute("SELECT target_id, title FROM target_groups")
                 return c.fetchall()
@@ -408,7 +444,13 @@ def get_media_stats_by_source(session_id=None):
                             COUNT(sm.id) FILTER (WHERE sm.is_released = TRUE) AS released
                         FROM monitored_sources ms
                         LEFT JOIN saved_media sm ON ms.source_id = sm.source_chat_id
-                        WHERE ms.is_active = TRUE AND ms.session_id = %s
+                        WHERE ms.is_active = TRUE
+                          AND (
+                            ms.session_id = %s
+                            OR ms.session_id = 'Legacy'
+                            OR ms.session_id IS NULL
+                            OR ms.session_id = ''
+                          )
                         GROUP BY ms.source_id, ms.title
                         ORDER BY unreleased DESC
                     """, (session_id,))
@@ -427,6 +469,48 @@ def get_media_stats_by_source(session_id=None):
     except Exception as e:
         logger.error(f"Error fetching media stats by source: {e}")
         return []
+
+def get_source_stats_detail(source_id):
+    """Return source-level details with media counts and mapped target count."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT source_id, title, session_id, is_active, live_forward
+                    FROM monitored_sources
+                    WHERE source_id = %s
+                """, (source_id,))
+                src = c.fetchone()
+                if not src:
+                    return None
+
+                c.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE is_released = FALSE) AS unreleased,
+                        COUNT(*) FILTER (WHERE is_released = TRUE) AS released,
+                        COUNT(*) AS total
+                    FROM saved_media
+                    WHERE source_chat_id = %s
+                """, (source_id,))
+                counts = c.fetchone() or (0, 0, 0)
+
+                c.execute("SELECT COUNT(*) FROM source_target_mapping WHERE source_id = %s", (source_id,))
+                mapped_targets = c.fetchone()[0]
+
+                return {
+                    "source_id": src[0],
+                    "title": src[1],
+                    "session_id": src[2] or "Legacy",
+                    "is_active": bool(src[3]),
+                    "live_forward": bool(src[4]),
+                    "unreleased": counts[0] or 0,
+                    "released": counts[1] or 0,
+                    "total": counts[2] or 0,
+                    "mapped_targets": mapped_targets or 0,
+                }
+    except Exception as e:
+        logger.error(f"Error fetching source details for {source_id}: {e}")
+        return None
 
 def get_unreleased_media_for_source(source_id):
     """Return all unreleased media items for a specific source."""
@@ -564,7 +648,7 @@ def toggle_live_forward(source_id):
         return False
 
 # ==========================================
-# 🤖 PYROGRAM USERBOT (LISTENER & DOWNLOADER)
+# ðŸ¤– PYROGRAM USERBOT (LISTENER & DOWNLOADER)
 # ==========================================
 
 # Multi-session: dict of phone -> Pyrogram Client
@@ -600,6 +684,8 @@ def register_userbot_handlers(client: Client):
         
         sources = get_all_sources(session_id=c._phone)
         monitored_ids = [s[0] for s in sources]
+        if not monitored_ids:
+            logger.info(f"[{c._phone}] No monitored sources found for this account yet.")
         if message.chat.id in monitored_ids:
             # Avoid processing messages sent by the bot to targets (if any)
             # but usually filters.media takes care of it.
@@ -705,7 +791,7 @@ async def download_media(client: Client, message: Message):
                 media_group_id
             )
             if success:
-                logger.info(f"✅ Saved media record for {file_path}")
+                logger.info(f"âœ… Saved media record for {file_path}")
                 # Check for Live Forward
                 if get_live_forward(message.chat.id):
                     # Fetch its ID for release
@@ -717,9 +803,9 @@ async def download_media(client: Client, message: Message):
                     if m_id:
                         await release_single_media(m_id, file_path, media_type, caption, message.chat.id)
             else:
-                logger.warning(f"⚠️ Media record already exists or failed for {file_path}")
+                logger.warning(f"âš ï¸ Media record already exists or failed for {file_path}")
     except Exception as e:
-        logger.error(f"❌ Failed to download media: {e}")
+        logger.error(f"âŒ Failed to download media: {e}")
 
 # live_listener is registered dynamically via register_userbot_handlers() after login
 
@@ -754,9 +840,9 @@ async def scrape_history(client: Client, chat_id: int, admin_chat_id: int, statu
                 
                 if scanned % 20 == 0:
                     markup = InlineKeyboardMarkup()
-                    markup.row(InlineKeyboardButton("🛑 Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
+                    markup.row(InlineKeyboardButton("ðŸ›‘ Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
                     try:
-                        bot.edit_message_text(f"⏳ *Scraping Progress...*\n\nScanned: `{scanned}` messages\nSaved: `{count}` media items\n\n_Scanning backwards by date..._", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+                        bot.edit_message_text(f"â³ *Scraping Progress...*\n\nScanned: `{scanned}` messages\nSaved: `{count}` media items\n\n_Scanning backwards by date..._", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
                     except: pass
         else:
             # Limit mode
@@ -772,10 +858,10 @@ async def scrape_history(client: Client, chat_id: int, admin_chat_id: int, statu
                 
                 if scanned % 20 == 0:
                     markup = InlineKeyboardMarkup()
-                    markup.row(InlineKeyboardButton("🛑 Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
+                    markup.row(InlineKeyboardButton("ðŸ›‘ Cancel Scrape", callback_data=f"cancel_scrape_{scrape_id}"))
                     limit_text = f"`{limit}`" if limit > 0 else "All"
                     try:
-                        bot.edit_message_text(f"⏳ *Scraping Progress...*\n\nScanned: `{scanned}` / {limit_text}\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+                        bot.edit_message_text(f"â³ *Scraping Progress...*\n\nScanned: `{scanned}` / {limit_text}\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
                     except: pass
                     
     except Exception as e:
@@ -784,13 +870,13 @@ async def scrape_history(client: Client, chat_id: int, admin_chat_id: int, statu
     active_scrapes.pop(scrape_id, None)
     try:
         markup = InlineKeyboardMarkup()
-        markup.row(InlineKeyboardButton("🔙 Back to Source Options", callback_data=f"src_options_{chat_id}"))
-        bot.edit_message_text(f"✅ *Scrape Finished*\n\nScanned: `{scanned}`\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
+        markup.row(InlineKeyboardButton("ðŸ”™ Back to Source Options", callback_data=f"src_options_{chat_id}"))
+        bot.edit_message_text(f"âœ… *Scrape Finished*\n\nScanned: `{scanned}`\nSaved: `{count}` media items", admin_chat_id, status_msg_id, reply_markup=markup, parse_mode="Markdown")
     except: pass
     logger.info(f"Finished scraping {chat_id}. Downloaded {count} media items.")
 
 # ==========================================
-# 🎛️ TELEBOT ADMIN DASHBOARD
+# ðŸŽ›ï¸ TELEBOT ADMIN DASHBOARD
 # ==========================================
 if BOT_TOKEN:
     bot = telebot.TeleBot(BOT_TOKEN)
@@ -814,7 +900,7 @@ if bot:
     @bot.message_handler(commands=['start'])
     def start_cmd(message):
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Unauthorized.")
+            bot.reply_to(message, "âŒ Unauthorized.")
             return
         show_main_menu(message.chat.id)
 
@@ -823,23 +909,23 @@ if bot:
         acct_label = f"{active_count} Account(s) Active" if active_count > 0 else "No Accounts"
         markup = InlineKeyboardMarkup()
         markup.row(
-            InlineKeyboardButton("📊 Analytics", callback_data="stats"),
-            InlineKeyboardButton("📂 Sources", callback_data="sources")
+            InlineKeyboardButton("ðŸ“Š Analytics", callback_data="stats"),
+            InlineKeyboardButton("ðŸ“‚ Sources", callback_data="sources")
         )
         markup.row(
-            InlineKeyboardButton("🎯 Targets", callback_data="targets"),
-            InlineKeyboardButton("🔗 Routing Map", callback_data="mappings")
+            InlineKeyboardButton("ðŸŽ¯ Targets", callback_data="targets"),
+            InlineKeyboardButton("ðŸ”— Routing Map", callback_data="mappings")
         )
-        markup.row(InlineKeyboardButton("🚀 Manual Release", callback_data="release"))
-        markup.row(InlineKeyboardButton("⏱ Automation Config", callback_data="auto_release_menu"))
-        markup.row(InlineKeyboardButton(f"🤖 Account Manager \u2022 {acct_label}", callback_data="account_manager"))
+        markup.row(InlineKeyboardButton("ðŸš€ Manual Release", callback_data="release"))
+        markup.row(InlineKeyboardButton("â± Automation Config", callback_data="auto_release_menu"))
+        markup.row(InlineKeyboardButton(f"ðŸ¤– Account Manager \u2022 {acct_label}", callback_data="account_manager"))
 
         text = (
-            "<b>💎 SYSTEM DASHBOARD</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "<blockquote><b>🟢 Passive Mode (Bot)</b>\n"
+            "<b>ðŸ’Ž SYSTEM DASHBOARD</b>\n"
+            "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
+            "<blockquote><b>ðŸŸ¢ Passive Mode (Bot)</b>\n"
             "<i>Always active. Add this bot as an admin to any group/channel to start capturing media.</i></blockquote>\n"
-            f"<blockquote><b>🤖 Userbot Accounts</b>\n"
+            f"<blockquote><b>ðŸ¤– Userbot Accounts</b>\n"
             f"<i>{active_count} session(s) are active and listening for media.</i></blockquote>"
         )
         try:
@@ -858,54 +944,58 @@ if bot:
 
         bot.answer_callback_query(call.id)
 
-        # ─── ACCOUNT MANAGER ───
+        # â”€â”€â”€ ACCOUNT MANAGER â”€â”€â”€
         if call.data == "account_manager":
             sessions = get_all_sessions()
             markup = InlineKeyboardMarkup()
             text = (
-                "<b>🤖 ACCOUNT MANAGER</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<b>ðŸ¤– ACCOUNT MANAGER</b>\n"
+                "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
             )
             if sessions:
                 text += f"<i>{len(sessions)} Userbot account(s) registered.</i>"
                 for phone, session_str, api_id, api_hash in sessions:
                     is_live = phone in active_clients
-                    status_icon = "✅" if is_live else "🔴"
+                    status_icon = "âœ…" if is_live else "ðŸ”´"
                     markup.row(InlineKeyboardButton(f"{status_icon} {phone}", callback_data=f"acct_dash_{phone}"))
             else:
                 text += "<i>No accounts added yet. Add your first Telegram account below.</i>"
-            markup.row(InlineKeyboardButton("➕ Add New Account", callback_data="connect_userbot"))
-            markup.row(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton("âž• Add New Account", callback_data="connect_userbot"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Dashboard", callback_data="main_menu"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("acct_dash_"):
             phone = call.data[len("acct_dash_"):]
             is_live = phone in active_clients
-            status = "✅ Active" if is_live else "🔴 Offline"
+            status = "âœ… Active" if is_live else "ðŸ”´ Offline"
             src_stats = get_media_stats_by_source(session_id=phone)
             src_count = len(src_stats)
             tgt_count = len(get_all_targets(session_id=phone))
             total_unreleased = sum(s[2] for s in src_stats)
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("📊 Media Statistics", callback_data=f"media_stats_{phone}"))
-            markup.row(InlineKeyboardButton("📁 Browse Joined Chats", callback_data=f"browse_chats_{phone}_0"))
+            markup.row(InlineKeyboardButton("ðŸ“Š Media Statistics", callback_data=f"media_stats_{phone}"))
+            for src_id, title, unreleased, released in src_stats[:6]:
+                total_src = (unreleased or 0) + (released or 0)
+                btn_label = f"ðŸ“‚ {(title or str(src_id))[:20]} â€¢ {total_src}"
+                markup.row(InlineKeyboardButton(btn_label, callback_data=f"srcstat_{src_id}"))
+            markup.row(InlineKeyboardButton("ðŸ“ Browse Joined Chats", callback_data=f"browse_chats_{phone}_0"))
             markup.row(
-                InlineKeyboardButton(f"📂 Sources ({src_count})", callback_data=f"acct_sources_{phone}"),
-                InlineKeyboardButton(f"🎯 Targets ({tgt_count})", callback_data=f"acct_targets_{phone}")
+                InlineKeyboardButton(f"ðŸ“‚ Sources ({src_count})", callback_data=f"acct_sources_{phone}"),
+                InlineKeyboardButton(f"ðŸŽ¯ Targets ({tgt_count})", callback_data=f"acct_targets_{phone}")
             )
             if is_live:
-                markup.row(InlineKeyboardButton("✨ Monitor Saved Messages", callback_data=f"quick_add_saved_{phone}"))
+                markup.row(InlineKeyboardButton("âœ¨ Monitor Saved Messages", callback_data=f"quick_add_saved_{phone}"))
             
-            markup.row(InlineKeyboardButton("🗑 Remove Account", callback_data=f"acct_disconnect_{phone}"))
-            markup.row(InlineKeyboardButton("🔙 Back to Accounts", callback_data="account_manager"))
+            markup.row(InlineKeyboardButton("ðŸ—‘ Remove Account", callback_data=f"acct_disconnect_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Accounts", callback_data="account_manager"))
             text = (
-                f"<b>🤖 ACCOUNT: <code>{phone}</code></b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>ðŸ¤– ACCOUNT: <code>{phone}</code></b>\n"
+                f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
                 f"<blockquote><b>Status:</b> {status}\n"
                 f"<b>Sources Monitored:</b> {src_count}\n"
                 f"<b>Target Channels:</b> {tgt_count}\n"
                 f"<b>Pending Release:</b> {total_unreleased} items</blockquote>\n\n"
-                f"<i>Tap 📊 Media Statistics to see a breakdown per source and release media.</i>"
+                f"<i>Tap a source button below or open Media Statistics for all groups/channels.</i>"
             )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
@@ -919,7 +1009,7 @@ if bot:
             
             # This marks is_active = FALSE in DB
             delete_session(phone)
-            bot.answer_callback_query(call.id, f"✅ Account {phone} removed from bot.", show_alert=True)
+            bot.answer_callback_query(call.id, f"âœ… Account {phone} removed from bot.", show_alert=True)
             call.data = "account_manager"
             callback_handler(call)
 
@@ -940,7 +1030,7 @@ if bot:
                     if dialog.chat.type.name in ["GROUP", "SUPERGROUP", "CHANNEL"]:
                         chats.append((dialog.chat.id, dialog.chat.title or str(dialog.chat.id)))
                     elif dialog.chat.type.name == "PRIVATE" and dialog.chat.id == (await client.get_me()).id:
-                        chats.append((dialog.chat.id, "✨ Saved Messages"))
+                        chats.append((dialog.chat.id, "âœ¨ Saved Messages"))
                 return chats
 
             all_chats = asyncio.run_coroutine_threadsafe(fetch_chats(), loop).result(timeout=30)
@@ -951,19 +1041,19 @@ if bot:
             for c_id, c_title in chunk:
                 safe = c_title[:28]
                 markup.row(
-                    InlineKeyboardButton(f"📂 {safe}", callback_data=f"chat_info_{phone}_{c_id}"),
+                    InlineKeyboardButton(f"ðŸ“‚ {safe}", callback_data=f"chat_info_{phone}_{c_id}"),
                 )
             nav_row = []
             if page > 0:
-                nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"browse_chats_{phone}_{page-1}"))
+                nav_row.append(InlineKeyboardButton("â—€ Prev", callback_data=f"browse_chats_{phone}_{page-1}"))
             if (page + 1) * per_page < total:
-                nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"browse_chats_{phone}_{page+1}"))
+                nav_row.append(InlineKeyboardButton("Next â–¶", callback_data=f"browse_chats_{phone}_{page+1}"))
             if nav_row:
                 markup.row(*nav_row)
-            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Account", callback_data=f"acct_dash_{phone}"))
             text = (
-                f"<b>📁 JOINED CHATS</b> \u2014 <code>{phone}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>ðŸ“ JOINED CHATS</b> \u2014 <code>{phone}</code>\n"
+                f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
                 f"<i>Page {page+1} \u2022 {total} total chats. Tap a chat to add it as a Source or Target.</i>"
             )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
@@ -975,10 +1065,10 @@ if bot:
             phone = "_".join(parts[2:-1])
             markup = InlineKeyboardMarkup()
             markup.row(
-                InlineKeyboardButton("➕ Add as Source", callback_data=f"quick_add_src_{phone}_{c_id}"),
-                InlineKeyboardButton("➕ Add as Target", callback_data=f"quick_add_tgt_{phone}_{c_id}")
+                InlineKeyboardButton("âž• Add as Source", callback_data=f"quick_add_src_{phone}_{c_id}"),
+                InlineKeyboardButton("âž• Add as Target", callback_data=f"quick_add_tgt_{phone}_{c_id}")
             )
-            markup.row(InlineKeyboardButton("🔙 Back to Chats", callback_data=f"browse_chats_{phone}_0"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Chats", callback_data=f"browse_chats_{phone}_0"))
             bot.edit_message_text(
                 f"<b>Chat ID:</b> <code>{c_id}</code>\n\nWhat would you like to do with this chat?",
                 call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML"
@@ -989,7 +1079,7 @@ if bot:
             c_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             add_monitored_source(c_id, str(c_id), session_id=phone)
-            bot.answer_callback_query(call.id, f"✅ Added as Source for {phone}!", show_alert=True)
+            bot.answer_callback_query(call.id, f"âœ… Added as Source for {phone}!", show_alert=True)
             # Return to info page
             call.data = f"chat_info_{phone}_{c_id}"
             callback_handler(call)
@@ -998,16 +1088,16 @@ if bot:
             phone = call.data[len("acct_sources_"):]
             sources = get_all_sources(session_id=phone)
             markup = InlineKeyboardMarkup()
-            text = f"<b>📂 MONITORED SOURCES</b> \u2014 <code>{phone}</code>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            text = f"<b>ðŸ“‚ MONITORED SOURCES</b> \u2014 <code>{phone}</code>\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
             if not sources:
                 text += "<i>No sources added yet for this account.</i>"
             else:
                 for s_id, title in sources:
                     markup.row(
-                        InlineKeyboardButton(f"📂 {title or s_id}", callback_data=f"filters_{s_id}"),
-                        InlineKeyboardButton("🗑", callback_data=f"quick_rem_src_{phone}_{s_id}")
+                        InlineKeyboardButton(f"ðŸ“‚ {title or s_id}", callback_data=f"filters_{s_id}"),
+                        InlineKeyboardButton("ðŸ—‘", callback_data=f"quick_rem_src_{phone}_{s_id}")
                     )
-            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Account", callback_data=f"acct_dash_{phone}"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("quick_rem_src_"):
@@ -1015,7 +1105,7 @@ if bot:
             s_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             remove_monitored_source(s_id)
-            bot.answer_callback_query(call.id, "✅ Source removed.")
+            bot.answer_callback_query(call.id, "âœ… Source removed.")
             call.data = f"acct_sources_{phone}"
             callback_handler(call)
 
@@ -1024,7 +1114,7 @@ if bot:
             c_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             add_target_group(c_id, str(c_id), session_id=phone)
-            bot.answer_callback_query(call.id, f"✅ Added as Target for {phone}!", show_alert=True)
+            bot.answer_callback_query(call.id, f"âœ… Added as Target for {phone}!", show_alert=True)
             # Return to info page
             call.data = f"chat_info_{phone}_{c_id}"
             callback_handler(call)
@@ -1033,16 +1123,16 @@ if bot:
             phone = call.data[len("acct_targets_"):]
             targets = get_all_targets(session_id=phone)
             markup = InlineKeyboardMarkup()
-            text = f"<b>🎯 TARGET CHANNELS</b> \u2014 <code>{phone}</code>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            text = f"<b>ðŸŽ¯ TARGET CHANNELS</b> \u2014 <code>{phone}</code>\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
             if not targets:
                 text += "<i>No targets added yet for this account.</i>"
             else:
                 for t_id, title in targets:
                     markup.row(
-                        InlineKeyboardButton(f"🎯 {title or t_id}", callback_data=f"tgt_info_{phone}_{t_id}"),
-                        InlineKeyboardButton("🗑", callback_data=f"quick_rem_tgt_{phone}_{t_id}")
+                        InlineKeyboardButton(f"ðŸŽ¯ {title or t_id}", callback_data=f"tgt_info_{phone}_{t_id}"),
+                        InlineKeyboardButton("ðŸ—‘", callback_data=f"quick_rem_tgt_{phone}_{t_id}")
                     )
-            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Account", callback_data=f"acct_dash_{phone}"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("tgt_info_"):
@@ -1058,39 +1148,95 @@ if bot:
             t_id = int(parts[-1])
             phone = "_".join(parts[3:-1])
             remove_target_group(t_id)
-            bot.answer_callback_query(call.id, "✅ Target removed.")
+            bot.answer_callback_query(call.id, "âœ… Target removed.")
             call.data = f"acct_targets_{phone}"
             callback_handler(call)
 
         elif call.data.startswith("media_stats_"):
-            phone = call.data[len("media_stats_"):]
+            payload = call.data[len("media_stats_"):]
+            page = 0
+            phone = payload
+            # Supports both old format: media_stats_<phone>
+            # and paged format: media_stats_<page>_<phone>
+            try:
+                parts = payload.split("_", 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    page = int(parts[0])
+                    phone = parts[1]
+            except Exception:
+                page = 0
+                phone = payload
+
             src_stats = get_media_stats_by_source(session_id=phone)
             markup = InlineKeyboardMarkup()
+            per_page = 8
+            total = len(src_stats)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            if page < 0:
+                page = 0
+            if page >= total_pages:
+                page = total_pages - 1
+            start = page * per_page
+            end = start + per_page
+            page_stats = src_stats[start:end]
             text = (
-                f"<b>📊 MEDIA STATISTICS</b> \u2014 <code>{phone}</code>\n"
+                f"<b>📊 MEDIA STATISTICS</b> — <code>{phone}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<i>Select a source/group below to open details and actions.</i>\n"
+                f"<i>Page {page+1}/{total_pages} • Sources: {total}</i>"
             )
             if not src_stats:
-                text += "<i>No sources configured for this account.</i>"
+                text += "\n\n<i>No sources configured for this account.</i>"
             else:
-                for src_id, title, unreleased, released in src_stats:
-                    title_short = (title or str(src_id))[:30]
-                    total_src = unreleased + released
-                    text += f"<blockquote><b>{title_short}</b>\n📦 Unreleased: {unreleased} \u2022 ✅ Released: {released} \u2022 🗂 Total: {total_src}</blockquote>\n"
-                    row = []
-                    if total_src > 0:
-                        row.append(InlineKeyboardButton(
-                            f"📁 Browse ({total_src})",
-                            callback_data=f"browse_media_{src_id}_0"
-                        ))
-                    if unreleased > 0:
-                        row.append(InlineKeyboardButton(
-                            f"🚀 Release ({unreleased})",
-                            callback_data=f"release_src_{src_id}"
-                        ))
-                    if row:
-                        markup.row(*row)
+                for src_id, title, unreleased, released in page_stats:
+                    total_src = (unreleased or 0) + (released or 0)
+                    btn_text = f"📂 {(title or str(src_id))[:20]} • 📦{unreleased or 0} ✅{released or 0} 🗂{total_src}"
+                    markup.row(InlineKeyboardButton(btn_text, callback_data=f"srcstat_{src_id}"))
+                nav = []
+                if page > 0:
+                    nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"media_stats_{page-1}_{phone}"))
+                if page + 1 < total_pages:
+                    nav.append(InlineKeyboardButton("Next ▶", callback_data=f"media_stats_{page+1}_{phone}"))
+                if nav:
+                    markup.row(*nav)
             markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("srcstat_"):
+            src_id = int(call.data[len("srcstat_"):])
+            details = get_source_stats_detail(src_id)
+            if not details:
+                bot.answer_callback_query(call.id, "Source not found.", show_alert=True)
+                return
+
+            src_title = details["title"] or str(src_id)
+            phone = details["session_id"] or "Legacy"
+            active_text = "Active" if details["is_active"] else "Inactive"
+            live_text = "ON" if details["live_forward"] else "OFF"
+
+            text = (
+                "<b>📂 SOURCE DETAILS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<blockquote><b>Name:</b> {src_title}\n"
+                f"<b>Source ID:</b> <code>{src_id}</code>\n"
+                f"<b>Account:</b> <code>{phone}</code>\n"
+                f"<b>Status:</b> {active_text}\n"
+                f"<b>Live Forward:</b> {live_text}\n"
+                f"<b>Mapped Targets:</b> {details['mapped_targets']}\n"
+                f"<b>Unreleased:</b> {details['unreleased']}\n"
+                f"<b>Released:</b> {details['released']}\n"
+                f"<b>Total:</b> {details['total']}</blockquote>"
+            )
+
+            markup = InlineKeyboardMarkup()
+            if details["total"] > 0:
+                markup.row(InlineKeyboardButton(f"📁 Browse Media ({details['total']})", callback_data=f"browse_media_{src_id}_0"))
+            if details["unreleased"] > 0:
+                markup.row(InlineKeyboardButton(f"🚀 Release All ({details['unreleased']})", callback_data=f"release_src_{src_id}"))
+            markup.row(
+                InlineKeyboardButton("⚙️ Source Options", callback_data=f"src_options_{src_id}"),
+                InlineKeyboardButton("🔙 Back to Stats", callback_data=f"media_stats_{phone}")
+            )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("release_src_"):
@@ -1106,7 +1252,7 @@ if bot:
 
             status_msg = bot.send_message(
                 call.message.chat.id,
-                f"⏳ <b>Releasing {len(media_items)} items...</b>",
+                f"â³ <b>Releasing {len(media_items)} items...</b>",
                 parse_mode="HTML"
             )
 
@@ -1119,7 +1265,7 @@ if bot:
                     await asyncio.sleep(1.5)
                 try:
                     bot.edit_message_text(
-                        f"✅ <b>Release Complete!</b>\n\n<b>{done}</b> / {len(items)} items sent to targets.",
+                        f"âœ… <b>Release Complete!</b>\n\n<b>{done}</b> / {len(items)} items sent to targets.",
                         chat_id, msg_id, parse_mode="HTML"
                     )
                 except:
@@ -1195,7 +1341,7 @@ if bot:
             markup.row(InlineKeyboardButton("\ud83d\uddd1 Delete", callback_data=f"del_media_{m_id}_{src_id}_{back_page}"))
             markup.row(InlineKeyboardButton("\ud83d\udd19 Back to List", callback_data=f"browse_media_{src_id}_{back_page}"))
 
-            file_status = 'Present ✅' if file_exists else 'Missing ❌'
+            file_status = 'Present âœ…' if file_exists else 'Missing âŒ'
             text = (
                 f"<b>\ud83d\udcc4 MEDIA DETAILS</b>\n"
                 f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
@@ -1281,7 +1427,7 @@ if bot:
             phone = call.data[len("quick_add_saved_"):]
             client = active_clients.get(phone)
             if not client:
-                bot.answer_callback_query(call.id, "❌ Account is not active or offline.", show_alert=True)
+                bot.answer_callback_query(call.id, "âŒ Account is not active or offline.", show_alert=True)
                 return
             
             async def add_saved():
@@ -1289,11 +1435,11 @@ if bot:
                     if not client.is_connected:
                         await client.start()
                     me = await client.get_me()
-                    add_monitored_source(me.id, "✨ Saved Messages", session_id=phone)
-                    bot.answer_callback_query(call.id, "✅ Saved Messages added as Source!", show_alert=True)
+                    add_monitored_source(me.id, "âœ¨ Saved Messages", session_id=phone)
+                    bot.answer_callback_query(call.id, "âœ… Saved Messages added as Source!", show_alert=True)
                 except Exception as e:
                     logger.error(f"Error adding saved messages: {e}")
-                    bot.answer_callback_query(call.id, f"❌ Error: {e}", show_alert=True)
+                    bot.answer_callback_query(call.id, f"âŒ Error: {e}", show_alert=True)
 
             asyncio.run_coroutine_threadsafe(add_saved(), loop)
 
@@ -1303,8 +1449,8 @@ if bot:
                 login_data[uid]["api_id"] = None
                 admin_states[uid] = "awaiting_api_hash"
                 markup = InlineKeyboardMarkup()
-                markup.row(InlineKeyboardButton("✨ Use Default API Hash", callback_data="default_api_hash"))
-                bot.edit_message_text("🔑 Please enter your <b>API HASH</b>:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+                markup.row(InlineKeyboardButton("âœ¨ Use Default API Hash", callback_data="default_api_hash"))
+                bot.edit_message_text("ðŸ”‘ Please enter your <b>API HASH</b>:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data == "default_api_hash":
             uid = call.from_user.id
@@ -1315,26 +1461,26 @@ if bot:
         elif call.data == "skip_to_otp":
             uid = call.from_user.id
             admin_states[uid] = "awaiting_phone_simple"
-            bot.edit_message_text("📱 Please send your phone number (e.g. `+1234567890`):", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+            bot.edit_message_text("ðŸ“± Please send your phone number (e.g. `+1234567890`):", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
         elif call.data == "resend_otp":
             uid = call.from_user.id
             if uid in login_data:
                 start_otp_flow(call.message)
-                bot.answer_callback_query(call.id, "🔄 Resending OTP...")
+                bot.answer_callback_query(call.id, "ðŸ”„ Resending OTP...")
 
         elif call.data == "connect_userbot":
             admin_states[call.from_user.id] = "awaiting_phone"
 
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("✨ Skip to OTP (Use Defaults)", callback_data="skip_to_otp"))
+            markup.row(InlineKeyboardButton("âœ¨ Skip to OTP (Use Defaults)", callback_data="skip_to_otp"))
             bot.send_message(
                 call.message.chat.id,
-                "📱 <b>Add Userbot Account</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "1️⃣ Send your phone number (e.g. <code>+1234567890</code>)\n"
-                "2️⃣ You will then be asked for your <b>API ID & Hash</b>\n"
-                "3️⃣ Finally, enter the <b>OTP</b> code\n\n"
+                "ðŸ“± <b>Add Userbot Account</b>\n"
+                "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
+                "1ï¸âƒ£ Send your phone number (e.g. <code>+1234567890</code>)\n"
+                "2ï¸âƒ£ You will then be asked for your <b>API ID & Hash</b>\n"
+                "3ï¸âƒ£ Finally, enter the <b>OTP</b> code\n\n"
                 "<i>Your number is only used to generate a secure session string.</i>",
                 reply_markup=markup,
                 parse_mode="HTML"
@@ -1345,18 +1491,18 @@ if bot:
         if call.data == "stats":
             unreleased, released = get_stats()
             text = (
-                "<b>📊 SYSTEM STATISTICS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<blockquote><b>📦 Unreleased Media:</b> {unreleased} items</blockquote>\n"
-                f"<blockquote><b>✅ Released Media:</b> {released} items</blockquote>"
+                "<b>ðŸ“Š SYSTEM STATISTICS</b>\n"
+                "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
+                f"<blockquote><b>ðŸ“¦ Unreleased Media:</b> {unreleased} items</blockquote>\n"
+                f"<blockquote><b>âœ… Released Media:</b> {released} items</blockquote>"
             )
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Dashboard", callback_data="main_menu"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
             
         elif call.data == "sources":
             sources = get_all_sources()
-            text = "<b>📂 MONITORED SOURCES</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            text = "<b>ðŸ“‚ MONITORED SOURCES</b>\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
             markup = InlineKeyboardMarkup()
             
             if not sources:
@@ -1364,10 +1510,10 @@ if bot:
             else:
                 text += "<i>Select a source below to configure its settings.</i>"
                 for s_id, title in sources:
-                    markup.row(InlineKeyboardButton(f"⚙️ {title}", callback_data=f"src_options_{s_id}"))
+                    markup.row(InlineKeyboardButton(f"âš™ï¸ {title}", callback_data=f"src_options_{s_id}"))
                     
-            markup.row(InlineKeyboardButton("➕ Add New Source", callback_data="add_source"))
-            markup.row(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton("âž• Add New Source", callback_data="add_source"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Dashboard", callback_data="main_menu"))
             
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
@@ -1386,21 +1532,21 @@ if bot:
 
             markup = InlineKeyboardMarkup()
             if phone and phone in active_clients:
-                markup.row(InlineKeyboardButton("🕰 Scrape History", callback_data=f"scrape_{s_id}"))
+                markup.row(InlineKeyboardButton("ðŸ•° Scrape History", callback_data=f"scrape_{s_id}"))
             else:
-                markup.row(InlineKeyboardButton("⚠️ Scrape (Account Offline)", callback_data="account_manager"))
+                markup.row(InlineKeyboardButton("âš ï¸ Scrape (Account Offline)", callback_data="account_manager"))
             
             live_fwd = get_live_forward(s_id)
-            lf_status = "✅ ON" if live_fwd else "❌ OFF"
-            markup.row(InlineKeyboardButton(f"⚡ Live Forward: {lf_status}", callback_data=f"toggle_lf_{s_id}"))
+            lf_status = "âœ… ON" if live_fwd else "âŒ OFF"
+            markup.row(InlineKeyboardButton(f"âš¡ Live Forward: {lf_status}", callback_data=f"toggle_lf_{s_id}"))
             
-            markup.row(InlineKeyboardButton("🎛 Filter Settings", callback_data=f"filters_{s_id}"))
-            markup.row(InlineKeyboardButton("🔙 Back to Sources", callback_data="sources"))
+            markup.row(InlineKeyboardButton("ðŸŽ› Filter Settings", callback_data=f"filters_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Sources", callback_data="sources"))
             bot.edit_message_text(
-                f"<b>⚙️ SOURCE OPTIONS</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>âš™ï¸ SOURCE OPTIONS</b>\n"
+                f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
                 f"<blockquote><b>ID:</b> <code>{s_id}</code></blockquote>\n\n"
-                f"<i>⚡ Live Forward instantly sends media to targets without waiting for release.</i>",
+                f"<i>âš¡ Live Forward instantly sends media to targets without waiting for release.</i>",
                 call.message.chat.id, call.message.message_id,
                 reply_markup=markup, parse_mode="HTML"
             )
@@ -1410,19 +1556,19 @@ if bot:
             toggle_live_forward(s_id)
             
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Back to Source", callback_data=f"src_options_{s_id}"))
-            bot.edit_message_text("✅ Live Forward mode toggled.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Source", callback_data=f"src_options_{s_id}"))
+            bot.edit_message_text("âœ… Live Forward mode toggled.", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
         elif call.data == "auto_release_menu":
             enabled = str(get_setting("auto_release_enabled", "False")) == "True"
             interval = get_setting("auto_release_interval", 60)
             batch = get_setting("auto_release_batch_size", 0)
             batch_text = "All" if int(batch) == 0 else str(batch)
-            status = "✅ ON" if enabled else "❌ OFF"
+            status = "âœ… ON" if enabled else "âŒ OFF"
             
             text = (
-                f"<b>⏱ AUTOMATION SETTINGS</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>â± AUTOMATION SETTINGS</b>\n"
+                f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n\n"
                 f"<blockquote><b>Status:</b> {status}\n"
                 f"<b>Interval:</b> {interval} minutes\n"
                 f"<b>Batch Size:</b> {batch_text} items</blockquote>\n\n"
@@ -1431,14 +1577,14 @@ if bot:
             raw_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL") or get_setting("keep_alive_url", "")
             ping_url = raw_url[:20] + "..." if raw_url else "Not Set"
             if os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL"):
-                ping_url = "✨ Auto-Detected"
+                ping_url = "âœ¨ Auto-Detected"
                 
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton(f"Toggle Status ({status})", callback_data="toggle_ar"))
             markup.row(InlineKeyboardButton("Edit Interval", callback_data="edit_ar_interval"))
             markup.row(InlineKeyboardButton("Edit Batch Size", callback_data="edit_ar_batch"))
-            markup.row(InlineKeyboardButton(f"📡 Keep-Alive: {ping_url[:20]}...", callback_data="edit_keep_alive"))
-            markup.row(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton(f"ðŸ“¡ Keep-Alive: {ping_url[:20]}...", callback_data="edit_keep_alive"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back to Dashboard", callback_data="main_menu"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data == "toggle_ar":
@@ -1452,20 +1598,20 @@ if bot:
         elif call.data == "edit_ar_interval":
             admin_states[call.from_user.id] = "awaiting_ar_interval"
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
-            bot.edit_message_text("⏱ Send the interval in minutes (e.g. `60` for 1 hour):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("â± Send the interval in minutes (e.g. `60` for 1 hour):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data == "edit_ar_batch":
             admin_states[call.from_user.id] = "awaiting_ar_batch"
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
-            bot.edit_message_text("📦 Send the batch size (number of items to release at once, `0` means release all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("ðŸ“¦ Send the batch size (number of items to release at once, `0` means release all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data == "edit_keep_alive":
             admin_states[call.from_user.id] = "awaiting_ping_url"
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data="auto_release_menu"))
-            bot.edit_message_text("📡 Send your **App URL** to keep the bot awake (e.g. `https://my-bot.onrender.com`):\n\n_This will ping the URL every 10 minutes._", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data="auto_release_menu"))
+            bot.edit_message_text("ðŸ“¡ Send your **App URL** to keep the bot awake (e.g. `https://my-bot.onrender.com`):\n\n_This will ping the URL every 10 minutes._", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("filters_"):
             s_id = int(call.data[len("filters_"):])
@@ -1475,20 +1621,20 @@ if bot:
                 return
             
             text = (
-                f"🎛 *Filter Settings for Source `{s_id}`*\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"📸 *Media Types*: `{filters_dict['media_types']}`\n"
-                f"⚖️ *Min File Size*: `{filters_dict['min_file_size']} bytes`\n"
-                f"🔑 *Caption Keywords*: `{filters_dict['caption_keywords'] or 'None (Allow All)'}`\n"
-                f"👤 *Allowed Senders*: `{filters_dict['allowed_senders'] or 'None (Allow All)'}`\n\n"
+                f"ðŸŽ› *Filter Settings for Source `{s_id}`*\n"
+                "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+                f"ðŸ“¸ *Media Types*: `{filters_dict['media_types']}`\n"
+                f"âš–ï¸ *Min File Size*: `{filters_dict['min_file_size']} bytes`\n"
+                f"ðŸ”‘ *Caption Keywords*: `{filters_dict['caption_keywords'] or 'None (Allow All)'}`\n"
+                f"ðŸ‘¤ *Allowed Senders*: `{filters_dict['allowed_senders'] or 'None (Allow All)'}`\n\n"
                 "_Select a filter below to change it._"
             )
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("📸 Edit Types", callback_data=f"editf_types_{s_id}"))
-            markup.row(InlineKeyboardButton("⚖️ Edit Size", callback_data=f"editf_size_{s_id}"))
-            markup.row(InlineKeyboardButton("🔑 Edit Keywords", callback_data=f"editf_keys_{s_id}"))
-            markup.row(InlineKeyboardButton("👤 Edit Senders", callback_data=f"editf_senders_{s_id}"))
-            markup.row(InlineKeyboardButton("🔙 Back", callback_data=f"src_options_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ“¸ Edit Types", callback_data=f"editf_types_{s_id}"))
+            markup.row(InlineKeyboardButton("âš–ï¸ Edit Size", callback_data=f"editf_size_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ”‘ Edit Keywords", callback_data=f"editf_keys_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ‘¤ Edit Senders", callback_data=f"editf_senders_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back", callback_data=f"src_options_{s_id}"))
             
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -1505,7 +1651,7 @@ if bot:
                 "senders": "Send allowed user IDs separated by comma.\nExample: `12345678,87654321`\nSend `clear` to remove filter."
             }
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"filters_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data=f"filters_{s_id}"))
             bot.edit_message_text(prompts[f_type], call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("scrape_"):
@@ -1521,14 +1667,14 @@ if bot:
                 phone = None
 
             if not phone or phone not in active_clients:
-                bot.answer_callback_query(call.id, "⚠️ Account for this source is offline.", show_alert=True)
+                bot.answer_callback_query(call.id, "âš ï¸ Account for this source is offline.", show_alert=True)
                 return
                 
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔢 By Message Limit", callback_data=f"scrmode_limit_{s_id}_{phone}"))
-            markup.row(InlineKeyboardButton("📅 By Date Range", callback_data=f"scrmode_date_{s_id}_{phone}"))
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"src_options_{s_id}"))
-            bot.edit_message_text(f"🕰 *Scrape History for `{s_id}`*\n\nChoose scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            markup.row(InlineKeyboardButton("ðŸ”¢ By Message Limit", callback_data=f"scrmode_limit_{s_id}_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ“… By Date Range", callback_data=f"scrmode_date_{s_id}_{phone}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data=f"src_options_{s_id}"))
+            bot.edit_message_text(f"ðŸ•° *Scrape History for `{s_id}`*\n\nChoose scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("scrmode_"):
             parts = call.data.split("_")
@@ -1537,20 +1683,20 @@ if bot:
             phone = parts[3]
             admin_states[call.from_user.id] = f"awaiting_scrape_{mode}_{s_id}_{phone}"
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔙 Cancel", callback_data=f"scrape_{s_id}"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Cancel", callback_data=f"scrape_{s_id}"))
             if mode == "limit":
-                bot.edit_message_text("🔢 Send the number of messages to scan (e.g. `100` or `0` for all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                bot.edit_message_text("ðŸ”¢ Send the number of messages to scan (e.g. `100` or `0` for all):", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             elif mode == "date":
-                bot.edit_message_text("📅 Send Start Date and End Date in format `YYYY-MM-DD YYYY-MM-DD`.\n\nExample: `2024-01-01 2024-01-31`", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                bot.edit_message_text("ðŸ“… Send Start Date and End Date in format `YYYY-MM-DD YYYY-MM-DD`.\n\nExample: `2024-01-01 2024-01-31`", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data.startswith("cancel_scrape_"):
             scrape_id = call.data[len("cancel_scrape_"):]
             active_scrapes[scrape_id] = True
-            bot.answer_callback_query(call.id, "🛑 Cancelling scrape...", show_alert=False)
+            bot.answer_callback_query(call.id, "ðŸ›‘ Cancelling scrape...", show_alert=False)
 
         elif call.data == "targets":
             targets = get_all_targets()
-            text = "🎯 *Target Groups*\n\n"
+            text = "ðŸŽ¯ *Target Groups*\n\n"
             markup = InlineKeyboardMarkup()
             
             if not targets:
@@ -1559,24 +1705,24 @@ if bot:
                 for t_id, title in targets:
                     text += f"- {title} (`{t_id}`)\n"
                     
-            markup.row(InlineKeyboardButton("➕ Add Target", callback_data="add_target"))
-            markup.row(InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton("âž• Add Target", callback_data="add_target"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back", callback_data="main_menu"))
             
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         elif call.data == "mappings":
             mappings = get_mappings()
-            text = "🔗 *Source to Target Mappings*\n\n"
+            text = "ðŸ”— *Source to Target Mappings*\n\n"
             markup = InlineKeyboardMarkup()
             
             if not mappings:
                 text += "No mappings configured."
             else:
                 for src_id, src_title, tgt_id, tgt_title in mappings:
-                    text += f"• `{src_title}` ➡️ `{tgt_title}`\n"
+                    text += f"â€¢ `{src_title}` âž¡ï¸ `{tgt_title}`\n"
                     
-            markup.row(InlineKeyboardButton("➕ Add Mapping", callback_data="add_mapping"))
-            markup.row(InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
+            markup.row(InlineKeyboardButton("âž• Add Mapping", callback_data="add_mapping"))
+            markup.row(InlineKeyboardButton("ðŸ”™ Back", callback_data="main_menu"))
             
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -1605,37 +1751,37 @@ if bot:
                 bot.answer_callback_query(call.id, "No unreleased media found.", show_alert=True)
                 return
                 
-            bot.send_message(call.message.chat.id, f"🚀 Found {len(media)} unreleased items. Starting release process...")
+            bot.send_message(call.message.chat.id, f"ðŸš€ Found {len(media)} unreleased items. Starting release process...")
             threading.Thread(target=release_media_thread, args=(call.message.chat.id,)).start()
 
         elif call.data == "main_menu":
             show_main_menu(call.message.chat.id, call.message.message_id)
 
-    # ── BOT-AS-ADMIN: Auto-register when bot is added to a group/channel ──
+    # â”€â”€ BOT-AS-ADMIN: Auto-register when bot is added to a group/channel â”€â”€
     @bot.my_chat_member_handler()
     def handle_bot_member_update(update):
         new_status = update.new_chat_member.status
         chat = update.chat
         if new_status in ['administrator', 'member']:
             add_monitored_source(chat.id, chat.title or f"Chat {chat.id}")
-            logger.info(f"✅ Auto-registered source: {chat.title} ({chat.id})")
+            logger.info(f"âœ… Auto-registered source: {chat.title} ({chat.id})")
             if ADMIN_ID:
                 try:
                     bot.send_message(
                         ADMIN_ID,
-                        f"📢 *New Source Registered!*\n\n"
-                        f"🏷 *Name*: {chat.title}\n"
-                        f"🆔 *ID*: `{chat.id}`\n"
-                        f"ℹ️ Bot was added as *{new_status}*. Media will now be saved automatically.",
+                        f"ðŸ“¢ *New Source Registered!*\n\n"
+                        f"ðŸ· *Name*: {chat.title}\n"
+                        f"ðŸ†” *ID*: `{chat.id}`\n"
+                        f"â„¹ï¸ Bot was added as *{new_status}*. Media will now be saved automatically.",
                         parse_mode="Markdown"
                     )
                 except:
                     pass
         elif new_status in ['kicked', 'left']:
             unregister_source(chat.id)
-            logger.info(f"❌ Auto-unregistered source: {chat.title} ({chat.id})")
+            logger.info(f"âŒ Auto-unregistered source: {chat.title} ({chat.id})")
 
-    # ── BOT-AS-ADMIN: Capture media from groups where bot is admin ──
+    # â”€â”€ BOT-AS-ADMIN: Capture media from groups where bot is admin â”€â”€
     @bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'animation'],
                          func=lambda m: m.chat.type in ['group', 'supergroup'])
     def capture_group_media(message):
@@ -1700,7 +1846,7 @@ if bot:
                         f.write(chunk)
             success = save_media_record(message.message_id, message.chat.id, media_type, local_path, caption, media_group_id)
             if success:
-                logger.info(f"✅ [Bot-Admin] Saved {media_type} from {message.chat.id}")
+                logger.info(f"âœ… [Bot-Admin] Saved {media_type} from {message.chat.id}")
                 if get_live_forward(message.chat.id):
                     with get_connection() as conn:
                         with conn.cursor() as c:
@@ -1714,9 +1860,9 @@ if bot:
                             loop
                         )
             else:
-                logger.warning(f"⚠️ [Bot-Admin] Media record exists or failed for {local_path}")
+                logger.warning(f"âš ï¸ [Bot-Admin] Media record exists or failed for {local_path}")
         except Exception as e:
-            logger.error(f"❌ [Bot-Admin] Failed to save media: {e}")
+            logger.error(f"âŒ [Bot-Admin] Failed to save media: {e}")
 
     def start_otp_flow(message):
         uid = message.from_user.id
@@ -1727,7 +1873,7 @@ if bot:
         aid = data.get("api_id") or API_ID
         ahash = data.get("api_hash") or API_HASH
         
-        bot.send_message(message.chat.id, "⏳ Sending OTP to your Telegram account...")
+        bot.send_message(message.chat.id, "â³ Sending OTP to your Telegram account...")
 
         async def send_code():
             try:
@@ -1744,17 +1890,17 @@ if bot:
                 admin_states[uid] = "awaiting_otp"
                 
                 markup = InlineKeyboardMarkup()
-                markup.row(InlineKeyboardButton("🔄 Resend OTP", callback_data="resend_otp"))
+                markup.row(InlineKeyboardButton("ðŸ”„ Resend OTP", callback_data="resend_otp"))
                 
                 bot.send_message(
                     message.chat.id,
-                    "✅ <b>OTP sent!</b> Please enter the code you received:\n"
+                    "âœ… <b>OTP sent!</b> Please enter the code you received:\n"
                     "<i>(Send digits only, e.g. 12345)</i>",
                     reply_markup=markup,
                     parse_mode="HTML"
                 )
             except Exception as e:
-                bot.send_message(message.chat.id, f"❌ <b>Failed to send OTP:</b>\n<code>{e}</code>", parse_mode="HTML")
+                bot.send_message(message.chat.id, f"âŒ <b>Failed to send OTP:</b>\n<code>{e}</code>", parse_mode="HTML")
                 admin_states.pop(uid, None)
                 login_data.pop(uid, None)
 
@@ -1762,50 +1908,50 @@ if bot:
 
     @bot.message_handler(func=lambda m: m.from_user.id in admin_states, content_types=['text'])
     def handle_states(message):
-        logger.info(f"📩 Admin State Handler: {message.from_user.id} in state {admin_states.get(message.from_user.id)}")
+        logger.info(f"ðŸ“© Admin State Handler: {message.from_user.id} in state {admin_states.get(message.from_user.id)}")
 
         state = admin_states.get(message.from_user.id)
 
-        # ── LOGIN FLOW ──
+        # â”€â”€ LOGIN FLOW â”€â”€
         if state == "awaiting_phone":
             phone = message.text.strip()
-            logger.info(f"📱 Received phone: {phone} for {message.from_user.id}")
+            logger.info(f"ðŸ“± Received phone: {phone} for {message.from_user.id}")
             login_data[message.from_user.id] = {"phone": phone, "client": None}
             admin_states[message.from_user.id] = "awaiting_api_id"
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("✨ Use Default API ID", callback_data="default_api_id"))
-            bot.reply_to(message, "🔢 Please enter your <b>API ID</b> from <a href='https://my.telegram.org'>my.telegram.org</a>:", reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
+            markup.row(InlineKeyboardButton("âœ¨ Use Default API ID", callback_data="default_api_id"))
+            bot.reply_to(message, "ðŸ”¢ Please enter your <b>API ID</b> from <a href='https://my.telegram.org'>my.telegram.org</a>:", reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
             return
 
         elif state == "awaiting_phone_simple":
             phone = message.text.strip()
-            logger.info(f"📱 Received simple phone: {phone} for {message.from_user.id}")
+            logger.info(f"ðŸ“± Received simple phone: {phone} for {message.from_user.id}")
             login_data[message.from_user.id] = {"phone": phone, "client": None, "api_id": None, "api_hash": None}
             start_otp_flow(message)
             return
 
         elif state == "awaiting_api_id":
-            logger.info(f"🔢 Received API ID for {message.from_user.id}")
+            logger.info(f"ðŸ”¢ Received API ID for {message.from_user.id}")
             try:
                 api_id = int(message.text.strip())
                 login_data[message.from_user.id]["api_id"] = api_id
                 admin_states[message.from_user.id] = "awaiting_api_hash"
                 markup = InlineKeyboardMarkup()
-                markup.row(InlineKeyboardButton("✨ Use Default API Hash", callback_data="default_api_hash"))
-                bot.reply_to(message, "🔑 Please enter your <b>API HASH</b>:", reply_markup=markup, parse_mode="HTML")
+                markup.row(InlineKeyboardButton("âœ¨ Use Default API Hash", callback_data="default_api_hash"))
+                bot.reply_to(message, "ðŸ”‘ Please enter your <b>API HASH</b>:", reply_markup=markup, parse_mode="HTML")
             except:
-                bot.reply_to(message, "❌ Invalid API ID. Please send numbers only.")
+                bot.reply_to(message, "âŒ Invalid API ID. Please send numbers only.")
             return
 
         elif state == "awaiting_api_hash":
-            logger.info(f"🔑 Received API HASH for {message.from_user.id}")
+            logger.info(f"ðŸ”‘ Received API HASH for {message.from_user.id}")
             api_hash = message.text.strip()
             login_data[message.from_user.id]["api_hash"] = api_hash
             start_otp_flow(message)
             return
 
         elif state == "awaiting_otp":
-            logger.info(f"🔐 Received OTP for {message.from_user.id}")
+            logger.info(f"ðŸ” Received OTP for {message.from_user.id}")
             otp = message.text.strip().replace(" ", "")
             data = login_data.get(message.from_user.id, {})
             tmp: Client = data.get("client")
@@ -1834,27 +1980,27 @@ if bot:
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(
                         message.chat.id,
-                        f"🎉 <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active.",
+                        f"ðŸŽ‰ <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active.",
                         parse_mode="HTML"
                     )
                 except SessionPasswordNeeded:
                     admin_states[message.from_user.id] = "awaiting_2fa"
                     bot.send_message(
                         message.chat.id,
-                        "🔐 <b>2FA Required</b>\n\nPlease send your 2FA password:",
+                        "ðŸ” <b>2FA Required</b>\n\nPlease send your 2FA password:",
                         parse_mode="HTML"
                     )
                 except Exception as e:
-                    logger.error(f"❌ Login failed: {e}")
+                    logger.error(f"âŒ Login failed: {e}")
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
-                    bot.send_message(message.chat.id, f"❌ Login failed: <code>{e}</code>", parse_mode="HTML")
+                    bot.send_message(message.chat.id, f"âŒ Login failed: <code>{e}</code>", parse_mode="HTML")
 
             asyncio.run_coroutine_threadsafe(sign_in(), loop)
             return
 
         elif state == "awaiting_2fa":
-            logger.info(f"🔐 Received 2FA for {message.from_user.id}")
+            logger.info(f"ðŸ” Received 2FA for {message.from_user.id}")
             password = message.text.strip()
             data = login_data.get(message.from_user.id, {})
             tmp: Client = data.get("client")
@@ -1879,19 +2025,19 @@ if bot:
                     login_data.pop(message.from_user.id, None)
                     bot.send_message(
                         message.chat.id,
-                        f"🎉 <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active.",
+                        f"ðŸŽ‰ <b>Login Successful!</b>\n\nAccount <code>{phone}</code> is now active.",
                         parse_mode="HTML"
                     )
                 except Exception as e:
-                    logger.error(f"❌ 2FA failed: {e}")
+                    logger.error(f"âŒ 2FA failed: {e}")
                     admin_states.pop(message.from_user.id, None)
                     login_data.pop(message.from_user.id, None)
-                    bot.send_message(message.chat.id, f"❌ 2FA failed: <code>{e}</code>", parse_mode="HTML")
+                    bot.send_message(message.chat.id, f"âŒ 2FA failed: <code>{e}</code>", parse_mode="HTML")
 
             asyncio.run_coroutine_threadsafe(check_password(), loop)
             return
 
-        # ── NORMAL ADMIN STATES ──
+        # â”€â”€ NORMAL ADMIN STATES â”€â”€
         admin_states.pop(message.from_user.id, None)
         try:
             if state and state.startswith("awaiting_scrape_"):
@@ -1902,10 +2048,10 @@ if bot:
                 
                 client = active_clients.get(phone)
                 if not client:
-                    bot.reply_to(message, "❌ Account is no longer active.")
+                    bot.reply_to(message, "âŒ Account is no longer active.")
                     return
 
-                status_msg = bot.reply_to(message, "⏳ Initializing scraper...")
+                status_msg = bot.reply_to(message, "â³ Initializing scraper...")
                 
                 if mode == "limit":
                     limit = int(message.text.strip())
@@ -1913,7 +2059,7 @@ if bot:
                 elif mode == "date":
                     dates = message.text.strip().split()
                     if len(dates) != 2:
-                        bot.edit_message_text("❌ Invalid format. Please provide exactly two dates.", message.chat.id, status_msg.message_id)
+                        bot.edit_message_text("âŒ Invalid format. Please provide exactly two dates.", message.chat.id, status_msg.message_id)
                         return
                     start_date = datetime.strptime(dates[0], "%Y-%m-%d")
                     end_date = datetime.strptime(dates[1], "%Y-%m-%d")
@@ -1921,7 +2067,7 @@ if bot:
                     end_date = end_date.replace(hour=23, minute=59, second=59)
                     
                     if start_date > end_date:
-                        bot.edit_message_text("❌ Start date cannot be after end date.", message.chat.id, status_msg.message_id)
+                        bot.edit_message_text("âŒ Start date cannot be after end date.", message.chat.id, status_msg.message_id)
                         return
                         
                     asyncio.run_coroutine_threadsafe(scrape_history(client, s_id, message.chat.id, status_msg.message_id, start_date=start_date, end_date=end_date), loop)
@@ -1931,33 +2077,33 @@ if bot:
                 try:
                     val = int(message.text.strip())
                     if val < 1:
-                        bot.reply_to(message, "❌ Interval must be at least 1 minute.")
+                        bot.reply_to(message, "âŒ Interval must be at least 1 minute.")
                         return
                     set_setting("auto_release_interval", val)
-                    bot.reply_to(message, f"✅ Auto-Release interval set to {val} minutes.")
+                    bot.reply_to(message, f"âœ… Auto-Release interval set to {val} minutes.")
                 except ValueError:
-                    bot.reply_to(message, "❌ Invalid number.")
+                    bot.reply_to(message, "âŒ Invalid number.")
                 return
 
             if state == "awaiting_ar_batch":
                 try:
                     val = int(message.text.strip())
                     if val < 0:
-                        bot.reply_to(message, "❌ Batch size cannot be negative.")
+                        bot.reply_to(message, "âŒ Batch size cannot be negative.")
                         return
                     set_setting("auto_release_batch_size", val)
-                    bot.reply_to(message, f"✅ Auto-Release batch size set to {val} items (0 means all).")
+                    bot.reply_to(message, f"âœ… Auto-Release batch size set to {val} items (0 means all).")
                 except ValueError:
-                    bot.reply_to(message, "❌ Invalid number.")
+                    bot.reply_to(message, "âŒ Invalid number.")
                 return
 
             if state == "awaiting_ping_url":
                 url = message.text.strip()
                 if not url.startswith("http"):
-                    bot.reply_to(message, "❌ Invalid URL. Must start with http:// or https://")
+                    bot.reply_to(message, "âŒ Invalid URL. Must start with http:// or https://")
                     return
                 set_setting("keep_alive_url", url)
-                bot.reply_to(message, f"✅ Keep-Alive URL set to:\n`{url}`", parse_mode="Markdown")
+                bot.reply_to(message, f"âœ… Keep-Alive URL set to:\n`{url}`", parse_mode="Markdown")
                 return
 
             if state and state.startswith("editf_"):
@@ -1979,57 +2125,57 @@ if bot:
                 update_source_filter(s_id, db_key, val)
                 
                 markup = InlineKeyboardMarkup()
-                markup.row(InlineKeyboardButton("🔙 Back to Filters", callback_data=f"filters_{s_id}"))
-                bot.reply_to(message, "✅ Filter updated successfully.", reply_markup=markup)
+                markup.row(InlineKeyboardButton("ðŸ”™ Back to Filters", callback_data=f"filters_{s_id}"))
+                bot.reply_to(message, "âœ… Filter updated successfully.", reply_markup=markup)
                 return
 
             if state == "awaiting_source":
                 text = message.text.strip()
                 if "t.me" in text or text.startswith("@"):
                     if not active_clients:
-                        bot.reply_to(message, "❌ No active userbots connected. Please connect an account in the Account Manager first.")
+                        bot.reply_to(message, "âŒ No active userbots connected. Please connect an account in the Account Manager first.")
                         return
                     
                     # Pick the first active client for manual joining
                     phone, client = next(iter(active_clients.items()))
                     
-                    bot.reply_to(message, f"⏳ Resolving chat via <code>{phone}</code>...", parse_mode="HTML")
+                    bot.reply_to(message, f"â³ Resolving chat via <code>{phone}</code>...", parse_mode="HTML")
                     async def join_and_save():
                         frozen_hint = (
-                            "\n\n⚠️ *Why did this happen?*\n"
+                            "\n\nâš ï¸ *Why did this happen?*\n"
                             "Telegram restricts joining via invite links for accounts that are new or flagged\\. "
                             "Your userbot account needs to be older/more active\\.\n\n"
-                            "👉 *Workaround*: Get the Chat ID manually \\(e\\.g\\. via @username\\_to\\_id\\_bot\\) "
+                            "ðŸ‘‰ *Workaround*: Get the Chat ID manually \\(e\\.g\\. via @username\\_to\\_id\\_bot\\) "
                             "and add the source as: `-1001234567 Channel Name`"
                         )
                         try:
                             # Detect if it's a private invite link (t.me/+xxx or joinchat)
                             is_private_link = "+joinchat" in text or "/+" in text
                             if not is_private_link:
-                                # Public @username or t.me/username — use get_chat, no join needed
+                                # Public @username or t.me/username â€” use get_chat, no join needed
                                 chat = await client.get_chat(text)
                                 add_monitored_source(chat.id, chat.title, session_id=phone)
-                                bot.send_message(message.chat.id, f"✅ *Source added to {phone}\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                                bot.send_message(message.chat.id, f"âœ… *Source added to {phone}\\!*\n\nðŸ· *{chat.title}*\nðŸ†” `{chat.id}`", parse_mode="MarkdownV2")
                             else:
-                                # Private invite link — must join
+                                # Private invite link â€” must join
                                 chat = await client.join_chat(text)
                                 add_monitored_source(chat.id, chat.title, session_id=phone)
-                                bot.send_message(message.chat.id, f"✅ *Userbot {phone} joined source\\!*\n\n🏷 *{chat.title}*\n🆔 `{chat.id}`", parse_mode="MarkdownV2")
+                                bot.send_message(message.chat.id, f"âœ… *Userbot {phone} joined source\\!*\n\nðŸ· *{chat.title}*\nðŸ†” `{chat.id}`", parse_mode="MarkdownV2")
                         except Exception as e:
                             err_str = str(e)
                             if "FROZEN_METHOD_INVALID" in err_str:
                                 bot.send_message(
                                     message.chat.id,
-                                    "❌ *Telegram blocked the join request*\n\n"
-                                    "`FROZEN_METHOD_INVALID` — Telegram has restricted your userbot from joining via invite links\\. "
+                                    "âŒ *Telegram blocked the join request*\n\n"
+                                    "`FROZEN_METHOD_INVALID` â€” Telegram has restricted your userbot from joining via invite links\\. "
                                     "This is a Telegram account trust restriction \\(not a bug\\)\\."
                                     + frozen_hint,
                                     parse_mode="MarkdownV2"
                                 )
                             elif "FloodWait" in err_str:
-                                bot.send_message(message.chat.id, "⏳ *Flood wait triggered\\.* Please wait a few minutes and try again\\.", parse_mode="MarkdownV2")
+                                bot.send_message(message.chat.id, "â³ *Flood wait triggered\\.* Please wait a few minutes and try again\\.", parse_mode="MarkdownV2")
                             else:
-                                bot.send_message(message.chat.id, f"❌ *Failed to add source\\.*\n\n`{err_str}`" + frozen_hint, parse_mode="MarkdownV2")
+                                bot.send_message(message.chat.id, f"âŒ *Failed to add source\\.*\n\n`{err_str}`" + frozen_hint, parse_mode="MarkdownV2")
                     
                     asyncio.run_coroutine_threadsafe(join_and_save(), loop)
                 else:
@@ -2037,17 +2183,17 @@ if bot:
                     # If ID is provided manually, we don't strictly need a session but it's better to have one
                     phone = next(iter(active_clients.keys())) if active_clients else "Legacy"
                     add_monitored_source(int(parts[0]), parts[1], session_id=phone)
-                    bot.reply_to(message, f"✅ Source added (assigned to {phone}).")
+                    bot.reply_to(message, f"âœ… Source added (assigned to {phone}).")
             elif state == "awaiting_target":
                 parts = message.text.split(" ", 1)
                 add_target_group(int(parts[0]), parts[1])
-                bot.reply_to(message, "✅ Target added.")
+                bot.reply_to(message, "âœ… Target added.")
             elif state == "awaiting_mapping":
                 parts = message.text.split()
                 add_mapping(int(parts[0]), int(parts[1]))
-                bot.reply_to(message, "✅ Mapping added.")
+                bot.reply_to(message, "âœ… Mapping added.")
         except Exception as e:
-            bot.reply_to(message, f"❌ Error: {e}")
+            bot.reply_to(message, f"âŒ Error: {e}")
 
 async def release_single_media(m_id, file_path, m_type, caption, source_id):
     """Release a single media item to all its target groups using the correct session client."""
@@ -2093,7 +2239,7 @@ async def release_single_media(m_id, file_path, m_type, caption, source_id):
 
 def keep_alive_worker():
     """Background worker to ping the app URL periodically."""
-    logger.info("📡 Keep-alive worker started.")
+    logger.info("ðŸ“¡ Keep-alive worker started.")
     while True:
         # Auto-detect URL from environment (Render/Heroku/etc) or settings
         url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEB_URL") or get_setting("keep_alive_url", "")
@@ -2105,11 +2251,11 @@ def keep_alive_worker():
                 # Add a timestamp to avoid caching
                 ts_url = f"{url}?t={int(time.time())}" if "?" not in url else f"{url}&t={int(time.time())}"
                 requests.get(ts_url, timeout=15)
-                logger.info(f"📡 Keep-alive ping sent to {url}")
+                logger.info(f"ðŸ“¡ Keep-alive ping sent to {url}")
             except Exception as e:
-                logger.error(f"❌ Keep-alive ping failed: {e}")
+                logger.error(f"âŒ Keep-alive ping failed: {e}")
         else:
-            logger.warning("📡 Keep-alive URL not set. Bot may sleep on free hosting.")
+            logger.warning("ðŸ“¡ Keep-alive URL not set. Bot may sleep on free hosting.")
             
         time.sleep(600) # 10 minutes
 
@@ -2140,7 +2286,7 @@ async def auto_release_loop():
             continue
             
         items_to_process = media_items[:batch_size] if batch_size > 0 else media_items
-        logger.info(f"⏱ Auto-Release triggered. Releasing {len(items_to_process)} items.")
+        logger.info(f"â± Auto-Release triggered. Releasing {len(items_to_process)} items.")
         
         for item in items_to_process:
             m_id, file_path, m_type, caption = item
@@ -2176,17 +2322,17 @@ def release_media_thread(admin_chat_id):
                 logger.error(f"Error in mass release for item {m_id}: {e}")
             await asyncio.sleep(1.5)
         
-        bot.send_message(admin_chat_id, f"✅ <b>Release Complete!</b> Released <code>{success_count}</code> items.", parse_mode="HTML")
+        bot.send_message(admin_chat_id, f"âœ… <b>Release Complete!</b> Released <code>{success_count}</code> items.", parse_mode="HTML")
 
     if loop.is_running():
         asyncio.run_coroutine_threadsafe(upload_job(media_items), loop)
-        bot.send_message(admin_chat_id, f"✅ Release job submitted to Userbot loop.")
+        bot.send_message(admin_chat_id, f"âœ… Release job submitted to Userbot loop.")
     else:
-        bot.send_message(admin_chat_id, f"❌ Userbot loop not running.")
+        bot.send_message(admin_chat_id, f"âŒ Userbot loop not running.")
 
 
 # ==========================================
-# 🌐 RENDER HEALTH CHECK SERVER
+# ðŸŒ RENDER HEALTH CHECK SERVER
 # ==========================================
 app = Flask(__name__)
 
@@ -2199,12 +2345,12 @@ def run_health_check_server():
     app.run(host='0.0.0.0', port=port)
 
 # ==========================================
-# 🚀 MAIN RUNNER
+# ðŸš€ MAIN RUNNER
 # ==========================================
 async def start_services():
     # Start Render Health Check Server IMMEDIATELY
     threading.Thread(target=run_health_check_server, daemon=True).start()
-    logger.info("🌐 Health Check Server started.")
+    logger.info("ðŸŒ Health Check Server started.")
     
     # Start Keep-Alive Pinger
     threading.Thread(target=keep_alive_worker, daemon=True).start()
@@ -2220,27 +2366,27 @@ async def start_services():
     # Restore all saved sessions
     saved_sessions = get_all_sessions()
     if saved_sessions:
-        logger.info(f"🔑 Found {len(saved_sessions)} saved session(s). Restoring...")
+        logger.info(f"ðŸ”‘ Found {len(saved_sessions)} saved session(s). Restoring...")
         for phone, session_str, api_id, api_hash in saved_sessions:
             try:
                 client = build_client(phone, session_str, api_id, api_hash)
                 register_userbot_handlers(client)
                 await client.start()
                 active_clients[phone] = client
-                logger.info(f"✅ Userbot [{phone}] started successfully!")
+                logger.info(f"âœ… Userbot [{phone}] started successfully!")
             except Unauthorized as e:
-                logger.warning(f"⚠️ Session [{phone}] is invalid (Unauthorized). Removing. {e}")
+                logger.warning(f"âš ï¸ Session [{phone}] is invalid (Unauthorized). Removing. {e}")
                 delete_session(phone)
             except Exception as e:
-                logger.error(f"❌ Could not start Userbot [{phone}]: {e}")
+                logger.error(f"âŒ Could not start Userbot [{phone}]: {e}")
     else:
-        logger.info("ℹ️ No saved sessions found. Admin must log in via the bot.")
+        logger.info("â„¹ï¸ No saved sessions found. Admin must log in via the bot.")
 
     if bot:
         logger.info("Starting Telebot Admin UI...")
         current_loop = asyncio.get_running_loop()
         current_loop.run_in_executor(None, bot.infinity_polling)
-        logger.info("✅ Admin Bot Started successfully!")
+        logger.info("âœ… Admin Bot Started successfully!")
     else:
         logger.warning("BOT_TOKEN not found. Admin UI will not start.")
 
