@@ -17,6 +17,7 @@ from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
 import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 
 load_dotenv()
@@ -183,6 +184,24 @@ def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
+def main_menu_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        KeyboardButton("⚙️ Setup"),
+        KeyboardButton("📡 Userbot")
+    )
+    kb.add(
+        KeyboardButton("📂 Sources"),
+        KeyboardButton("🎯 Target")
+    )
+    kb.add(
+        KeyboardButton("🚀 Transfer"),
+        KeyboardButton("📊 Status")
+    )
+    kb.add(KeyboardButton("❓ Help"))
+    return kb
+
+
 def build_temp_client(api_id: int, api_hash: str) -> Client:
     return Client(
         name=":memory:",
@@ -289,30 +308,76 @@ def cmd_start(message):
     bot.reply_to(
         message,
         (
-            "Commands:\n"
-            "/settarget <chat_id>\n"
-            "/showtarget\n"
-            "/setapiid <id>\n"
-            "/setapihash <hash>\n"
-            "/setsession <string_session>\n"
-            "/login  (generate session string from phone/OTP)\n"
-            "/startuserbot  (start/reload userbot now)\n"
-            "/showapi\n"
-            "/clearapi\n"
-            "/autoon\n"
-            "/autooff\n"
-            "/status\n"
-            "/listgroups [page]\n"
-            "/setsource <chat_id>\n"
-            "/delsource <chat_id>\n"
-            "/showsources\n"
-            "/sendsource <chat_id> <N> (send last N media from a source chat)\n"
-            "/sendlast <N>  (send last N media from Saved Messages)\n"
-            "/resendlast <N> (force resend, ignore sent-history)\n"
-            "/clearsent (clear sent-history)\n"
-            "/showmedia <N> (show last N media in Saved Messages)\n"
-        )
+            "Welcome to Source ➜ Target Forward Bot\n\n"
+            "Use the buttons below for guided actions.\n"
+            "Quick start:\n"
+            "1) ⚙️ Setup (API + Session)\n"
+            "2) 📡 Userbot (start it)\n"
+            "3) 🎯 Target (set target chat)\n"
+            "4) 📂 Sources (add source chats)\n"
+            "5) 🚀 Transfer (live or bulk transfer)\n"
+        ),
+        reply_markup=main_menu_keyboard()
     )
+
+
+@bot.message_handler(commands=["menu"])
+def cmd_menu(message):
+    if not is_admin(message.from_user.id):
+        return
+    bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🚀 Transfer", "📊 Status"])
+def menu_router(message):
+    if not is_admin(message.from_user.id):
+        return
+    text = message.text
+    if text == "❓ Help":
+        bot.reply_to(
+            message,
+            (
+                "Commands:\n"
+                "/setapiid <id>\n/setapihash <hash>\n/setsession <session>\n/login\n"
+                "/startuserbot\n/showapi\n/clearapi\n\n"
+                "/settarget <chat_id>\n/showtarget\n"
+                "/setsource <chat_id>\n/delsource <chat_id>\n/showsources\n/listgroups [page]\n\n"
+                "/autoon /autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>\n/showmedia <N>\n/clearsent"
+            ),
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "⚙️ Setup":
+        bot.reply_to(
+            message,
+            "Setup:\n1) /setapiid <id>\n2) /setapihash <hash>\n3) /login (recommended) or /setsession <session>\n4) /showapi",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "📡 Userbot":
+        bot.reply_to(
+            message,
+            "Userbot controls:\n/startuserbot\n/status",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "📂 Sources":
+        bot.reply_to(
+            message,
+            "Source controls:\n/listgroups\n/setsource <chat_id>\n/showsources\n/delsource <chat_id>",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "🎯 Target":
+        bot.reply_to(
+            message,
+            "Target controls:\n/settarget <chat_id>\n/showtarget",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "🚀 Transfer":
+        bot.reply_to(
+            message,
+            "Transfer controls:\n/autoon (live forward)\n/autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "📊 Status":
+        cmd_status(message)
 
 
 @bot.message_handler(commands=["settarget"])
@@ -326,7 +391,7 @@ def cmd_settarget(message):
     try:
         target_id = int(parts[1])
         set_setting("target_chat_id", target_id)
-        bot.reply_to(message, f"Target set to: `{target_id}`", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Target set to: `{target_id}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
     except ValueError:
         bot.reply_to(message, "Invalid target id.")
 
@@ -336,7 +401,7 @@ def cmd_showtarget(message):
     if not is_admin(message.from_user.id):
         return
     t = get_setting("target_chat_id", "Not set")
-    bot.reply_to(message, f"Current target: `{t}`", parse_mode="Markdown")
+    bot.reply_to(message, f"🎯 Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["setapiid"])
@@ -352,7 +417,7 @@ def cmd_setapiid(message):
         if api_id <= 0:
             raise ValueError
         set_setting("api_id", api_id)
-        bot.reply_to(message, "API ID saved. Restart service to apply.")
+        bot.reply_to(message, "✅ API ID saved.", reply_markup=main_menu_keyboard())
     except ValueError:
         bot.reply_to(message, "Invalid API ID.")
 
@@ -366,7 +431,7 @@ def cmd_setapihash(message):
         bot.reply_to(message, "Usage: /setapihash <api_hash>")
         return
     set_setting("api_hash", parts[1].strip())
-    bot.reply_to(message, "API Hash saved. Restart service to apply.")
+    bot.reply_to(message, "✅ API Hash saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["setsession"])
@@ -378,7 +443,7 @@ def cmd_setsession(message):
         bot.reply_to(message, "Usage: /setsession <string_session>")
         return
     set_setting("user_session_string", parts[1].strip())
-    bot.reply_to(message, "User session saved. Restart service to apply.")
+    bot.reply_to(message, "✅ User session saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["showapi"])
@@ -394,7 +459,8 @@ def cmd_showapi(message):
     bot.reply_to(
         message,
         f"API ID: `{api_id}`\nAPI Hash: `{hash_mask}`\nSession: `{sess_mask}`",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
     )
 
 
@@ -405,7 +471,7 @@ def cmd_clearapi(message):
     set_setting("api_id", "")
     set_setting("api_hash", "")
     set_setting("user_session_string", "")
-    bot.reply_to(message, "Stored API ID/API Hash/Session removed. Restart service to apply.")
+    bot.reply_to(message, "🧹 Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["startuserbot"])
