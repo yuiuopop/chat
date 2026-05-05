@@ -305,6 +305,24 @@ def get_targets_for_source(source_id):
         logger.error(f"Error fetching targets for source: {e}")
         return []
 
+def remove_monitored_source(source_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("DELETE FROM monitored_sources WHERE source_id = %s", (source_id,))
+                # Also clean up unreleased media for this source if needed
+                # c.execute("DELETE FROM saved_media WHERE source_chat_id = %s AND is_released = FALSE", (source_id,))
+    except Exception as e:
+        logger.error(f"Error removing source: {e}")
+
+def remove_target_group(target_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("DELETE FROM target_groups WHERE target_id = %s", (target_id,))
+    except Exception as e:
+        logger.error(f"Error removing target: {e}")
+
 def get_all_sources(session_id=None):
     try:
         with get_connection() as conn:
@@ -1021,11 +1039,19 @@ if bot:
             else:
                 for t_id, title in targets:
                     markup.row(
-                        InlineKeyboardButton(f"🎯 {title or t_id}", callback_data="none"),
+                        InlineKeyboardButton(f"🎯 {title or t_id}", callback_data=f"tgt_info_{phone}_{t_id}"),
                         InlineKeyboardButton("🗑", callback_data=f"quick_rem_tgt_{phone}_{t_id}")
                     )
             markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+        elif call.data.startswith("tgt_info_"):
+            parts = call.data.split("_")
+            t_id = int(parts[-1])
+            phone = "_".join(parts[2:-1])
+            bot.answer_callback_query(call.id, f"Target ID: {t_id}")
+            # Could add more target info here if needed
+
 
         elif call.data.startswith("quick_rem_tgt_"):
             parts = call.data.split("_")
@@ -1254,11 +1280,21 @@ if bot:
         elif call.data.startswith("quick_add_saved_"):
             phone = call.data[len("quick_add_saved_"):]
             client = active_clients.get(phone)
-            if not client: return
+            if not client:
+                bot.answer_callback_query(call.id, "❌ Account is not active or offline.", show_alert=True)
+                return
+            
             async def add_saved():
-                me = await client.get_me()
-                add_monitored_source(me.id, "✨ Saved Messages", session_id=phone)
-                bot.answer_callback_query(call.id, "✅ Saved Messages added as Source!", show_alert=True)
+                try:
+                    if not client.is_connected:
+                        await client.start()
+                    me = await client.get_me()
+                    add_monitored_source(me.id, "✨ Saved Messages", session_id=phone)
+                    bot.answer_callback_query(call.id, "✅ Saved Messages added as Source!", show_alert=True)
+                except Exception as e:
+                    logger.error(f"Error adding saved messages: {e}")
+                    bot.answer_callback_query(call.id, f"❌ Error: {e}", show_alert=True)
+
             asyncio.run_coroutine_threadsafe(add_saved(), loop)
 
         elif call.data == "default_api_id":
