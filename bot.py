@@ -121,6 +121,12 @@ def mark_sent(source_message_id, target_chat_id):
         )
 
 
+def clear_sent_records():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM sent_messages")
+
+
 # -----------------------------
 # Clients
 # -----------------------------
@@ -256,6 +262,9 @@ def cmd_start(message):
             "/autooff\n"
             "/status\n"
             "/sendlast <N>  (send last N media from Saved Messages)\n"
+            "/resendlast <N> (force resend, ignore sent-history)\n"
+            "/clearsent (clear sent-history)\n"
+            "/showmedia <N> (show last N media in Saved Messages)\n"
         )
     )
 
@@ -538,7 +547,7 @@ def cmd_sendlast(message):
         bot.reply_to(message, "N must be a number")
         return
 
-    async def run_sendlast():
+    async def run_sendlast(force=False):
         target_raw = get_setting("target_chat_id", "")
         if not target_raw:
             bot.reply_to(message, "Set target first with /settarget")
@@ -546,12 +555,13 @@ def cmd_sendlast(message):
         target_id = int(target_raw)
         me = await userbot.get_me()
         count = 0
-        async for m in userbot.get_chat_history(me.id, limit=n * 5):
+        scan_limit = max(50, n * 15)
+        async for m in userbot.get_chat_history(me.id, limit=scan_limit):
             if count >= n:
                 break
             if not m.media:
                 continue
-            if already_sent(m.id):
+            if (not force) and already_sent(m.id):
                 continue
             try:
                 await userbot.copy_message(target_id, me.id, m.id)
@@ -560,10 +570,116 @@ def cmd_sendlast(message):
                 await asyncio.sleep(0.7)
             except Exception as e:
                 logger.error(f"sendlast failed for {m.id}: {e}")
-        bot.reply_to(message, f"Done. Sent {count} media to target.")
+        mode = "force" if force else "normal"
+        bot.reply_to(message, f"Done ({mode}). Sent {count} media to target.")
 
-    asyncio.run_coroutine_threadsafe(run_sendlast(), loop)
+    asyncio.run_coroutine_threadsafe(run_sendlast(force=False), loop)
     bot.reply_to(message, "Started sending...")
+
+
+@bot.message_handler(commands=["resendlast"])
+def cmd_resendlast(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Configure API/session and restart or /startuserbot.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /resendlast 20")
+        return
+    try:
+        n = int(parts[1])
+        if n < 1:
+            bot.reply_to(message, "N must be >= 1")
+            return
+    except ValueError:
+        bot.reply_to(message, "N must be a number")
+        return
+
+    async def run_resend():
+        target_raw = get_setting("target_chat_id", "")
+        if not target_raw:
+            bot.reply_to(message, "Set target first with /settarget")
+            return
+        target_id = int(target_raw)
+        me = await userbot.get_me()
+        count = 0
+        scan_limit = max(50, n * 15)
+        async for m in userbot.get_chat_history(me.id, limit=scan_limit):
+            if count >= n:
+                break
+            if not m.media:
+                continue
+            try:
+                await userbot.copy_message(target_id, me.id, m.id)
+                # keep history updated even in force mode
+                mark_sent(m.id, target_id)
+                count += 1
+                await asyncio.sleep(0.7)
+            except Exception as e:
+                logger.error(f"resendlast failed for {m.id}: {e}")
+        bot.reply_to(message, f"Done (force). Sent {count} media to target.")
+
+    asyncio.run_coroutine_threadsafe(run_resend(), loop)
+    bot.reply_to(message, "Started force resend...")
+
+
+@bot.message_handler(commands=["clearsent"])
+def cmd_clearsent(message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_sent_records()
+    bot.reply_to(message, "Sent-history cleared. You can run /sendlast again.")
+
+
+@bot.message_handler(commands=["showmedia"])
+def cmd_showmedia(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+
+    parts = message.text.split()
+    n = 10
+    if len(parts) == 2:
+        try:
+            n = int(parts[1])
+            if n < 1:
+                n = 10
+        except ValueError:
+            bot.reply_to(message, "Usage: /showmedia 10")
+            return
+
+    async def run_show():
+        me = await userbot.get_me()
+        rows = []
+        scan_limit = max(50, n * 15)
+        async for m in userbot.get_chat_history(me.id, limit=scan_limit):
+            if len(rows) >= n:
+                break
+            if not m.media:
+                continue
+            media_type = m.media.value if m.media else "unknown"
+            dt = m.date.strftime("%Y-%m-%d %H:%M")
+            sent_flag = "sent" if already_sent(m.id) else "new"
+            rows.append(f"{len(rows)+1}. id={m.id} | {media_type} | {dt} | {sent_flag}")
+
+        if not rows:
+            bot.reply_to(message, "No media found in Saved Messages.")
+            return
+
+        text = "Saved Messages media (recent):\n" + "\n".join(rows)
+        # Telegram message size safety
+        if len(text) > 3500:
+            text = text[:3500] + "\n..."
+        bot.reply_to(message, f"<pre>{text}</pre>", parse_mode="HTML")
+
+    asyncio.run_coroutine_threadsafe(run_show(), loop)
+    bot.reply_to(message, "Reading Saved Messages media...")
 
 
 # -----------------------------
