@@ -477,7 +477,18 @@ def source_manage_keyboard(chat_id):
     return markup, stats
 
 
+def build_temp_client(api_id: int, api_hash: str) -> Client:
+    return Client(
+        name=":memory:",
+        api_id=api_id,
+        api_hash=api_hash,
+        in_memory=True,
+        workers=2,
+    )
+
+
 @bot.callback_query_handler(func=lambda call: True)
+
 def handle_callbacks(call):
     uid = call.from_user.id
     if not is_admin(uid):
@@ -603,13 +614,7 @@ def handle_callbacks(call):
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
 
 
-    return Client(
-        name=":memory:",
-        api_id=api_id,
-        api_hash=api_hash,
-        in_memory=True,
-        workers=2,
-    )
+
 
 
 async def forward_from_saved_message(msg: Message) -> bool:
