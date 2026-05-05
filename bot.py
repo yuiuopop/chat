@@ -872,7 +872,9 @@ def menu_router(message):
     if not is_admin(message.from_user.id):
         return
     text = message.text
+    set_heartbeat("poll")
     if text == "🏠 Dashboard":
+
         bot.reply_to(message, dashboard_text(), parse_mode="Markdown", reply_markup=main_menu_keyboard())
         bot.send_message(message.chat.id, "🎮 *Interactive Control Panel*", reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
     elif text == "❓ Help":
@@ -1513,12 +1515,16 @@ def cmd_collecthistory(message):
     async def run_collect():
         collected = 0
         scanned = 0
+        mode = get_setting("forward_mode", "media")
         async for m in userbot.get_chat_history(source_chat_id, limit=n):
             scanned += 1
-            if not m.media:
+            is_media = bool(m.media)
+            if mode == "media" and not is_media:
                 continue
-            media_type = m.media.value if m.media else "unknown"
-            ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or "")
+            
+            media_type = m.media.value if is_media else "text"
+            ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or m.text or "")
+
             if ok:
                 collected += 1
             await asyncio.sleep(0.05)
@@ -1566,13 +1572,17 @@ def cmd_collectall(message):
             source_title = source_row[1] or str(source_chat_id)
             source_collected = 0
             source_scanned = 0
+            mode = get_setting("forward_mode", "media")
             try:
                 async for m in userbot.get_chat_history(source_chat_id, limit=per_source_limit):
                     source_scanned += 1
-                    if not m.media:
+                    is_media = bool(m.media)
+                    if mode == "media" and not is_media:
                         continue
-                    media_type = m.media.value if m.media else "unknown"
-                    ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or "")
+
+                    media_type = m.media.value if is_media else "text"
+                    ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or m.text or "")
+
                     if ok:
                         source_collected += 1
                     await asyncio.sleep(0.03)
@@ -1954,12 +1964,13 @@ def run_bot_polling_forever():
     while True:
         try:
             logger.info("Starting bot polling loop...")
-            set_heartbeat("poll")
+            bot.delete_webhook()
             bot.infinity_polling(
                 skip_pending=True,
-                timeout=20,
-                long_polling_timeout=20
+                timeout=30,
+                long_polling_timeout=25
             )
+
         except Exception as e:
             logger.error(f"Bot polling crashed, retrying in 5s: {e}")
             time.sleep(5)
@@ -2002,11 +2013,11 @@ def supervisor_watchdog():
             poll_hb, user_hb = get_heartbeats()
             now = time.time()
 
-            # Polling stale detector
+            # Polling stale detector (logs only, infinity_polling handles itself)
             if now - poll_hb > poll_stale_seconds:
-                logger.warning("Polling heartbeat stale. Spawning new polling watchdog thread.")
-                threading.Thread(target=run_bot_polling_forever, daemon=True).start()
-                set_heartbeat("poll")
+                logger.warning(f"Polling heartbeat stale ({int(now - poll_hb)}s). Bot might be idle.")
+                # We don't spawn a new thread here anymore to avoid 409 conflicts
+
 
             # Userbot stale detector
             if now - user_hb > userbot_stale_seconds:
