@@ -343,19 +343,19 @@ def get_heartbeats():
 def main_menu_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
-        KeyboardButton("âš™ï¸ Setup"),
-        KeyboardButton("ðŸ“¡ Userbot")
+        KeyboardButton("⚙️ Setup"),
+        KeyboardButton("📡 Userbot")
     )
     kb.add(
-        KeyboardButton("ðŸ“‚ Sources"),
-        KeyboardButton("ðŸŽ¯ Target")
+        KeyboardButton("📂 Sources"),
+        KeyboardButton("🎯 Target")
     )
     kb.add(
-        KeyboardButton("ðŸ§² Monitor"),
-        KeyboardButton("ðŸš€ Transfer"),
-        KeyboardButton("ðŸ“Š Status")
+        KeyboardButton("🧲 Monitor"),
+        KeyboardButton("🚀 Transfer"),
+        KeyboardButton("📊 Status")
     )
-    kb.add(KeyboardButton("â“ Help"))
+    kb.add(KeyboardButton("❓ Help"))
     return kb
 
 
@@ -486,14 +486,14 @@ def cmd_start(message):
     bot.reply_to(
         message,
         (
-            "Welcome to Source âžœ Target Forward Bot\n\n"
+            "Welcome to Source ➜ Target Forward Bot\n\n"
             "Use the buttons below for guided actions.\n"
             "Quick start:\n"
-            "1) âš™ï¸ Setup (API + Session)\n"
-            "2) ðŸ“¡ Userbot (start it)\n"
-            "3) ðŸŽ¯ Target (set target chat)\n"
-            "4) ðŸ“‚ Sources (add source chats)\n"
-            "5) ðŸš€ Transfer (live or bulk transfer)\n"
+            "1) ⚙️ Setup (API + Session)\n"
+            "2) 📡 Userbot (start it)\n"
+            "3) 🎯 Target (set target chat)\n"
+            "4) 📂 Sources (add source chats)\n"
+            "5) 🚀 Transfer (live or bulk transfer)\n"
         ),
         reply_markup=main_menu_keyboard()
     )
@@ -506,12 +506,12 @@ def cmd_menu(message):
     bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
 
 
-@bot.message_handler(func=lambda m: m.text in ["â“ Help", "âš™ï¸ Setup", "ðŸ“¡ Userbot", "ðŸ“‚ Sources", "ðŸŽ¯ Target", "ðŸ§² Monitor", "ðŸš€ Transfer", "ðŸ“Š Status"])
+@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
 def menu_router(message):
     if not is_admin(message.from_user.id):
         return
     text = message.text
-    if text == "â“ Help":
+    if text == "❓ Help":
         bot.reply_to(
             message,
             (
@@ -526,43 +526,43 @@ def menu_router(message):
             ),
             reply_markup=main_menu_keyboard()
         )
-    elif text == "âš™ï¸ Setup":
+    elif text == "⚙️ Setup":
         bot.reply_to(
             message,
             "Setup:\n1) /setapiid <id>\n2) /setapihash <hash>\n3) /login (recommended) or /setsession <session>\n4) /showapi",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸ“¡ Userbot":
+    elif text == "📡 Userbot":
         bot.reply_to(
             message,
             "Userbot controls:\n/startuserbot\n/status",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸ“‚ Sources":
+    elif text == "📂 Sources":
         bot.reply_to(
             message,
             "Source controls:\n/listgroups\n/setsource <chat_id>\n/showsources\n/delsource <chat_id>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸŽ¯ Target":
+    elif text == "🎯 Target":
         bot.reply_to(
             message,
             "Target controls:\n/settarget <chat_id>\n/showtarget",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸ§² Monitor":
+    elif text == "🧲 Monitor":
         bot.reply_to(
             message,
             "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/collectfull <source_chat_id>\n/cancelcollect <source_chat_id>\n/release <source_chat_id> <N>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸš€ Transfer":
+    elif text == "🚀 Transfer":
         bot.reply_to(
             message,
             "Transfer controls:\n/autoon (live forward)\n/autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>",
             reply_markup=main_menu_keyboard()
         )
-    elif text == "ðŸ“Š Status":
+    elif text == "📊 Status":
         cmd_status(message)
 
 
@@ -591,7 +591,7 @@ def cmd_showtarget(message):
     if not is_admin(message.from_user.id):
         return
     t = get_target_ref() or "Not set"
-    bot.reply_to(message, f"ðŸŽ¯ Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, f"🎯 Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["checktarget"])
@@ -636,7 +636,7 @@ def cmd_setapiid(message):
         if api_id <= 0:
             raise ValueError
         set_setting("api_id", api_id)
-        bot.reply_to(message, "âœ… API ID saved.", reply_markup=main_menu_keyboard())
+        bot.reply_to(message, "✅ API ID saved.", reply_markup=main_menu_keyboard())
     except ValueError:
         bot.reply_to(message, "Invalid API ID.")
 
@@ -650,7 +650,7 @@ def cmd_setapihash(message):
         bot.reply_to(message, "Usage: /setapihash <api_hash>")
         return
     set_setting("api_hash", parts[1].strip())
-    bot.reply_to(message, "âœ… API Hash saved.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "✅ API Hash saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["setsession"])
@@ -662,7 +662,7 @@ def cmd_setsession(message):
         bot.reply_to(message, "Usage: /setsession <string_session>")
         return
     set_setting("user_session_string", parts[1].strip())
-    bot.reply_to(message, "âœ… User session saved.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "✅ User session saved.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["showapi"])
@@ -690,7 +690,7 @@ def cmd_clearapi(message):
     set_setting("api_id", "")
     set_setting("api_hash", "")
     set_setting("user_session_string", "")
-    bot.reply_to(message, "ðŸ§¹ Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
+    bot.reply_to(message, "🧹 Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
 
 
 @bot.message_handler(commands=["startuserbot"])
@@ -982,7 +982,7 @@ def cmd_monitoron(message):
         bot.reply_to(message, "Add this as source first: /setsource <chat_id>")
         return
     set_monitor_enabled(chat_id, True)
-    bot.reply_to(message, "âœ… Monitoring enabled for this source.")
+    bot.reply_to(message, "✅ Monitoring enabled for this source.")
 
 
 @bot.message_handler(commands=["monitoroff"])
@@ -1002,7 +1002,7 @@ def cmd_monitoroff(message):
         bot.reply_to(message, "This chat is not in sources.")
         return
     set_monitor_enabled(chat_id, False)
-    bot.reply_to(message, "ðŸ›‘ Monitoring disabled for this source.")
+    bot.reply_to(message, "🛑 Monitoring disabled for this source.")
 
 
 @bot.message_handler(commands=["monitorstatus"])
@@ -1063,7 +1063,7 @@ def cmd_release(message):
         try:
             await userbot.get_chat(target_id)
         except Exception as e:
-            bot.reply_to(message, f"âŒ Cannot access target chat `{target_id}`: {e}", parse_mode="Markdown")
+            bot.reply_to(message, f"❌ Cannot access target chat `{target_id}`: {e}", parse_mode="Markdown")
             return
 
         items = get_unreleased_collected(source_chat_id, n)
@@ -1102,9 +1102,9 @@ def cmd_release(message):
                 if len(fail_reasons) < 5:
                     fail_reasons.append(f"{source_message_id}: {e}")
 
-        summary = f"âœ… Released {sent}/{len(items)} media to target."
+        summary = f"✅ Released {sent}/{len(items)} media to target."
         if failed > 0:
-            summary += f"\nâŒ Failed: {failed}"
+            summary += f"\n❌ Failed: {failed}"
             if fail_reasons:
                 summary += "\n\nFirst errors:\n" + "\n".join(f"- {r}" for r in fail_reasons)
         bot.reply_to(message, summary)
@@ -1151,7 +1151,7 @@ def cmd_collecthistory(message):
                 collected += 1
             await asyncio.sleep(0.05)
         title = get_source_title(source_chat_id) or str(source_chat_id)
-        bot.reply_to(message, f"âœ… Collected `{collected}` new media from `{title}` (scanned `{scanned}` messages).", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Collected `{collected}` new media from `{title}` (scanned `{scanned}` messages).", parse_mode="Markdown")
 
     asyncio.run_coroutine_threadsafe(run_collect(), loop)
     bot.reply_to(message, "Started history collection...")
@@ -1212,7 +1212,7 @@ def cmd_collectall(message):
             per_source_results.append((source_title, source_chat_id, source_collected, source_scanned))
 
         lines = [
-            f"âœ… CollectAll done.",
+            f"✅ CollectAll done.",
             f"Sources: {len(per_source_results)}",
             f"Collected: {total_collected}",
             f"Scanned: {total_scanned}",
@@ -1273,7 +1273,7 @@ def cmd_collectfull(message):
             bot.reply_to(message, f"CollectFull error: {e}")
         finally:
             active_collect_full.pop(key, None)
-            bot.reply_to(message, f"âœ… CollectFull finished for `{source_chat_id}`. Scanned `{scanned}`, collected `{collected}`.", parse_mode="Markdown")
+            bot.reply_to(message, f"✅ CollectFull finished for `{source_chat_id}`. Scanned `{scanned}`, collected `{collected}`.", parse_mode="Markdown")
 
     asyncio.run_coroutine_threadsafe(run_collect_full(), loop)
     bot.reply_to(message, f"Started full history collection for `{source_chat_id}`. Use /cancelcollect {source_chat_id} to stop.", parse_mode="Markdown")
@@ -1691,7 +1691,6 @@ if __name__ == "__main__":
     # Always start pinger; it auto-detects URL (or uses KEEP_ALIVE_URL override)
     threading.Thread(target=keep_alive_worker, daemon=True).start()
     loop.run_until_complete(start_async())
-
 
 
 
