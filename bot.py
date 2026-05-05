@@ -81,14 +81,36 @@ def init_db():
             """
         )
         c.execute(
-            """
+            """\
             CREATE TABLE IF NOT EXISTS source_chats (
                 chat_id INTEGER PRIMARY KEY,
                 title TEXT,
+                monitor_enabled INTEGER DEFAULT 0,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collected_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                media_type TEXT,
+                caption TEXT,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                released INTEGER DEFAULT 0,
+                target_chat_id INTEGER,
+                released_at TIMESTAMP,
+                UNIQUE(source_chat_id, source_message_id)
+            )
+            """
+        )
+        # Migration for older source_chats table
+        try:
+            c.execute("ALTER TABLE source_chats ADD COLUMN monitor_enabled INTEGER DEFAULT 0")
+        except Exception:
+            pass
     logger.info("DB initialized")
 
 
@@ -142,7 +164,7 @@ def add_source_chat(chat_id: int, title: str):
         c = conn.cursor()
         c.execute(
             """
-            INSERT INTO source_chats (chat_id, title) VALUES (?, ?)
+            INSERT INTO source_chats (chat_id, title, monitor_enabled) VALUES (?, ?, 0)
             ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
             """,
             (chat_id, title)
@@ -158,7 +180,7 @@ def remove_source_chat(chat_id: int):
 def list_source_chats():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT chat_id, title FROM source_chats ORDER BY added_at DESC")
+        c.execute("SELECT chat_id, title, monitor_enabled FROM source_chats ORDER BY added_at DESC")
         return c.fetchall()
 
 
@@ -167,6 +189,88 @@ def is_source_chat(chat_id: int) -> bool:
         c = conn.cursor()
         c.execute("SELECT 1 FROM source_chats WHERE chat_id = ?", (chat_id,))
         return c.fetchone() is not None
+
+
+def set_monitor_enabled(chat_id: int, enabled: bool):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE source_chats SET monitor_enabled = ? WHERE chat_id = ?",
+            (1 if enabled else 0, chat_id)
+        )
+        return c.rowcount > 0
+
+
+def is_monitor_enabled(chat_id: int) -> bool:
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT monitor_enabled FROM source_chats WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        return bool(row and int(row[0]) == 1)
+
+
+def save_collected_media(source_chat_id: int, source_message_id: int, media_type: str, caption: str):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT OR IGNORE INTO collected_media (source_chat_id, source_message_id, media_type, caption)
+            VALUES (?, ?, ?, ?)
+            """,
+            (source_chat_id, source_message_id, media_type, caption or "")
+        )
+        return c.rowcount > 0
+
+
+def get_monitor_stats(source_chat_id: int):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) as unreleased,
+                SUM(CASE WHEN released = 1 THEN 1 ELSE 0 END) as released
+            FROM collected_media
+            WHERE source_chat_id = ?
+            """,
+            (source_chat_id,)
+        )
+        row = c.fetchone() or (0, 0, 0)
+        return {
+            "total": int(row[0] or 0),
+            "unreleased": int(row[1] or 0),
+            "released": int(row[2] or 0),
+        }
+
+
+def get_unreleased_collected(source_chat_id: int, limit: int):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, source_message_id, media_type
+            FROM collected_media
+            WHERE source_chat_id = ? AND released = 0
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (source_chat_id, limit)
+        )
+        return c.fetchall()
+
+
+def mark_collected_released(row_id: int, target_chat_id: int):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            UPDATE collected_media
+            SET released = 1, target_chat_id = ?, released_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (target_chat_id, row_id)
+        )
 
 
 # -----------------------------
@@ -195,6 +299,7 @@ def main_menu_keyboard():
         KeyboardButton("🎯 Target")
     )
     kb.add(
+        KeyboardButton("🧲 Monitor"),
         KeyboardButton("🚀 Transfer"),
         KeyboardButton("📊 Status")
     )
@@ -247,8 +352,19 @@ async def forward_from_saved_message(msg: Message) -> bool:
 
 async def saved_media_listener(client: Client, message: Message):
     try:
-        # Process media from configured source chats (including Saved Messages if added)
+        # Process media from configured source chats
         if message.chat and is_source_chat(message.chat.id):
+            if message.media and is_monitor_enabled(message.chat.id):
+                media_type = message.media.value if message.media else "unknown"
+                collected = save_collected_media(
+                    message.chat.id,
+                    message.id,
+                    media_type,
+                    message.caption or ""
+                )
+                if collected:
+                    logger.info(f"Collected media {message.id} from {message.chat.id}")
+            # Optional live-forward mode
             await forward_from_saved_message(message)
     except Exception as e:
         logger.error(f"Listener error: {e}")
@@ -328,7 +444,7 @@ def cmd_menu(message):
     bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
 
 
-@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🚀 Transfer", "📊 Status"])
+@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
 def menu_router(message):
     if not is_admin(message.from_user.id):
         return
@@ -342,6 +458,7 @@ def menu_router(message):
                 "/startuserbot\n/showapi\n/clearapi\n\n"
                 "/settarget <chat_id>\n/showtarget\n"
                 "/setsource <chat_id>\n/delsource <chat_id>\n/showsources\n/listgroups [page]\n\n"
+                "/monitoron <chat_id>\n/monitoroff <chat_id>\n/monitorstatus <chat_id>\n/release <chat_id> <N>\n\n"
                 "/autoon /autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>\n/showmedia <N>\n/clearsent"
             ),
             reply_markup=main_menu_keyboard()
@@ -368,6 +485,12 @@ def menu_router(message):
         bot.reply_to(
             message,
             "Target controls:\n/settarget <chat_id>\n/showtarget",
+            reply_markup=main_menu_keyboard()
+        )
+    elif text == "🧲 Monitor":
+        bot.reply_to(
+            message,
+            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/release <source_chat_id> <N>",
             reply_markup=main_menu_keyboard()
         )
     elif text == "🚀 Transfer":
@@ -737,12 +860,126 @@ def cmd_showsources(message):
         bot.reply_to(message, "No source chats configured. Use /setsource <chat_id>.")
         return
     lines = [f"Configured sources: {len(rows)}", ""]
-    for i, (cid, title) in enumerate(rows, start=1):
-        lines.append(f"{i}. {title or cid} | id={cid}")
+    for i, (cid, title, monitor_enabled) in enumerate(rows, start=1):
+        mon = "ON" if int(monitor_enabled or 0) == 1 else "OFF"
+        lines.append(f"{i}. {title or cid} | id={cid} | monitor={mon}")
     text = "\n".join(lines)
     if len(text) > 3500:
         text = text[:3500] + "\n..."
     bot.reply_to(message, f"<pre>{text}</pre>", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["monitoron"])
+def cmd_monitoron(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /monitoron -1001234567890")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid chat id.")
+        return
+    if not is_source_chat(chat_id):
+        bot.reply_to(message, "Add this as source first: /setsource <chat_id>")
+        return
+    set_monitor_enabled(chat_id, True)
+    bot.reply_to(message, "✅ Monitoring enabled for this source.")
+
+
+@bot.message_handler(commands=["monitoroff"])
+def cmd_monitoroff(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /monitoroff -1001234567890")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid chat id.")
+        return
+    if not is_source_chat(chat_id):
+        bot.reply_to(message, "This chat is not in sources.")
+        return
+    set_monitor_enabled(chat_id, False)
+    bot.reply_to(message, "🛑 Monitoring disabled for this source.")
+
+
+@bot.message_handler(commands=["monitorstatus"])
+def cmd_monitorstatus(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /monitorstatus -1001234567890")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid chat id.")
+        return
+    if not is_source_chat(chat_id):
+        bot.reply_to(message, "This chat is not in sources.")
+        return
+    stats = get_monitor_stats(chat_id)
+    mon = "ON" if is_monitor_enabled(chat_id) else "OFF"
+    bot.reply_to(
+        message,
+        f"Source: `{chat_id}`\nMonitor: `{mon}`\nCollected: `{stats['total']}`\nUnreleased: `{stats['unreleased']}`\nReleased: `{stats['released']}`",
+        parse_mode="Markdown"
+    )
+
+
+@bot.message_handler(commands=["release"])
+def cmd_release(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /release -1001234567890 20")
+        return
+    try:
+        source_chat_id = int(parts[1])
+        n = int(parts[2])
+        if n < 1:
+            bot.reply_to(message, "N must be >= 1")
+            return
+    except ValueError:
+        bot.reply_to(message, "Invalid source chat id or N.")
+        return
+
+    target_raw = get_setting("target_chat_id", "")
+    if not target_raw:
+        bot.reply_to(message, "Set target first with /settarget")
+        return
+    target_id = int(target_raw)
+
+    async def run_release():
+        items = get_unreleased_collected(source_chat_id, n)
+        if not items:
+            bot.reply_to(message, "No unreleased collected media for this source.")
+            return
+        sent = 0
+        for row_id, source_message_id, media_type in items:
+            try:
+                await userbot.copy_message(target_id, source_chat_id, source_message_id)
+                mark_collected_released(row_id, target_id)
+                sent += 1
+                await asyncio.sleep(0.7)
+            except Exception as e:
+                logger.error(f"Release failed for {source_chat_id}:{source_message_id}: {e}")
+        bot.reply_to(message, f"✅ Released {sent}/{len(items)} media to target.")
+
+    asyncio.run_coroutine_threadsafe(run_release(), loop)
+    bot.reply_to(message, "Started release job...")
 
 
 @bot.message_handler(commands=["sendsource"])
