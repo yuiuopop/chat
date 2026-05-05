@@ -159,24 +159,6 @@ def init_db():
                     conn.rollback()
                 else:
                     conn.commit()
-
-            # Migration: Add session_id to sources/targets for multi-session routing
-            for table_name in ["monitored_sources", "target_groups"]:
-                try:
-                    c.execute(f"ALTER TABLE {table_name} ADD COLUMN session_id TEXT DEFAULT 'Legacy'")
-                except Exception:
-                    conn.rollback()
-                else:
-                    conn.commit()
-
-            # Normalize old rows so legacy sources/targets remain visible after multi-session upgrade
-            try:
-                c.execute("UPDATE monitored_sources SET session_id = 'Legacy' WHERE session_id IS NULL OR session_id = ''")
-                c.execute("UPDATE target_groups SET session_id = 'Legacy' WHERE session_id IS NULL OR session_id = ''")
-            except Exception:
-                conn.rollback()
-            else:
-                conn.commit()
             
             # Migrate legacy session
             try:
@@ -346,17 +328,7 @@ def get_all_sources(session_id=None):
         with get_connection() as conn:
             with conn.cursor() as c:
                 if session_id:
-                    c.execute("""
-                        SELECT source_id, title
-                        FROM monitored_sources
-                        WHERE is_active = TRUE
-                          AND (
-                            session_id = %s
-                            OR session_id = 'Legacy'
-                            OR session_id IS NULL
-                            OR session_id = ''
-                          )
-                    """, (session_id,))
+                    c.execute("SELECT source_id, title FROM monitored_sources WHERE is_active = TRUE AND session_id = %s", (session_id,))
                 else:
                     c.execute("SELECT source_id, title FROM monitored_sources WHERE is_active = TRUE")
                 return c.fetchall()
@@ -369,15 +341,7 @@ def get_all_targets(session_id=None):
         with get_connection() as conn:
             with conn.cursor() as c:
                 if session_id:
-                    c.execute("""
-                        SELECT target_id, title
-                        FROM target_groups
-                        WHERE
-                            session_id = %s
-                            OR session_id = 'Legacy'
-                            OR session_id IS NULL
-                            OR session_id = ''
-                    """, (session_id,))
+                    c.execute("SELECT target_id, title FROM target_groups WHERE session_id = %s", (session_id,))
                 else:
                     c.execute("SELECT target_id, title FROM target_groups")
                 return c.fetchall()
@@ -444,13 +408,7 @@ def get_media_stats_by_source(session_id=None):
                             COUNT(sm.id) FILTER (WHERE sm.is_released = TRUE) AS released
                         FROM monitored_sources ms
                         LEFT JOIN saved_media sm ON ms.source_id = sm.source_chat_id
-                        WHERE ms.is_active = TRUE
-                          AND (
-                            ms.session_id = %s
-                            OR ms.session_id = 'Legacy'
-                            OR ms.session_id IS NULL
-                            OR ms.session_id = ''
-                          )
+                        WHERE ms.is_active = TRUE AND ms.session_id = %s
                         GROUP BY ms.source_id, ms.title
                         ORDER BY unreleased DESC
                     """, (session_id,))
@@ -469,62 +427,6 @@ def get_media_stats_by_source(session_id=None):
     except Exception as e:
         logger.error(f"Error fetching media stats by source: {e}")
         return []
-
-def get_source_stats_detail(source_id):
-    """Return source-level details with media counts and mapped target count."""
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("""
-                    SELECT source_id, title, session_id, is_active, live_forward
-                    FROM monitored_sources
-                    WHERE source_id = %s
-                """, (source_id,))
-                src = c.fetchone()
-                if not src:
-                    return None
-
-                c.execute("""
-                    SELECT
-                        COUNT(*) FILTER (WHERE is_released = FALSE) AS unreleased,
-                        COUNT(*) FILTER (WHERE is_released = TRUE) AS released,
-                        COUNT(*) AS total
-                    FROM saved_media
-                    WHERE source_chat_id = %s
-                """, (source_id,))
-                counts = c.fetchone() or (0, 0, 0)
-
-                c.execute("SELECT COUNT(*) FROM source_target_mapping WHERE source_id = %s", (source_id,))
-                mapped_targets = c.fetchone()[0]
-
-                return {
-                    "source_id": src[0],
-                    "title": src[1],
-                    "session_id": src[2] or "Legacy",
-                    "is_active": bool(src[3]),
-                    "live_forward": bool(src[4]),
-                    "unreleased": counts[0] or 0,
-                    "released": counts[1] or 0,
-                    "total": counts[2] or 0,
-                    "mapped_targets": mapped_targets or 0,
-                }
-    except Exception as e:
-        logger.error(f"Error fetching source details for {source_id}: {e}")
-        return None
-
-def get_source_session_id(source_id):
-    """Return owning session_id for a source, or None if missing."""
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as c:
-                c.execute("SELECT session_id FROM monitored_sources WHERE source_id = %s", (source_id,))
-                row = c.fetchone()
-                if not row:
-                    return None
-                return row[0] if row[0] is not None else "Legacy"
-    except Exception as e:
-        logger.error(f"Error fetching source session for {source_id}: {e}")
-        return None
 
 def get_unreleased_media_for_source(source_id):
     """Return all unreleased media items for a specific source."""
@@ -690,8 +592,18 @@ def register_userbot_handlers(client: Client):
     """Attach live listener to the client."""
     @client.on_message(filters.media)
     async def live_listener(c: Client, message: Message):
-        # Always evaluate media here; download_media enforces source/session checks.
-        asyncio.create_task(download_media(c, message))
+        # Allow self-sent media only if it's in a monitored source (like Saved Messages)
+        if message.from_user and message.from_user.is_self:
+            # We don't use ~filters.me anymore, but we must be careful not to loop
+            # Check if this chat is specifically monitored
+            pass 
+        
+        sources = get_all_sources(session_id=c._phone)
+        monitored_ids = [s[0] for s in sources]
+        if message.chat.id in monitored_ids:
+            # Avoid processing messages sent by the bot to targets (if any)
+            # but usually filters.media takes care of it.
+            asyncio.create_task(download_media(c, message))
 
 def passes_filters(message, filters_dict, is_pyrogram=True):
     """Check if a message passes the source filters. Works for Pyrogram and Telebot."""
@@ -765,23 +677,11 @@ async def download_media(client: Client, message: Message):
     monitored_ids = [s[0] for s in sources]
     
     if message.chat.id not in monitored_ids:
-        logger.debug(f"[{getattr(client, '_phone', 'unknown')}] Skip media {message.id} from {message.chat.id}: source not monitored")
-        return
-
-    # Enforce source ownership per session while still allowing legacy/unassigned rows.
-    source_session = get_source_session_id(message.chat.id)
-    current_phone = getattr(client, "_phone", None)
-    if source_session not in (None, "", "Legacy", current_phone):
-        logger.debug(
-            f"[{current_phone}] Skip media {message.id} from {message.chat.id}: "
-            f"source belongs to session '{source_session}'"
-        )
         return
 
     # Check filters
     source_filters = get_source_filters(message.chat.id)
     if not passes_filters(message, source_filters, is_pyrogram=True):
-        logger.debug(f"[{current_phone}] Skip media {message.id} from {message.chat.id}: filter did not pass")
         return
 
     try:
@@ -808,9 +708,6 @@ async def download_media(client: Client, message: Message):
                 logger.info(f"✅ Saved media record for {file_path}")
                 # Check for Live Forward
                 if get_live_forward(message.chat.id):
-                    targets = get_targets_for_source(message.chat.id)
-                    if not targets:
-                        logger.warning(f"⚠️ Live Forward is ON for {message.chat.id} but no mapped targets found.")
                     # Fetch its ID for release
                     with get_connection() as conn:
                         with conn.cursor() as c:
@@ -991,10 +888,6 @@ if bot:
             total_unreleased = sum(s[2] for s in src_stats)
             markup = InlineKeyboardMarkup()
             markup.row(InlineKeyboardButton("📊 Media Statistics", callback_data=f"media_stats_{phone}"))
-            for src_id, title, unreleased, released in src_stats[:6]:
-                total_src = (unreleased or 0) + (released or 0)
-                btn_label = f"📂 {(title or str(src_id))[:20]} • {total_src}"
-                markup.row(InlineKeyboardButton(btn_label, callback_data=f"srcstat_{src_id}"))
             markup.row(InlineKeyboardButton("📁 Browse Joined Chats", callback_data=f"browse_chats_{phone}_0"))
             markup.row(
                 InlineKeyboardButton(f"📂 Sources ({src_count})", callback_data=f"acct_sources_{phone}"),
@@ -1012,7 +905,7 @@ if bot:
                 f"<b>Sources Monitored:</b> {src_count}\n"
                 f"<b>Target Channels:</b> {tgt_count}\n"
                 f"<b>Pending Release:</b> {total_unreleased} items</blockquote>\n\n"
-                f"<i>Tap a source button below or open Media Statistics for all groups/channels.</i>"
+                f"<i>Tap 📊 Media Statistics to see a breakdown per source and release media.</i>"
             )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
@@ -1170,90 +1063,34 @@ if bot:
             callback_handler(call)
 
         elif call.data.startswith("media_stats_"):
-            payload = call.data[len("media_stats_"):]
-            page = 0
-            phone = payload
-            # Supports both old format: media_stats_<phone>
-            # and paged format: media_stats_<page>_<phone>
-            try:
-                parts = payload.split("_", 1)
-                if len(parts) == 2 and parts[0].isdigit():
-                    page = int(parts[0])
-                    phone = parts[1]
-            except Exception:
-                page = 0
-                phone = payload
-
+            phone = call.data[len("media_stats_"):]
             src_stats = get_media_stats_by_source(session_id=phone)
             markup = InlineKeyboardMarkup()
-            per_page = 8
-            total = len(src_stats)
-            total_pages = max(1, (total + per_page - 1) // per_page)
-            if page < 0:
-                page = 0
-            if page >= total_pages:
-                page = total_pages - 1
-            start = page * per_page
-            end = start + per_page
-            page_stats = src_stats[start:end]
             text = (
-                f"<b>?? MEDIA STATISTICS</b> � <code>{phone}</code>\n"
-                f"????????????????????\n\n"
-                f"<i>Select a source/group below to open details and actions.</i>\n"
-                f"<i>Page {page+1}/{total_pages} � Sources: {total}</i>"
+                f"<b>📊 MEDIA STATISTICS</b> \u2014 <code>{phone}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
             )
             if not src_stats:
-                text += "\n\n<i>No sources configured for this account.</i>"
+                text += "<i>No sources configured for this account.</i>"
             else:
-                for src_id, title, unreleased, released in page_stats:
-                    total_src = (unreleased or 0) + (released or 0)
-                    btn_text = f"?? {(title or str(src_id))[:20]} � ??{unreleased or 0} ?{released or 0} ??{total_src}"
-                    markup.row(InlineKeyboardButton(btn_text, callback_data=f"srcstat_{src_id}"))
-                nav = []
-                if page > 0:
-                    nav.append(InlineKeyboardButton("? Prev", callback_data=f"media_stats_{page-1}_{phone}"))
-                if page + 1 < total_pages:
-                    nav.append(InlineKeyboardButton("Next ?", callback_data=f"media_stats_{page+1}_{phone}"))
-                if nav:
-                    markup.row(*nav)
-            markup.row(InlineKeyboardButton("?? Back to Account", callback_data=f"acct_dash_{phone}"))
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
-
-        elif call.data.startswith("srcstat_"):
-            src_id = int(call.data[len("srcstat_"):])
-            details = get_source_stats_detail(src_id)
-            if not details:
-                bot.answer_callback_query(call.id, "Source not found.", show_alert=True)
-                return
-
-            src_title = details["title"] or str(src_id)
-            phone = details["session_id"] or "Legacy"
-            active_text = "Active" if details["is_active"] else "Inactive"
-            live_text = "ON" if details["live_forward"] else "OFF"
-
-            text = (
-                "<b>?? SOURCE DETAILS</b>\n"
-                "????????????????????\n\n"
-                f"<blockquote><b>Name:</b> {src_title}\n"
-                f"<b>Source ID:</b> <code>{src_id}</code>\n"
-                f"<b>Account:</b> <code>{phone}</code>\n"
-                f"<b>Status:</b> {active_text}\n"
-                f"<b>Live Forward:</b> {live_text}\n"
-                f"<b>Mapped Targets:</b> {details['mapped_targets']}\n"
-                f"<b>Unreleased:</b> {details['unreleased']}\n"
-                f"<b>Released:</b> {details['released']}\n"
-                f"<b>Total:</b> {details['total']}</blockquote>"
-            )
-
-            markup = InlineKeyboardMarkup()
-            if details["total"] > 0:
-                markup.row(InlineKeyboardButton(f"?? Browse Media ({details['total']})", callback_data=f"browse_media_{src_id}_0"))
-            if details["unreleased"] > 0:
-                markup.row(InlineKeyboardButton(f"?? Release All ({details['unreleased']})", callback_data=f"release_src_{src_id}"))
-            markup.row(
-                InlineKeyboardButton("?? Source Options", callback_data=f"src_options_{src_id}"),
-                InlineKeyboardButton("?? Back to Stats", callback_data=f"media_stats_{phone}")
-            )
+                for src_id, title, unreleased, released in src_stats:
+                    title_short = (title or str(src_id))[:30]
+                    total_src = unreleased + released
+                    text += f"<blockquote><b>{title_short}</b>\n📦 Unreleased: {unreleased} \u2022 ✅ Released: {released} \u2022 🗂 Total: {total_src}</blockquote>\n"
+                    row = []
+                    if total_src > 0:
+                        row.append(InlineKeyboardButton(
+                            f"📁 Browse ({total_src})",
+                            callback_data=f"browse_media_{src_id}_0"
+                        ))
+                    if unreleased > 0:
+                        row.append(InlineKeyboardButton(
+                            f"🚀 Release ({unreleased})",
+                            callback_data=f"release_src_{src_id}"
+                        ))
+                    if row:
+                        markup.row(*row)
+            markup.row(InlineKeyboardButton("🔙 Back to Account", callback_data=f"acct_dash_{phone}"))
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
         elif call.data.startswith("release_src_"):
@@ -2424,5 +2261,4 @@ if __name__ == "__main__":
         loop.run_until_complete(start_services())
     except KeyboardInterrupt:
         logger.info("System stopped.")
-
 
