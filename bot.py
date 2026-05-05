@@ -512,6 +512,20 @@ def get_source_stats_detail(source_id):
         logger.error(f"Error fetching source details for {source_id}: {e}")
         return None
 
+def get_source_session_id(source_id):
+    """Return owning session_id for a source, or None if missing."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT session_id FROM monitored_sources WHERE source_id = %s", (source_id,))
+                row = c.fetchone()
+                if not row:
+                    return None
+                return row[0] if row[0] is not None else "Legacy"
+    except Exception as e:
+        logger.error(f"Error fetching source session for {source_id}: {e}")
+        return None
+
 def get_unreleased_media_for_source(source_id):
     """Return all unreleased media items for a specific source."""
     try:
@@ -676,20 +690,8 @@ def register_userbot_handlers(client: Client):
     """Attach live listener to the client."""
     @client.on_message(filters.media)
     async def live_listener(c: Client, message: Message):
-        # Allow self-sent media only if it's in a monitored source (like Saved Messages)
-        if message.from_user and message.from_user.is_self:
-            # We don't use ~filters.me anymore, but we must be careful not to loop
-            # Check if this chat is specifically monitored
-            pass 
-        
-        sources = get_all_sources(session_id=c._phone)
-        monitored_ids = [s[0] for s in sources]
-        if not monitored_ids:
-            logger.info(f"[{c._phone}] No monitored sources found for this account yet.")
-        if message.chat.id in monitored_ids:
-            # Avoid processing messages sent by the bot to targets (if any)
-            # but usually filters.media takes care of it.
-            asyncio.create_task(download_media(c, message))
+        # Always evaluate media here; download_media enforces source/session checks.
+        asyncio.create_task(download_media(c, message))
 
 def passes_filters(message, filters_dict, is_pyrogram=True):
     """Check if a message passes the source filters. Works for Pyrogram and Telebot."""
@@ -763,11 +765,23 @@ async def download_media(client: Client, message: Message):
     monitored_ids = [s[0] for s in sources]
     
     if message.chat.id not in monitored_ids:
+        logger.debug(f"[{getattr(client, '_phone', 'unknown')}] Skip media {message.id} from {message.chat.id}: source not monitored")
+        return
+
+    # Enforce source ownership per session while still allowing legacy/unassigned rows.
+    source_session = get_source_session_id(message.chat.id)
+    current_phone = getattr(client, "_phone", None)
+    if source_session not in (None, "", "Legacy", current_phone):
+        logger.debug(
+            f"[{current_phone}] Skip media {message.id} from {message.chat.id}: "
+            f"source belongs to session '{source_session}'"
+        )
         return
 
     # Check filters
     source_filters = get_source_filters(message.chat.id)
     if not passes_filters(message, source_filters, is_pyrogram=True):
+        logger.debug(f"[{current_phone}] Skip media {message.id} from {message.chat.id}: filter did not pass")
         return
 
     try:
@@ -794,6 +808,9 @@ async def download_media(client: Client, message: Message):
                 logger.info(f"✅ Saved media record for {file_path}")
                 # Check for Live Forward
                 if get_live_forward(message.chat.id):
+                    targets = get_targets_for_source(message.chat.id)
+                    if not targets:
+                        logger.warning(f"⚠️ Live Forward is ON for {message.chat.id} but no mapped targets found.")
                     # Fetch its ID for release
                     with get_connection() as conn:
                         with conn.cursor() as c:
