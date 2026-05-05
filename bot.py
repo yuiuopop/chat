@@ -199,6 +199,38 @@ def get_runtime_credentials():
     return final_api_id, final_api_hash, final_session
 
 
+async def start_or_reload_userbot() -> tuple[bool, str]:
+    """Start userbot from DB/env credentials, or reload if already running."""
+    global userbot
+    final_api_id, final_api_hash, final_session = get_runtime_credentials()
+    if not all([final_api_id, final_api_hash, final_session]):
+        return False, "Missing API ID / API Hash / Session."
+
+    try:
+        if userbot is not None:
+            try:
+                await userbot.stop()
+            except Exception:
+                pass
+            userbot = None
+
+        userbot = Client(
+            "saved_forward_userbot",
+            api_id=final_api_id,
+            api_hash=final_api_hash,
+            session_string=final_session,
+            in_memory=True,
+            workers=4,
+        )
+        userbot.add_handler(MessageHandler(saved_media_listener, filters.me & filters.media))
+        await userbot.start()
+        me = await userbot.get_me()
+        return True, f"Userbot running as @{me.username or me.id}"
+    except Exception as e:
+        userbot = None
+        return False, f"Failed to start userbot: {e}"
+
+
 # -----------------------------
 # Admin bot commands
 # -----------------------------
@@ -217,6 +249,7 @@ def cmd_start(message):
             "/setapihash <hash>\n"
             "/setsession <string_session>\n"
             "/login  (generate session string from phone/OTP)\n"
+            "/startuserbot  (start/reload userbot now)\n"
             "/showapi\n"
             "/clearapi\n"
             "/autoon\n"
@@ -318,6 +351,19 @@ def cmd_clearapi(message):
     set_setting("api_hash", "")
     set_setting("user_session_string", "")
     bot.reply_to(message, "Stored API ID/API Hash/Session removed. Restart service to apply.")
+
+
+@bot.message_handler(commands=["startuserbot"])
+def cmd_startuserbot(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    async def run():
+        ok, msg = await start_or_reload_userbot()
+        bot.reply_to(message, msg)
+
+    asyncio.run_coroutine_threadsafe(run(), loop)
+    bot.reply_to(message, "Starting/reloading userbot...")
 
 
 @bot.message_handler(commands=["login"])
@@ -558,22 +604,11 @@ async def start_async():
     if get_setting("auto_forward") is None:
         set_setting("auto_forward", "false")
 
-    final_api_id, final_api_hash, final_session = get_runtime_credentials()
-    if not all([final_api_id, final_api_hash, final_session]):
+    ok, msg = await start_or_reload_userbot()
+    if not ok:
         logger.warning("Userbot credentials incomplete. Admin bot will run; set creds using /setapiid /setapihash /setsession then restart.")
     else:
-        userbot = Client(
-            "saved_forward_userbot",
-            api_id=final_api_id,
-            api_hash=final_api_hash,
-            session_string=final_session,
-            in_memory=True,
-            workers=4,
-        )
-        userbot.add_handler(MessageHandler(saved_media_listener, filters.me & filters.media))
-        await userbot.start()
-        me = await userbot.get_me()
-        logger.info(f"Userbot started as @{me.username or me.id}")
+        logger.info(msg)
 
     # run telebot in thread
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
