@@ -3,6 +3,7 @@ import asyncio
 import threading
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 
 # Pyrogram sync import needs a current event loop on Python 3.10+
@@ -1366,8 +1367,46 @@ def keep_alive_worker():
             logger.warning(f"Keep-alive ping failed: {e}")
         finally:
             # 10 min
-            import time
             time.sleep(600)
+
+
+def run_bot_polling_forever():
+    """Run TeleBot polling forever with auto-restart on crashes/conflicts."""
+    while True:
+        try:
+            logger.info("Starting bot polling loop...")
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=20,
+                long_polling_timeout=20
+            )
+        except Exception as e:
+            logger.error(f"Bot polling crashed, retrying in 5s: {e}")
+            time.sleep(5)
+
+
+def userbot_watchdog():
+    """Keep userbot alive by reloading credentials and restarting when disconnected."""
+    while True:
+        try:
+            if userbot is None:
+                time.sleep(8)
+                continue
+            if not userbot.is_connected:
+                logger.warning("Userbot disconnected. Attempting auto-restart...")
+
+                async def _restart():
+                    ok, msg = await start_or_reload_userbot()
+                    if ok:
+                        logger.info(f"Watchdog restart success: {msg}")
+                    else:
+                        logger.error(f"Watchdog restart failed: {msg}")
+
+                asyncio.run_coroutine_threadsafe(_restart(), loop)
+        except Exception as e:
+            logger.error(f"Userbot watchdog error: {e}")
+        finally:
+            time.sleep(12)
 
 
 # -----------------------------
@@ -1385,9 +1424,12 @@ async def start_async():
     else:
         logger.info(msg)
 
-    # run telebot in thread
-    threading.Thread(target=bot.infinity_polling, daemon=True).start()
-    logger.info("Admin bot polling started")
+    # run resilient telebot polling in thread
+    threading.Thread(target=run_bot_polling_forever, daemon=True).start()
+    logger.info("Admin bot polling watchdog started")
+    # run userbot watchdog
+    threading.Thread(target=userbot_watchdog, daemon=True).start()
+    logger.info("Userbot watchdog started")
 
     await idle()
     if userbot is not None:
