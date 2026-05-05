@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 # Pyrogram sync import needs a current event loop on Python 3.10+
 loop = asyncio.new_event_loop()
@@ -307,11 +308,31 @@ bot = telebot.TeleBot(BOT_TOKEN)
 admin_states = {}
 login_data = {}
 
+# Heartbeats for watchdog supervision
+last_poll_heartbeat = time.time()
+last_userbot_heartbeat = time.time()
+hb_lock = threading.Lock()
+
 
 def is_admin(user_id: int) -> bool:
     if ADMIN_ID == 0:
         return True
     return user_id == ADMIN_ID
+
+
+def set_heartbeat(kind: str):
+    global last_poll_heartbeat, last_userbot_heartbeat
+    now = time.time()
+    with hb_lock:
+        if kind == "poll":
+            last_poll_heartbeat = now
+        elif kind == "userbot":
+            last_userbot_heartbeat = now
+
+
+def get_heartbeats():
+    with hb_lock:
+        return last_poll_heartbeat, last_userbot_heartbeat
 
 
 def main_menu_keyboard():
@@ -378,6 +399,7 @@ async def forward_from_saved_message(msg: Message) -> bool:
 
 async def saved_media_listener(client: Client, message: Message):
     try:
+        set_heartbeat("userbot")
         # Process media from configured source chats
         if message.chat and is_source_chat(message.chat.id):
             if message.media and is_monitor_enabled(message.chat.id):
@@ -1358,11 +1380,49 @@ def run_web():
 
 
 def keep_alive_worker():
+    """
+    Periodically ping this service URL to reduce idle/sleep risk on some hosts.
+    Auto-detects URL from env/providers; KEEP_ALIVE_URL still overrides.
+    """
+    detected_url = ""
+
+    def detect_public_url() -> str:
+        # 1) Explicit override
+        if KEEP_ALIVE_URL.strip():
+            return KEEP_ALIVE_URL.strip().rstrip("/")
+
+        # 2) Common hosting provider envs
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        if render_url:
+            return render_url.rstrip("/")
+
+        railway_url = os.getenv("RAILWAY_STATIC_URL", "").strip()
+        if railway_url:
+            if railway_url.startswith("http://") or railway_url.startswith("https://"):
+                return railway_url.rstrip("/")
+            return f"https://{railway_url}".rstrip("/")
+
+        fly_url = os.getenv("FLY_APP_NAME", "").strip()
+        if fly_url:
+            return f"https://{fly_url}.fly.dev".rstrip("/")
+
+        # 3) Optional custom env
+        web_url = os.getenv("WEB_URL", "").strip()
+        if web_url:
+            return web_url.rstrip("/")
+
+        return ""
+
     while True:
         try:
-            url = KEEP_ALIVE_URL.strip()
+            url = detect_public_url()
+            if url and url != detected_url:
+                detected_url = url
+                logger.info(f"Keep-alive URL detected: {detected_url}")
             if url:
                 requests.get(url, timeout=12)
+            else:
+                logger.info("Keep-alive URL not detected yet; skipping ping cycle.")
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
         finally:
@@ -1375,6 +1435,7 @@ def run_bot_polling_forever():
     while True:
         try:
             logger.info("Starting bot polling loop...")
+            set_heartbeat("poll")
             bot.infinity_polling(
                 skip_pending=True,
                 timeout=20,
@@ -1409,6 +1470,45 @@ def userbot_watchdog():
             time.sleep(12)
 
 
+def supervisor_watchdog():
+    """
+    Strong anti-off supervision:
+    - If poll heartbeat is stale, restart polling thread.
+    - If userbot heartbeat is stale or disconnected, reload userbot.
+    """
+    poll_stale_seconds = 180
+    userbot_stale_seconds = 300
+    while True:
+        try:
+            poll_hb, user_hb = get_heartbeats()
+            now = time.time()
+
+            # Polling stale detector
+            if now - poll_hb > poll_stale_seconds:
+                logger.warning("Polling heartbeat stale. Spawning new polling watchdog thread.")
+                threading.Thread(target=run_bot_polling_forever, daemon=True).start()
+                set_heartbeat("poll")
+
+            # Userbot stale detector
+            if now - user_hb > userbot_stale_seconds:
+                logger.warning("Userbot heartbeat stale. Attempting userbot reload.")
+
+                async def _reload():
+                    ok, msg = await start_or_reload_userbot()
+                    if ok:
+                        logger.info(f"Supervisor reload success: {msg}")
+                        set_heartbeat("userbot")
+                    else:
+                        logger.error(f"Supervisor reload failed: {msg}")
+
+                asyncio.run_coroutine_threadsafe(_reload(), loop)
+                set_heartbeat("userbot")
+        except Exception as e:
+            logger.error(f"Supervisor watchdog error: {e}")
+        finally:
+            time.sleep(30)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1430,6 +1530,9 @@ async def start_async():
     # run userbot watchdog
     threading.Thread(target=userbot_watchdog, daemon=True).start()
     logger.info("Userbot watchdog started")
+    # run global supervisor
+    threading.Thread(target=supervisor_watchdog, daemon=True).start()
+    logger.info("Supervisor watchdog started")
 
     await idle()
     if userbot is not None:
@@ -1438,6 +1541,6 @@ async def start_async():
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    if KEEP_ALIVE_URL:
-        threading.Thread(target=keep_alive_worker, daemon=True).start()
+    # Always start pinger; it auto-detects URL (or uses KEEP_ALIVE_URL override)
+    threading.Thread(target=keep_alive_worker, daemon=True).start()
     loop.run_until_complete(start_async())
