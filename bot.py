@@ -19,7 +19,7 @@ from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 
 load_dotenv()
@@ -341,25 +341,268 @@ def get_heartbeats():
 
 
 def main_menu_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(
+        KeyboardButton("🏠 Dashboard"),
         KeyboardButton("⚙️ Setup"),
         KeyboardButton("📡 Userbot")
     )
     kb.add(
         KeyboardButton("📂 Sources"),
-        KeyboardButton("🎯 Target")
+        KeyboardButton("🎯 Target"),
+        KeyboardButton("🧲 Monitor")
     )
     kb.add(
-        KeyboardButton("🧲 Monitor"),
         KeyboardButton("🚀 Transfer"),
-        KeyboardButton("📊 Status")
+        KeyboardButton("📊 Status"),
+        KeyboardButton("❓ Help")
     )
-    kb.add(KeyboardButton("❓ Help"))
     return kb
 
 
-def build_temp_client(api_id: int, api_hash: str) -> Client:
+def dashboard_inline_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔄 Refresh Stats", callback_data="dash_refresh"),
+        InlineKeyboardButton("📡 Bot Status", callback_data="dash_bot_status")
+    )
+    markup.add(
+        InlineKeyboardButton("📂 Manage Sources", callback_data="sources_list_0"),
+        InlineKeyboardButton("🎯 Target Config", callback_data="target_view")
+    )
+    markup.add(
+        InlineKeyboardButton("🚀 Quick Release", callback_data="quick_release_all"),
+        InlineKeyboardButton("🧹 Clear Sent", callback_data="clear_sent_confirm")
+    )
+    return markup
+
+
+def setup_inline_keyboard():
+    api_id = get_setting("api_id", "") or API_ID
+    api_hash = get_setting("api_hash", "") or API_HASH
+    session_val = get_setting("user_session_string", "") or USER_SESSION_STRING
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    id_status = "✅" if api_id and str(api_id) != "0" else "❌"
+    hash_status = "✅" if api_hash else "❌"
+    sess_status = "✅" if session_val else "❌"
+
+    markup.add(InlineKeyboardButton(f"{id_status} Set API ID", callback_data="setup_api_id"))
+    markup.add(InlineKeyboardButton(f"{hash_status} Set API Hash", callback_data="setup_api_hash"))
+    markup.add(InlineKeyboardButton(f"{sess_status} Login (Session)", callback_data="setup_login"))
+    markup.add(InlineKeyboardButton("🗑 Clear All Credentials", callback_data="setup_clear_confirm"))
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
+
+
+
+def dashboard_text():
+    t = get_target_ref() or "Not set"
+    a = get_setting("auto_forward", "false")
+    sources = list_source_chats()
+    
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM sent_messages")
+        sent_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM collected_media WHERE released = 0")
+        queue_count = c.fetchone()[0]
+
+    poll_hb, user_hb = get_heartbeats()
+    now = time.time()
+    poll_status = "🟢 Active" if now - poll_hb < 180 else "🔴 Stale"
+    userbot_status = "🟢 Active" if (userbot and userbot.is_connected) else "🔴 Offline"
+
+    text = (
+        "💎 *System Dashboard*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 *Bot Status:* {poll_status}\n"
+        f"📡 *Userbot:* {userbot_status}\n\n"
+        f"🎯 *Target:* `{t}`\n"
+        f"⚡ *Auto-Forward:* `{a.upper()}`\n\n"
+        f"📂 *Sources:* `{len(sources)}` configured\n"
+        f"📥 *Queue:* `{queue_count}` unreleased\n"
+        f"📤 *Sent:* `{sent_count}` total\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💡 _Select an option below to manage the system._"
+    )
+    return text
+
+
+def sources_list_keyboard(page=0):
+    rows = list_source_chats()
+    per_page = 5
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    p = min(page, total_pages - 1)
+    chunk = rows[p * per_page:(p + 1) * per_page]
+    
+    markup = InlineKeyboardMarkup()
+    for cid, title, mon in chunk:
+        mon_icon = "🟢" if int(mon or 0) == 1 else "🔴"
+        btn_text = f"{mon_icon} {title or cid}"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"src_manage_{cid}"))
+    
+    # Pagination
+    nav_btns = []
+    if p > 0:
+        nav_btns.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sources_list_{p-1}"))
+    if p < total_pages - 1:
+        nav_btns.append(InlineKeyboardButton("Next ➡️", callback_data=f"sources_list_{p+1}"))
+    if nav_btns:
+        markup.row(*nav_btns)
+        
+    markup.add(InlineKeyboardButton("➕ Add Source", callback_data="sources_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
+
+def source_manage_keyboard(chat_id):
+    mon = is_monitor_enabled(chat_id)
+    stats = get_monitor_stats(chat_id)
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    mon_btn = InlineKeyboardButton("🔴 Disable Monitor" if mon else "🟢 Enable Monitor", callback_data=f"src_toggle_{chat_id}")
+    markup.add(mon_btn)
+    
+    markup.add(
+        InlineKeyboardButton("📥 Scrape History", callback_data=f"src_scrape_{chat_id}"),
+        InlineKeyboardButton("🚀 Release N", callback_data=f"src_release_n_{chat_id}")
+    )
+    markup.add(
+        InlineKeyboardButton("🗑 Remove Source", callback_data=f"src_delete_confirm_{chat_id}"),
+        InlineKeyboardButton("🔙 List", callback_data="sources_list_0")
+    )
+    return markup, stats
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "Unauthorized.")
+        return
+
+    data = call.data
+    
+    if data == "dash_main" or data == "dash_refresh":
+        bot.edit_message_text(
+            dashboard_text(),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=dashboard_inline_keyboard(),
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "Dashboard updated")
+
+    elif data.startswith("sources_list_"):
+        page = int(data.split("_")[-1])
+        bot.edit_message_text(
+            "📂 *Managed Sources*\n\n_Select a source to configure or monitor._",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=sources_list_keyboard(page),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("src_manage_"):
+        cid = int(data.split("_")[-1])
+        kb, stats = source_manage_keyboard(cid)
+        title = get_source_title(cid) or str(cid)
+        mon = "🟢 ON" if is_monitor_enabled(cid) else "🔴 OFF"
+        text = (
+            f"📂 *Source:* `{title}`\n"
+            f"🆔 *ID:* `{cid}`\n\n"
+            f"🛰 *Monitor Status:* {mon}\n"
+            f"📊 *Collected:* `{stats['total']}`\n"
+            f"📥 *Unreleased:* `{stats['unreleased']}`\n"
+            f"📤 *Released:* `{stats['released']}`"
+        )
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("src_toggle_"):
+        cid = int(data.split("_")[-1])
+        new_state = not is_monitor_enabled(cid)
+        set_monitor_enabled(cid, new_state)
+        bot.answer_callback_query(call.id, f"Monitor {'Enabled' if new_state else 'Disabled'}")
+        # Refresh management view
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"src_manage_{cid}", 'message': call.message, 'id': call.id}))
+
+    elif data == "target_view":
+        t = get_target_ref() or "Not set"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔄 Change Target", callback_data="target_change_prompt"))
+        kb.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+        bot.edit_message_text(f"🎯 *Target Configuration*\n\nCurrent Target: `{t}`\n\n_You can also use /settarget <id> directly._", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data == "target_change_prompt":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "Please send the new target chat ID or @username.\n(Example: `-1001234567890`)")
+
+    elif data == "sources_add_start":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "Please send the chat ID of the new source.\n(Use /listgroups to find IDs)")
+
+    elif data.startswith("src_delete_confirm_"):
+        cid = int(data.split("_")[-1])
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"src_delete_do_{cid}"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"src_manage_{cid}"))
+        bot.edit_message_text(f"⚠️ *Confirm Removal*\n\nAre you sure you want to remove this source?\n`{cid}`", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("src_delete_do_"):
+        cid = int(data.split("_")[-1])
+        remove_source_chat(cid)
+        bot.answer_callback_query(call.id, "Source removed")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "sources_list_0", 'message': call.message, 'id': call.id}))
+
+    elif data == "dash_bot_status":
+        bot.answer_callback_query(call.id, "Refreshing connection info...")
+        # (This could trigger a quick check or just refresh the dash)
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
+
+    elif data == "clear_sent_confirm":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Confirm Clear", callback_data="clear_sent_do"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
+        bot.edit_message_text("🧹 *Confirm Clear*\n\nThis will clear all sent-message history, allowing you to resend the same media.", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data == "clear_sent_do":
+        clear_sent_records()
+        bot.answer_callback_query(call.id, "History cleared")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
+    
+    elif data == "quick_release_all":
+        bot.answer_callback_query(call.id, "Use /release <source> <N> for now.")
+        # Future: implement a bulk release for all sources
+
+    elif data == "setup_api_id":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "Please use /setapiid <your_api_id> to update it.")
+    
+    elif data == "setup_api_hash":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "Please use /setapihash <your_api_hash> to update it.")
+    
+    elif data == "setup_login":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "🚀 Starting login process...\nPlease use /login to begin.")
+
+    elif data == "setup_clear_confirm":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Confirm Clear", callback_data="setup_clear_do"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
+        bot.edit_message_text("⚠️ *Confirm Wipe*\n\nThis will remove all API credentials and session strings from the database.", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data == "setup_clear_do":
+        set_setting("api_id", "")
+        set_setting("api_hash", "")
+        set_setting("user_session_string", "")
+        bot.answer_callback_query(call.id, "Credentials wiped")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
+
+
     return Client(
         name=":memory:",
         api_id=api_id,
@@ -485,17 +728,16 @@ def cmd_start(message):
         return
     bot.reply_to(
         message,
-        (
-            "Welcome to Source ➜ Target Forward Bot\n\n"
-            "Use the buttons below for guided actions.\n"
-            "Quick start:\n"
-            "1) ⚙️ Setup (API + Session)\n"
-            "2) 📡 Userbot (start it)\n"
-            "3) 🎯 Target (set target chat)\n"
-            "4) 📂 Sources (add source chats)\n"
-            "5) 🚀 Transfer (live or bulk transfer)\n"
-        ),
+        dashboard_text(),
+        parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
+    )
+    # Also send the inline dashboard for immediate interaction
+    bot.send_message(
+        message.chat.id,
+        "🎮 *Interactive Control Panel*",
+        reply_markup=dashboard_inline_keyboard(),
+        parse_mode="Markdown"
     )
 
 
@@ -506,12 +748,15 @@ def cmd_menu(message):
     bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
 
 
-@bot.message_handler(func=lambda m: m.text in ["❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
+@bot.message_handler(func=lambda m: m.text in ["🏠 Dashboard", "❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
 def menu_router(message):
     if not is_admin(message.from_user.id):
         return
     text = message.text
-    if text == "❓ Help":
+    if text == "🏠 Dashboard":
+        bot.reply_to(message, dashboard_text(), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        bot.send_message(message.chat.id, "🎮 *Interactive Control Panel*", reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
+    elif text == "❓ Help":
         bot.reply_to(
             message,
             (
@@ -529,8 +774,9 @@ def menu_router(message):
     elif text == "⚙️ Setup":
         bot.reply_to(
             message,
-            "Setup:\n1) /setapiid <id>\n2) /setapihash <hash>\n3) /login (recommended) or /setsession <session>\n4) /showapi",
-            reply_markup=main_menu_keyboard()
+            "⚙️ *System Configuration*\n\nFollow the steps below to connect your Telegram account. You need an API ID and Hash from [my.telegram.org](https://my.telegram.org).",
+            parse_mode="Markdown",
+            reply_markup=setup_inline_keyboard()
         )
     elif text == "📡 Userbot":
         bot.reply_to(
@@ -541,20 +787,27 @@ def menu_router(message):
     elif text == "📂 Sources":
         bot.reply_to(
             message,
-            "Source controls:\n/listgroups\n/setsource <chat_id>\n/showsources\n/delsource <chat_id>",
-            reply_markup=main_menu_keyboard()
+            "📂 *Managed Sources*\n\n_Select a source to configure or monitor._",
+            parse_mode="Markdown",
+            reply_markup=sources_list_keyboard(0)
         )
     elif text == "🎯 Target":
+        t = get_target_ref() or "Not set"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔄 Change Target", callback_data="target_change_prompt"))
+        kb.add(InlineKeyboardButton("🔙 Dashboard", callback_data="dash_main"))
         bot.reply_to(
             message,
-            "Target controls:\n/settarget <chat_id>\n/showtarget",
-            reply_markup=main_menu_keyboard()
+            f"🎯 *Target Configuration*\n\nCurrent Target: `{t}`",
+            parse_mode="Markdown",
+            reply_markup=kb
         )
     elif text == "🧲 Monitor":
         bot.reply_to(
             message,
-            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/collectfull <source_chat_id>\n/cancelcollect <source_chat_id>\n/release <source_chat_id> <N>",
-            reply_markup=main_menu_keyboard()
+            "🧲 *Monitoring Console*\n\n_Manage which sources are currently being watched for new media._",
+            parse_mode="Markdown",
+            reply_markup=sources_list_keyboard(0)
         )
     elif text == "🚀 Transfer":
         bot.reply_to(
@@ -563,7 +816,7 @@ def menu_router(message):
             reply_markup=main_menu_keyboard()
         )
     elif text == "📊 Status":
-        cmd_status(message)
+        bot.reply_to(message, dashboard_text(), parse_mode="Markdown", reply_markup=dashboard_inline_keyboard())
 
 
 @bot.message_handler(commands=["settarget"])
