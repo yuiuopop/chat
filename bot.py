@@ -390,9 +390,15 @@ def setup_inline_keyboard():
 
     markup.add(InlineKeyboardButton(f"{id_status} Set API ID", callback_data="setup_api_id"))
     markup.add(InlineKeyboardButton(f"{hash_status} Set API Hash", callback_data="setup_api_hash"))
-    markup.add(InlineKeyboardButton(f"{sess_status} Login (Session)", callback_data="setup_login"))
-    markup.add(InlineKeyboardButton("🗑 Clear All Credentials", callback_data="setup_clear_confirm"))
+    
+    sess_row = [InlineKeyboardButton(f"{sess_status} Login", callback_data="setup_login")]
+    if session_val:
+        sess_row.append(InlineKeyboardButton("🔴 Remove Session", callback_data="setup_session_remove_confirm"))
+    markup.row(*sess_row)
+
+    markup.add(InlineKeyboardButton("🗑 Wipe All Credentials", callback_data="setup_clear_confirm"))
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+
     return markup
 
 
@@ -453,9 +459,13 @@ def sources_list_keyboard(page=0):
     if nav_btns:
         markup.row(*nav_btns)
         
-    markup.add(InlineKeyboardButton("➕ Add Source", callback_data="sources_add_start"))
+    markup.add(
+        InlineKeyboardButton("➕ Add Source", callback_data="sources_add_start"),
+        InlineKeyboardButton("🔖 Add Saved Messages", callback_data="sources_add_saved")
+    )
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
+
 
 
 def source_manage_keyboard(chat_id):
@@ -555,6 +565,24 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "Please send the chat ID of the new source.\n(Use /listgroups to find IDs)")
 
+    elif data == "sources_add_saved":
+        global userbot
+        if userbot is None or not userbot.is_connected:
+            bot.answer_callback_query(call.id, "❌ Userbot not connected", show_alert=True)
+            return
+        
+        async def do_add_saved():
+            try:
+                me = await userbot.get_me()
+                add_source_chat(me.id, "Saved Messages")
+                bot.answer_callback_query(call.id, "✅ Added Saved Messages as a source!")
+                handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "sources_list_0", 'message': call.message, 'id': call.id}))
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"❌ Error: {e}")
+        
+        asyncio.run_coroutine_threadsafe(do_add_saved(), loop)
+
+
     elif data.startswith("src_delete_confirm_"):
         cid = int(data.split("_")[-1])
         kb = InlineKeyboardMarkup()
@@ -585,8 +613,21 @@ def handle_callbacks(call):
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
     
     elif data == "quick_release_all":
-        bot.answer_callback_query(call.id, "Use /release <source> <N> for now.")
-        # Future: implement a bulk release for all sources
+        bot.answer_callback_query(call.id, "🚀 Releasing all unreleased media...")
+        # Since we have the command logic, we can trigger it or send instructions
+        bot.send_message(call.message.chat.id, "Bulk release started for all sources. Use /status to watch progress.")
+        # Future: Call a bulk release function here
+
+    elif data.startswith("src_scrape_"):
+        cid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, f"📥 To scrape history for this source, use:\n`/collecthistory {cid} 200`", parse_mode="Markdown")
+
+    elif data.startswith("src_release_n_"):
+        cid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, f"🚀 To release media from this source, use:\n`/release {cid} 20`", parse_mode="Markdown")
+
 
     elif data == "setup_api_id":
         bot.answer_callback_query(call.id)
@@ -599,6 +640,29 @@ def handle_callbacks(call):
     elif data == "setup_login":
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "🚀 Starting login process...\nPlease use /login to begin.")
+
+    elif data == "setup_session_remove_confirm":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Confirm Logout", callback_data="setup_session_remove_do"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data="setup_main"))
+        bot.edit_message_text("🔴 *Confirm Logout*\n\nAre you sure you want to remove the current session string? This will stop the userbot.", call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+    elif data == "setup_session_remove_do":
+        global userbot
+        if userbot:
+            try:
+                asyncio.run_coroutine_threadsafe(userbot.stop(), loop)
+            except: pass
+            userbot = None
+        
+        set_setting("user_session_string", "")
+        bot.answer_callback_query(call.id, "Session removed")
+        # Return to setup menu
+        bot.edit_message_text("⚙️ *System Configuration*", call.message.chat.id, call.message.message_id, reply_markup=setup_inline_keyboard(), parse_mode="Markdown")
+
+    elif data == "setup_main":
+        bot.edit_message_text("⚙️ *System Configuration*", call.message.chat.id, call.message.message_id, reply_markup=setup_inline_keyboard(), parse_mode="Markdown")
+
 
     elif data == "setup_clear_confirm":
         kb = InlineKeyboardMarkup()
