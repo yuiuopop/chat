@@ -5,6 +5,10 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 
+# Pyrogram sync import needs a current event loop on Python 3.10+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 import requests
 from flask import Flask
 from dotenv import load_dotenv
@@ -36,10 +40,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("saved_to_target_userbot")
-
-# Dedicated event loop for Pyrogram tasks
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
 
 
 # -----------------------------
