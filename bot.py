@@ -14,7 +14,7 @@ from flask import Flask
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import RPCError
+from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
 import telebot
 
@@ -126,12 +126,24 @@ def mark_sent(source_message_id, target_chat_id):
 # -----------------------------
 userbot = None
 bot = telebot.TeleBot(BOT_TOKEN)
+admin_states = {}
+login_data = {}
 
 
 def is_admin(user_id: int) -> bool:
     if ADMIN_ID == 0:
         return True
     return user_id == ADMIN_ID
+
+
+def build_temp_client(api_id: int, api_hash: str) -> Client:
+    return Client(
+        name=":memory:",
+        api_id=api_id,
+        api_hash=api_hash,
+        in_memory=True,
+        workers=2,
+    )
 
 
 async def forward_from_saved_message(msg: Message) -> bool:
@@ -204,6 +216,7 @@ def cmd_start(message):
             "/setapiid <id>\n"
             "/setapihash <hash>\n"
             "/setsession <string_session>\n"
+            "/login  (generate session string from phone/OTP)\n"
             "/showapi\n"
             "/clearapi\n"
             "/autoon\n"
@@ -305,6 +318,124 @@ def cmd_clearapi(message):
     set_setting("api_hash", "")
     set_setting("user_session_string", "")
     bot.reply_to(message, "Stored API ID/API Hash/Session removed. Restart service to apply.")
+
+
+@bot.message_handler(commands=["login"])
+def cmd_login(message):
+    if not is_admin(message.from_user.id):
+        return
+    uid = message.from_user.id
+    admin_states[uid] = "awaiting_phone"
+    login_data[uid] = {}
+    bot.reply_to(message, "Send phone number with country code.\nExample: `+14155550123`", parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states, content_types=["text"])
+def login_state_handler(message):
+    uid = message.from_user.id
+    state = admin_states.get(uid)
+    if not state:
+        return
+
+    if state == "awaiting_phone":
+        phone = message.text.strip()
+        api_id, api_hash, _ = get_runtime_credentials()
+        if not api_id or not api_hash:
+            bot.reply_to(message, "Set API credentials first: /setapiid and /setapihash")
+            admin_states.pop(uid, None)
+            login_data.pop(uid, None)
+            return
+
+        async def send_code():
+            try:
+                tmp = build_temp_client(api_id, api_hash)
+                await tmp.connect()
+                sent = await tmp.send_code(phone)
+                login_data[uid] = {
+                    "phone": phone,
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "tmp_client": tmp,
+                    "phone_code_hash": sent.phone_code_hash
+                }
+                admin_states[uid] = "awaiting_otp"
+                bot.reply_to(message, "OTP sent. Send the code (digits only).")
+            except Exception as e:
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                bot.reply_to(message, f"Failed to send OTP: {e}")
+
+        asyncio.run_coroutine_threadsafe(send_code(), loop)
+        return
+
+    if state == "awaiting_otp":
+        otp = message.text.strip().replace(" ", "")
+        data = login_data.get(uid, {})
+        tmp: Client = data.get("tmp_client")
+        if not tmp:
+            bot.reply_to(message, "Login session expired. Run /login again.")
+            admin_states.pop(uid, None)
+            login_data.pop(uid, None)
+            return
+
+        async def sign_in():
+            try:
+                await tmp.sign_in(
+                    phone_number=data["phone"],
+                    phone_code_hash=data["phone_code_hash"],
+                    phone_code=otp
+                )
+                s = await tmp.export_session_string()
+                set_setting("user_session_string", s)
+                await tmp.disconnect()
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                bot.reply_to(message, "Session generated and saved.\nRestart service to apply.")
+            except SessionPasswordNeeded:
+                admin_states[uid] = "awaiting_2fa"
+                bot.reply_to(message, "2FA enabled. Send your Telegram 2FA password.")
+            except Exception as e:
+                try:
+                    await tmp.disconnect()
+                except Exception:
+                    pass
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                bot.reply_to(message, f"Login failed: {e}")
+
+        asyncio.run_coroutine_threadsafe(sign_in(), loop)
+        return
+
+    if state == "awaiting_2fa":
+        password = message.text.strip()
+        data = login_data.get(uid, {})
+        tmp: Client = data.get("tmp_client")
+        if not tmp:
+            bot.reply_to(message, "Login session expired. Run /login again.")
+            admin_states.pop(uid, None)
+            login_data.pop(uid, None)
+            return
+
+        async def finish_2fa():
+            try:
+                await tmp.check_password(password)
+                s = await tmp.export_session_string()
+                set_setting("user_session_string", s)
+                await tmp.disconnect()
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                bot.reply_to(message, "Session generated and saved.\nRestart service to apply.")
+            except Exception as e:
+                try:
+                    await tmp.disconnect()
+                except Exception:
+                    pass
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                bot.reply_to(message, f"2FA failed: {e}")
+
+        asyncio.run_coroutine_threadsafe(finish_2fa(), loop)
+        return
 
 
 @bot.message_handler(commands=["autoon"])
