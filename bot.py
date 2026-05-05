@@ -46,7 +46,24 @@ logger = logging.getLogger("saved_to_target_userbot")
 # -----------------------------
 # DB (single-file sqlite)
 # -----------------------------
-DB_PATH = "saved_to_target.db"
+# Use persistent disk path on Render when provided.
+# Set one of these env vars on Render:
+#   DATA_DIR=/var/data
+# or SQLITE_DB_PATH=/var/data/saved_to_target.db
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "").strip()
+DATA_DIR = os.getenv("DATA_DIR", "").strip()
+
+if SQLITE_DB_PATH:
+    DB_PATH = SQLITE_DB_PATH
+elif DATA_DIR:
+    DB_PATH = os.path.join(DATA_DIR, "saved_to_target.db")
+else:
+    DB_PATH = "saved_to_target.db"
+
+# Ensure parent dir exists when absolute/custom path is used
+db_parent = os.path.dirname(DB_PATH)
+if db_parent:
+    os.makedirs(db_parent, exist_ok=True)
 
 
 @contextmanager
@@ -81,7 +98,7 @@ def init_db():
             """
         )
         c.execute(
-            """\
+            """
             CREATE TABLE IF NOT EXISTS source_chats (
                 chat_id INTEGER PRIMARY KEY,
                 title TEXT,
@@ -207,6 +224,14 @@ def is_monitor_enabled(chat_id: int) -> bool:
         c.execute("SELECT monitor_enabled FROM source_chats WHERE chat_id = ?", (chat_id,))
         row = c.fetchone()
         return bool(row and int(row[0]) == 1)
+
+
+def get_source_title(chat_id: int):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT title FROM source_chats WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        return row[0] if row else None
 
 
 def save_collected_media(source_chat_id: int, source_message_id: int, media_type: str, caption: str):
@@ -363,7 +388,11 @@ async def saved_media_listener(client: Client, message: Message):
                     message.caption or ""
                 )
                 if collected:
-                    logger.info(f"Collected media {message.id} from {message.chat.id}")
+                    logger.info(f"Collected media {message.id} ({media_type}) from source {message.chat.id}")
+                else:
+                    logger.info(f"Skipped collect for {message.chat.id}:{message.id} (already in queue)")
+            elif message.media:
+                logger.info(f"Media seen in source {message.chat.id} but monitor is OFF")
             # Optional live-forward mode
             await forward_from_saved_message(message)
     except Exception as e:
@@ -404,7 +433,9 @@ async def start_or_reload_userbot() -> tuple[bool, str]:
             in_memory=True,
             workers=4,
         )
-        userbot.add_handler(MessageHandler(saved_media_listener, filters.me & filters.media))
+        # Important: do NOT use filters.me here, otherwise we only receive our own messages
+        # and monitoring from source groups/channels won't work.
+        userbot.add_handler(MessageHandler(saved_media_listener, filters.media))
         await userbot.start()
         me = await userbot.get_me()
         return True, f"Userbot running as @{me.username or me.id}"
@@ -459,6 +490,7 @@ def menu_router(message):
                 "/settarget <chat_id>\n/showtarget\n"
                 "/setsource <chat_id>\n/delsource <chat_id>\n/showsources\n/listgroups [page]\n\n"
                 "/monitoron <chat_id>\n/monitoroff <chat_id>\n/monitorstatus <chat_id>\n/release <chat_id> <N>\n\n"
+                "/collecthistory <chat_id> <N>\n/collectall <N_per_source>\n\n"
                 "/autoon /autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>\n/showmedia <N>\n/clearsent"
             ),
             reply_markup=main_menu_keyboard()
@@ -490,7 +522,7 @@ def menu_router(message):
     elif text == "🧲 Monitor":
         bot.reply_to(
             message,
-            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/release <source_chat_id> <N>",
+            "Monitor controls:\n/monitoron <source_chat_id>\n/monitoroff <source_chat_id>\n/monitorstatus <source_chat_id>\n/collecthistory <source_chat_id> <N>\n/collectall <N_per_source>\n/release <source_chat_id> <N>",
             reply_markup=main_menu_keyboard()
         )
     elif text == "🚀 Transfer":
@@ -980,6 +1012,122 @@ def cmd_release(message):
 
     asyncio.run_coroutine_threadsafe(run_release(), loop)
     bot.reply_to(message, "Started release job...")
+
+
+@bot.message_handler(commands=["collecthistory"])
+def cmd_collecthistory(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /collecthistory -1001234567890 200")
+        return
+    try:
+        source_chat_id = int(parts[1])
+        n = int(parts[2])
+        if n < 1:
+            bot.reply_to(message, "N must be >= 1")
+            return
+    except ValueError:
+        bot.reply_to(message, "Invalid source chat id or N.")
+        return
+    if not is_source_chat(source_chat_id):
+        bot.reply_to(message, "Add this source first with /setsource <chat_id>.")
+        return
+
+    async def run_collect():
+        collected = 0
+        scanned = 0
+        async for m in userbot.get_chat_history(source_chat_id, limit=n):
+            scanned += 1
+            if not m.media:
+                continue
+            media_type = m.media.value if m.media else "unknown"
+            ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or "")
+            if ok:
+                collected += 1
+            await asyncio.sleep(0.05)
+        title = get_source_title(source_chat_id) or str(source_chat_id)
+        bot.reply_to(message, f"✅ Collected `{collected}` new media from `{title}` (scanned `{scanned}` messages).", parse_mode="Markdown")
+
+    asyncio.run_coroutine_threadsafe(run_collect(), loop)
+    bot.reply_to(message, "Started history collection...")
+
+
+@bot.message_handler(commands=["collectall"])
+def cmd_collectall(message):
+    global userbot
+    if not is_admin(message.from_user.id):
+        return
+    if userbot is None:
+        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /collectall 500")
+        return
+    try:
+        per_source_limit = int(parts[1])
+        if per_source_limit < 1:
+            bot.reply_to(message, "N_per_source must be >= 1")
+            return
+    except ValueError:
+        bot.reply_to(message, "Invalid N_per_source.")
+        return
+
+    sources = list_source_chats()
+    if not sources:
+        bot.reply_to(message, "No sources configured. Add with /setsource first.")
+        return
+
+    async def run_collectall():
+        total_collected = 0
+        total_scanned = 0
+        per_source_results = []
+
+        for source_row in sources:
+            source_chat_id = int(source_row[0])
+            source_title = source_row[1] or str(source_chat_id)
+            source_collected = 0
+            source_scanned = 0
+            try:
+                async for m in userbot.get_chat_history(source_chat_id, limit=per_source_limit):
+                    source_scanned += 1
+                    if not m.media:
+                        continue
+                    media_type = m.media.value if m.media else "unknown"
+                    ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or "")
+                    if ok:
+                        source_collected += 1
+                    await asyncio.sleep(0.03)
+            except Exception as e:
+                logger.error(f"collectall failed for {source_chat_id}: {e}")
+
+            total_collected += source_collected
+            total_scanned += source_scanned
+            per_source_results.append((source_title, source_chat_id, source_collected, source_scanned))
+
+        lines = [
+            f"✅ CollectAll done.",
+            f"Sources: {len(per_source_results)}",
+            f"Collected: {total_collected}",
+            f"Scanned: {total_scanned}",
+            ""
+        ]
+        for title, cid, ccount, scount in per_source_results:
+            lines.append(f"- {title} ({cid}): +{ccount} collected, {scount} scanned")
+        text = "\n".join(lines)
+        if len(text) > 3500:
+            text = text[:3500] + "\n..."
+        bot.reply_to(message, f"<pre>{text}</pre>", parse_mode="HTML")
+
+    asyncio.run_coroutine_threadsafe(run_collectall(), loop)
+    bot.reply_to(message, f"Started collect-all for {len(sources)} source(s)...")
 
 
 @bot.message_handler(commands=["sendsource"])
