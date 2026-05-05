@@ -372,9 +372,26 @@ def dashboard_inline_keyboard():
     )
     markup.add(
         InlineKeyboardButton("🚀 Quick Release", callback_data="quick_release_all"),
-        InlineKeyboardButton("🧹 Clear Sent", callback_data="clear_sent_confirm")
+        InlineKeyboardButton("⚙️ Settings", callback_data="settings_main")
     )
     return markup
+
+
+def settings_inline_keyboard():
+    mode = get_setting("forward_mode", "media")
+    auto = get_setting("auto_forward", "false")
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    mode_text = "📑 Mode: Everything" if mode == "all" else "🖼 Mode: Media Only"
+    auto_text = "⚡ Auto-Forward: ON" if auto == "true" else "💤 Auto-Forward: OFF"
+    
+    markup.add(InlineKeyboardButton(mode_text, callback_data="settings_toggle_mode"))
+    markup.add(InlineKeyboardButton(auto_text, callback_data="settings_toggle_auto"))
+    markup.add(InlineKeyboardButton("🧹 Clear Sent History", callback_data="clear_sent_confirm"))
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
 
 
 def setup_inline_keyboard():
@@ -421,13 +438,17 @@ def dashboard_text():
     poll_status = "🟢 Active" if now - poll_hb < 180 else "🔴 Stale"
     userbot_status = "🟢 Active" if (userbot and userbot.is_connected) else "🔴 Offline"
 
+    m = get_setting("forward_mode", "media")
+    mode_label = "📑 EVERYTHING" if m == "all" else "🖼 MEDIA ONLY"
+
     text = (
         "💎 *System Dashboard*\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🤖 *Bot Status:* {poll_status}\n"
         f"📡 *Userbot:* {userbot_status}\n\n"
         f"🎯 *Target:* `{t}`\n"
-        f"⚡ *Auto-Forward:* `{a.upper()}`\n\n"
+        f"⚡ *Auto-Forward:* `{a.upper()}`\n"
+        f"🛠 *Filter Mode:* `{mode_label}`\n\n"
         f"📂 *Sources:* `{len(sources)}` configured\n"
         f"📥 *Queue:* `{queue_count}` unreleased\n"
         f"📤 *Sent:* `{sent_count}` total\n"
@@ -435,6 +456,7 @@ def dashboard_text():
         "💡 _Select an option below to manage the system._"
     )
     return text
+
 
 
 def sources_list_keyboard(page=0):
@@ -560,6 +582,24 @@ def handle_callbacks(call):
     elif data == "target_change_prompt":
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "Please send the new target chat ID or @username.\n(Example: `-1001234567890`)")
+
+    elif data == "settings_main":
+        bot.edit_message_text("⚙️ *System Settings*", call.message.chat.id, call.message.message_id, reply_markup=settings_inline_keyboard(), parse_mode="Markdown")
+
+    elif data == "settings_toggle_mode":
+        current = get_setting("forward_mode", "media")
+        new = "all" if current == "media" else "media"
+        set_setting("forward_mode", new)
+        bot.answer_callback_query(call.id, f"Mode set to {new.upper()}")
+        bot.edit_message_text("⚙️ *System Settings*", call.message.chat.id, call.message.message_id, reply_markup=settings_inline_keyboard(), parse_mode="Markdown")
+
+    elif data == "settings_toggle_auto":
+        current = get_setting("auto_forward", "false")
+        new = "true" if current == "false" else "false"
+        set_setting("auto_forward", new)
+        bot.answer_callback_query(call.id, f"Auto-Forward {'Enabled' if new == 'true' else 'Disabled'}")
+        bot.edit_message_text("⚙️ *System Settings*", call.message.chat.id, call.message.message_id, reply_markup=settings_inline_keyboard(), parse_mode="Markdown")
+
 
     elif data == "sources_add_start":
         bot.answer_callback_query(call.id)
@@ -690,10 +730,12 @@ async def forward_from_saved_message(msg: Message) -> bool:
         return False
     if str(get_setting("auto_forward", "false")).lower() != "true":
         return False
-    if not msg.media:
+    # If mode is media-only, skip text messages
+    if get_setting("forward_mode", "media") == "media" and not msg.media:
         return False
     if already_sent(msg.id):
         return False
+
 
     target_id = target_raw
     source_chat_id = msg.chat.id if msg.chat else None
@@ -722,14 +764,18 @@ async def saved_media_listener(client: Client, message: Message):
         set_heartbeat("userbot")
         # Process media from configured source chats
         if message.chat and is_source_chat(message.chat.id):
-            if message.media and is_monitor_enabled(message.chat.id):
-                media_type = message.media.value if message.media else "unknown"
+            mode = get_setting("forward_mode", "media")
+            is_media = bool(message.media)
+            
+            if (mode == "all" or is_media) and is_monitor_enabled(message.chat.id):
+                media_type = message.media.value if is_media else "text"
                 collected = save_collected_media(
                     message.chat.id,
                     message.id,
                     media_type,
-                    message.caption or ""
+                    message.caption or message.text or ""
                 )
+
                 if collected:
                     logger.info(f"Collected media {message.id} ({media_type}) from source {message.chat.id}")
                 else:
@@ -778,8 +824,10 @@ async def start_or_reload_userbot() -> tuple[bool, str]:
         )
         # Important: do NOT use filters.me here, otherwise we only receive our own messages
         # and monitoring from source groups/channels won't work.
-        userbot.add_handler(MessageHandler(saved_media_listener, filters.media))
+        # Register handler for all messages (not just media) to allow text forwarding
+        userbot.add_handler(MessageHandler(saved_media_listener))
         await userbot.start()
+
         me = await userbot.get_me()
         return True, f"Userbot running as @{me.username or me.id}"
     except Exception as e:
