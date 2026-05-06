@@ -645,8 +645,26 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
-        bot.answer_callback_query(call.id, "🚀 Starting Release...")
-        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid), loop)
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("⚡ Instant Release", callback_data=f"pair_rel_now_{pid}"),
+            InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{pid}")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
+        bot.edit_message_text("🚀 **Release Engine**\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("pair_rel_now_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🚀 Starting Instant Release...")
+        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, interval=1.5), loop)
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("pair_rel_slow_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = f"rel_setup_interval_{pid}"
+        bot.send_message(call.message.chat.id, "⏰ **Slow Release Setup**\n\nEnter the **interval** between items in seconds:\n(Example: `60` for 1 minute, `300` for 5 minutes)")
 
     elif data.startswith("pair_delete_confirm_"):
         pid = int(data.split("_")[-1])
@@ -868,6 +886,16 @@ def handle_state_inputs(message):
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
+    elif state.startswith("rel_setup_interval_"):
+        pid = int(state.split("_")[-1])
+        if not text.isdigit():
+            bot.reply_to(message, "Please send a number.")
+            return
+        interval = int(text)
+        admin_states.pop(uid)
+        bot.send_message(message.chat.id, f"🚀 **Slow Release Started**\nPair: `{pid}` | Interval: `{interval}s`")
+        asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, interval=interval), loop)
+
     # --- History Scraper Flow ---
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
@@ -1029,62 +1057,67 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_release(admin_chat_id, pair_id):
+async def run_release(admin_chat_id, pair_id, interval=1.2):
     if not userbot: return
     task_key = f"rel_{pair_id}"
     running_tasks[task_key] = True
     
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"SELECT source_id, target_id FROM target_pairs WHERE id = {p}", (pair_id,))
-        row = c.fetchone()
-    
-    if not row: return
-    sid, tid_ref = row
-    
     try:
-        target_chat = await resolve_target_id(userbot, tid_ref)
-        target_id = target_chat.id
-    except Exception as e:
-        bot.send_message(admin_chat_id, f"❌ Target Error: {e}")
-        return
-
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
-        items = c.fetchall()
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT source_id, target_id, source_title FROM target_pairs WHERE id = {p}", (pair_id,))
+            row = c.fetchone()
+        
+        if not row: return
+        sid, tid_ref, s_title = row
     
-    if not items:
-        bot.send_message(admin_chat_id, "No pending items to release.")
-        return
-
-    sent = 0
-    status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
-    
-    for row_id, smid in items:
-        if not running_tasks.get(task_key):
-            bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
-            break
         try:
-            try: await userbot.copy_message(target_id, sid, smid)
-            except: await userbot.forward_messages(target_id, sid, smid)
-            
-            with db_conn() as conn:
-                c = conn.cursor()
-                p = get_placeholder()
-                c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-            sent += 1
-            if sent % 5 == 0:
-                try: bot.edit_message_text(f"🚀 Releasing...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
-                except: pass
-            await asyncio.sleep(1.2) # Increased delay for safety (Anti-ban)
+            target_chat = await resolve_target_id(userbot, tid_ref)
+            target_id = target_chat.id
         except Exception as e:
-            logger.error(f"Release error: {e}")
-            
-    bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
-    running_tasks.pop(task_key, None)
+            bot.send_message(admin_chat_id, f"❌ Target Error: {e}")
+            return
+
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
+            items = c.fetchall()
+        
+        if not items:
+            bot.send_message(admin_chat_id, "No pending items to release.")
+            return
+
+        sent = 0
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
+        
+        for row_id, smid in items:
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
+                break
+            try:
+                try: await userbot.copy_message(target_id, sid, smid)
+                except: await userbot.forward_messages(target_id, sid, smid)
+                
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                sent += 1
+                if sent % 5 == 0:
+                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
+                    except: pass
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error(f"Release error: {e}")
+                
+        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
+    except Exception as e:
+        logger.error(f"Global Release Error: {e}")
+        bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
 
 # -----------------------------
 # Watchdog
