@@ -73,27 +73,53 @@ def init_db():
                 value TEXT
             )
         """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS target_pairs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id BIGINT,
-                target_id BIGINT,
-                source_title TEXT,
-                target_title TEXT,
-                UNIQUE(source_id, target_id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS collected_media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pair_id INTEGER,
-                source_message_id BIGINT,
-                media_type TEXT,
-                caption TEXT,
-                released INTEGER DEFAULT 0,
-                UNIQUE(pair_id, source_message_id)
-            )
-        """)
+        
+        if DATABASE_URL:
+            # PostgreSQL
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS target_pairs (
+                    id SERIAL PRIMARY KEY,
+                    source_id BIGINT,
+                    target_id BIGINT,
+                    source_title TEXT,
+                    target_title TEXT,
+                    UNIQUE(source_id, target_id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS collected_media (
+                    id SERIAL PRIMARY KEY,
+                    pair_id INTEGER,
+                    source_message_id BIGINT,
+                    media_type TEXT,
+                    caption TEXT,
+                    released INTEGER DEFAULT 0,
+                    UNIQUE(pair_id, source_message_id)
+                )
+            """)
+        else:
+            # SQLite
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS target_pairs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id BIGINT,
+                    target_id BIGINT,
+                    source_title TEXT,
+                    target_title TEXT,
+                    UNIQUE(source_id, target_id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS collected_media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair_id INTEGER,
+                    source_message_id BIGINT,
+                    media_type TEXT,
+                    caption TEXT,
+                    released INTEGER DEFAULT 0,
+                    UNIQUE(pair_id, source_message_id)
+                )
+            """)
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
