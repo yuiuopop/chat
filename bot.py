@@ -247,12 +247,14 @@ def get_dashboard_text():
     status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
     
     text = f"✨ **SYSTEM CONSOLE**\n"
-    text += f"Status: `{status}`\n"
+    text += f"━━━━━━━━━━━━━━━\n"
+    text += f"◈ Status: `{status}`\n"
     if is_online and userbot.me:
         name = userbot.me.first_name or "User"
-        text += f"Account: `{name}`\n"
+        text += f"◈ Account: `{name}`\n"
     
-    text += "\n_Manage your automation pairs below:_"
+    text += f"━━━━━━━━━━━━━━━\n"
+    text += "Manage your automation and stalking tasks below:"
     return text
 
 def get_dashboard_markup():
@@ -720,29 +722,31 @@ def handle_callbacks(call):
                 
                 if is_stalk:
                     # STALKING VIEW
-                    t_text = f"`{t_title}`" if tid else "⚠️ **NOT SET** (Required for Release)"
+                    t_text = f"`{t_title}`" if tid else "⚠️ *Target Not Set*"
                     text = (
-                        f"🕵️ **Stalking Dashboard**\n\n"
-                        f"Source: `{s_title}`\n"
-                        f"Target: {t_text}\n\n"
-                        f"📊 **Media Stats:**\n"
-                        f"Collected: `{stats['total']}`\n"
-                        f"Present in Chat: `{total_in_chat}`\n"
-                        f"📥 Pending Release: `{stats['pending']}`\n\n"
-                        f"🤖 **Status:** `{mon_status}`"
+                        f"🕵️ **STALKING DASHBOARD**\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"◈ **Source:** `{s_title}`\n"
+                        f"◈ **Target:** {t_text}\n\n"
+                        f"📊 **MEDIA STATS**\n"
+                        f"◈ Collected: `{stats['total']}`\n"
+                        f"◈ In Chat: `{total_in_chat}`\n"
+                        f"◈ Pending: `{stats['pending']}`\n\n"
+                        f"🤖 **STATUS:** `{mon_status}`"
                     )
                 else:
                     # TARGET PAIR VIEW
                     text = (
-                        f"🎯 **Target Pair Management**\n\n"
-                        f"Source: `{s_title}`\n"
-                        f"Target: `{t_title}`\n\n"
-                        f"📊 **Stats:**\n"
-                        f"Collected: `{stats['total']}`\n"
-                        f"📥 Pending: `{stats['pending']}`\n\n"
-                        f"🤖 **Automation Status:**\n"
-                        f"Monitor: `{mon_status}`\n"
-                        f"Live Forward: `{live_status}`"
+                        f"🎯 **PAIR MANAGEMENT**\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"◈ **Source:** `{s_title}`\n"
+                        f"◈ **Target:** `{t_title}`\n\n"
+                        f"📊 **PAIR STATS**\n"
+                        f"◈ Collected: `{stats['total']}`\n"
+                        f"◈ Pending: `{stats['pending']}`\n\n"
+                        f"🤖 **AUTOMATION**\n"
+                        f"◈ Monitor: `{mon_status}`\n"
+                        f"◈ Live: `{live_status}`"
                     )
                 
                 bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
