@@ -68,14 +68,30 @@ if db_parent:
     os.makedirs(db_parent, exist_ok=True)
 
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
 @contextmanager
 def db_conn():
-    conn = sqlite3.connect(DB_PATH)
+    if DATABASE_URL:
+        # PostgreSQL
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
+    else:
+        # SQLite
+        conn = sqlite3.connect(DB_PATH)
+    
     try:
         yield conn
-        conn.commit()
+        if not DATABASE_URL:
+            conn.commit()
     finally:
         conn.close()
+
+
+def get_placeholder():
+    return "%s" if DATABASE_URL else "?"
+
 
 
 def init_db():
@@ -89,42 +105,18 @@ def init_db():
             )
             """
         )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_message_id INTEGER UNIQUE,
-                target_chat_id INTEGER,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS source_chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT,
-                monitor_enabled INTEGER DEFAULT 0,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS collected_media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_chat_id INTEGER NOT NULL,
-                source_message_id INTEGER NOT NULL,
-                media_type TEXT,
-                caption TEXT,
-                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                released INTEGER DEFAULT 0,
-                target_chat_id INTEGER,
-                released_at TIMESTAMP,
-                UNIQUE(source_chat_id, source_message_id)
-            )
-            """
-        )
+        
+        if DATABASE_URL:
+            # PostgreSQL
+            c.execute("CREATE TABLE IF NOT EXISTS sent_messages (id SERIAL PRIMARY KEY, source_message_id BIGINT UNIQUE, target_chat_id BIGINT, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS source_chats (chat_id BIGINT PRIMARY KEY, title TEXT, monitor_enabled INTEGER DEFAULT 0, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS collected_media (id SERIAL PRIMARY KEY, source_chat_id BIGINT NOT NULL, source_message_id BIGINT NOT NULL, media_type TEXT, caption TEXT, collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, released INTEGER DEFAULT 0, target_chat_id BIGINT, released_at TIMESTAMP, UNIQUE(source_chat_id, source_message_id))")
+        else:
+            # SQLite
+            c.execute("CREATE TABLE IF NOT EXISTS sent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, source_message_id INTEGER UNIQUE, target_chat_id INTEGER, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS source_chats (chat_id INTEGER PRIMARY KEY, title TEXT, monitor_enabled INTEGER DEFAULT 0, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS collected_media (id INTEGER PRIMARY KEY AUTOINCREMENT, source_chat_id INTEGER NOT NULL, source_message_id INTEGER NOT NULL, media_type TEXT, caption TEXT, collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, released INTEGER DEFAULT 0, target_chat_id INTEGER, released_at TIMESTAMP, UNIQUE(source_chat_id, source_message_id))")
+
         # Migration for older source_chats table
         try:
             c.execute("ALTER TABLE source_chats ADD COLUMN monitor_enabled INTEGER DEFAULT 0")
@@ -136,21 +128,34 @@ def init_db():
 def get_setting(key, default=None):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        p = get_placeholder()
+        c.execute(f"SELECT value FROM settings WHERE key = {p}", (key,))
         row = c.fetchone()
         return row[0] if row else default
+
 
 
 def set_setting(key, value):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO settings (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, str(value))
-        )
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (%s, %s)
+                ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                (key, str(value))
+            )
+        else:
+            c.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, str(value))
+            )
+
 
 
 def get_target_ref():
@@ -160,20 +165,21 @@ def get_target_ref():
 def already_sent(source_message_id):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT 1 FROM sent_messages WHERE source_message_id = ?", (source_message_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT 1 FROM sent_messages WHERE source_message_id = {p}", (source_message_id,))
         return c.fetchone() is not None
+
 
 
 def mark_sent(source_message_id, target_chat_id):
     with db_conn() as conn:
         c = conn.cursor()
+        p = get_placeholder()
         c.execute(
-            """
-            INSERT OR IGNORE INTO sent_messages (source_message_id, target_chat_id)
-            VALUES (?, ?)
-            """,
+            f"INSERT INTO sent_messages (source_message_id, target_chat_id) VALUES ({p}, {p}) ON CONFLICT DO NOTHING",
             (source_message_id, target_chat_id)
         )
+
 
 
 def clear_sent_records():
@@ -185,19 +191,26 @@ def clear_sent_records():
 def add_source_chat(chat_id: int, title: str):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO source_chats (chat_id, title, monitor_enabled) VALUES (?, ?, 0)
-            ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
-            """,
-            (chat_id, title)
-        )
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO source_chats (chat_id, title, monitor_enabled) VALUES (%s, %s, 0) ON CONFLICT(chat_id) DO UPDATE SET title = EXCLUDED.title",
+                (chat_id, title)
+            )
+        else:
+            c.execute(
+                "INSERT INTO source_chats (chat_id, title, monitor_enabled) VALUES (?, ?, 0) ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title",
+                (chat_id, title)
+            )
+
 
 
 def remove_source_chat(chat_id: int):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM source_chats WHERE chat_id = ?", (chat_id,))
+        p = get_placeholder()
+        c.execute(f"DELETE FROM source_chats WHERE chat_id = {p}", (chat_id,))
+
 
 
 def list_source_chats():
@@ -210,61 +223,68 @@ def list_source_chats():
 def is_source_chat(chat_id: int) -> bool:
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT 1 FROM source_chats WHERE chat_id = ?", (chat_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT 1 FROM source_chats WHERE chat_id = {p}", (chat_id,))
         return c.fetchone() is not None
+
 
 
 def set_monitor_enabled(chat_id: int, enabled: bool):
     with db_conn() as conn:
         c = conn.cursor()
+        p = get_placeholder()
         c.execute(
-            "UPDATE source_chats SET monitor_enabled = ? WHERE chat_id = ?",
+            f"UPDATE source_chats SET monitor_enabled = {p} WHERE chat_id = {p}",
             (1 if enabled else 0, chat_id)
         )
         return c.rowcount > 0
 
 
+
 def is_monitor_enabled(chat_id: int) -> bool:
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT monitor_enabled FROM source_chats WHERE chat_id = ?", (chat_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT monitor_enabled FROM source_chats WHERE chat_id = {p}", (chat_id,))
         row = c.fetchone()
         return bool(row and int(row[0]) == 1)
+
 
 
 def get_source_title(chat_id: int):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT title FROM source_chats WHERE chat_id = ?", (chat_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT title FROM source_chats WHERE chat_id = {p}", (chat_id,))
         row = c.fetchone()
         return row[0] if row else None
+
 
 
 def save_collected_media(source_chat_id: int, source_message_id: int, media_type: str, caption: str):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute(
-            """
-            INSERT OR IGNORE INTO collected_media (source_chat_id, source_message_id, media_type, caption)
-            VALUES (?, ?, ?, ?)
-            """,
-            (source_chat_id, source_message_id, media_type, caption or "")
-        )
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO collected_media (source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (source_chat_id, source_message_id, media_type, caption or "")
+            )
+        else:
+            c.execute(
+                "INSERT OR IGNORE INTO collected_media (source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
+                (source_chat_id, source_message_id, media_type, caption or "")
+            )
         return c.rowcount > 0
+
 
 
 def get_monitor_stats(source_chat_id: int):
     with db_conn() as conn:
         c = conn.cursor()
+        p = get_placeholder()
         c.execute(
-            """
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) as unreleased,
-                SUM(CASE WHEN released = 1 THEN 1 ELSE 0 END) as released
-            FROM collected_media
-            WHERE source_chat_id = ?
-            """,
+            f"SELECT COUNT(*), SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END), SUM(CASE WHEN released = 1 THEN 1 ELSE 0 END) FROM collected_media WHERE source_chat_id = {p}",
             (source_chat_id,)
         )
         row = c.fetchone() or (0, 0, 0)
@@ -275,33 +295,28 @@ def get_monitor_stats(source_chat_id: int):
         }
 
 
+
 def get_unreleased_collected(source_chat_id: int, limit: int):
     with db_conn() as conn:
         c = conn.cursor()
+        p = get_placeholder()
         c.execute(
-            """
-            SELECT id, source_message_id, media_type
-            FROM collected_media
-            WHERE source_chat_id = ? AND released = 0
-            ORDER BY id ASC
-            LIMIT ?
-            """,
+            f"SELECT id, source_message_id, media_type FROM collected_media WHERE source_chat_id = {p} AND released = 0 ORDER BY id ASC LIMIT {p}",
             (source_chat_id, limit)
         )
         return c.fetchall()
 
 
+
 def mark_collected_released(row_id: int, target_chat_id: int):
     with db_conn() as conn:
         c = conn.cursor()
+        p = get_placeholder()
         c.execute(
-            """
-            UPDATE collected_media
-            SET released = 1, target_chat_id = ?, released_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
+            f"UPDATE collected_media SET released = 1, target_chat_id = {p}, released_at = CURRENT_TIMESTAMP WHERE id = {p}",
             (target_chat_id, row_id)
         )
+
 
 
 # -----------------------------
@@ -499,14 +514,31 @@ def source_manage_keyboard(chat_id):
     markup.add(mon_btn)
     
     markup.add(
-        InlineKeyboardButton("📥 Scrape History", callback_data=f"src_scrape_{chat_id}"),
+        InlineKeyboardButton("📥 Scrape History", callback_data=f"src_scrape_menu_{chat_id}"),
         InlineKeyboardButton("🚀 Release N", callback_data=f"src_release_n_{chat_id}")
     )
+
     markup.add(
         InlineKeyboardButton("🗑 Remove Source", callback_data=f"src_delete_confirm_{chat_id}"),
         InlineKeyboardButton("🔙 List", callback_data="sources_list_0")
     )
     return markup, stats
+
+
+def scrape_options_keyboard(chat_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔢 By Count", callback_data=f"scrape_type_count_{chat_id}"),
+        InlineKeyboardButton("📅 By Date", callback_data=f"scrape_type_date_{chat_id}")
+    )
+    markup.add(
+        InlineKeyboardButton("♾ Full History", callback_data=f"scrape_type_full_{chat_id}"),
+        InlineKeyboardButton("⏪ Before Added Date", callback_data=f"scrape_type_pre_added_{chat_id}")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Source", callback_data=f"src_manage_{chat_id}"))
+
+    return markup
+
 
 
 def build_temp_client(api_id: int, api_hash: str) -> Client:
@@ -655,20 +687,69 @@ def handle_callbacks(call):
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
     
     elif data == "quick_release_all":
-        bot.answer_callback_query(call.id, "🚀 Releasing all unreleased media...")
-        # Since we have the command logic, we can trigger it or send instructions
-        bot.send_message(call.message.chat.id, "Bulk release started for all sources. Use /status to watch progress.")
-        # Future: Call a bulk release function here
+        bot.answer_callback_query(call.id, "🚀 Starting Global Release...")
+        async def run_bulk():
+            await release_engine(call.message.chat.id)
+        asyncio.run_coroutine_threadsafe(run_bulk(), loop)
 
-    elif data.startswith("src_scrape_"):
+
+    elif data.startswith("src_scrape_menu_"):
         cid = int(data.split("_")[-1])
+        title = get_source_title(cid) or str(cid)
+        bot.edit_message_text(f"📥 *Scrape History:* `{title}`\n\nChoose how you want to collect old content:", call.message.chat.id, call.message.message_id, reply_markup=scrape_options_keyboard(cid), parse_mode="Markdown")
+
+    elif data.startswith("scrape_type_count_"):
+        cid = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_scrape_count_{cid}"
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, f"📥 To scrape history for this source, use:\n`/collecthistory {cid} 200`", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, "🔢 *How many messages* should I scan?\n(Enter a number, e.g., `200`)", parse_mode="Markdown")
+
+    elif data.startswith("scrape_type_date_"):
+        cid = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_scrape_date_start_{cid}"
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "📅 *Enter Start Date*\n(Format: `YYYY-MM-DD`, e.g., `2024-01-01`)", parse_mode="Markdown")
+
+    elif data.startswith("scrape_type_full_"):
+        cid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🚀 Starting Full History Scrape...")
+        # Trigger background task for full scrape
+        async def run_full():
+            await advanced_scrape_task(call.message.chat.id, cid, mode="full")
+        asyncio.run_coroutine_threadsafe(run_full(), loop)
+
+    elif data.startswith("scrape_type_pre_added_"):
+        cid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🚀 Scraping history BEFORE group was added...")
+        
+        async def run_pre():
+            # Get added_at from DB
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                c.execute(f"SELECT added_at FROM source_chats WHERE chat_id = {p}", (cid,))
+                row = c.fetchone()
+                added_at_str = row[0] if row else None
+            
+            # If we have a date, use it as the end_date for our backwards scan
+            # (In our task, end_date is where we start scanning backwards from)
+            end_date = None
+            if added_at_str:
+                # added_at_str is usually YYYY-MM-DD HH:MM:SS
+                end_date = added_at_str.split()[0] # Just the date part YYYY-MM-DD
+            
+            await advanced_scrape_task(call.message.chat.id, cid, end_date=end_date)
+        
+        asyncio.run_coroutine_threadsafe(run_pre(), loop)
+
+
 
     elif data.startswith("src_release_n_"):
         cid = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_release_count_{cid}"
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, f"🚀 To release media from this source, use:\n`/release {cid} 20`", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, "🚀 *How many items* should I release from this source?\n(Enter a number, or type `all`)", parse_mode="Markdown")
+
 
 
     elif data == "setup_api_id":
@@ -1091,11 +1172,79 @@ def cmd_login(message):
 
 
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states, content_types=["text"])
-def login_state_handler(message):
+def admin_state_handler(message):
     uid = message.from_user.id
     state = admin_states.get(uid)
     if not state:
         return
+
+    # --- Scraping States ---
+    if state.startswith("awaiting_scrape_count_"):
+        cid = int(state.split("_")[-1])
+        try:
+            count = int(message.text.strip())
+            admin_states.pop(uid, None)
+            bot.reply_to(message, f"🔢 Starting scrape of `{count}` messages for `{cid}`...", parse_mode="Markdown")
+            async def run_c():
+                await advanced_scrape_task(message.chat.id, cid, limit=count)
+            asyncio.run_coroutine_threadsafe(run_c(), loop)
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid number. Please enter digits only.")
+        return
+
+    if state.startswith("awaiting_scrape_date_start_"):
+        cid = int(state.split("_")[-1])
+        date_str = message.text.strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+            admin_states[uid] = f"awaiting_scrape_date_end_{cid}_{date_str}"
+            bot.reply_to(message, f"📅 *Start Date Set:* `{date_str}`\n\nNow enter the *End Date* (Format: `YYYY-MM-DD`)\n(Or type `today`)", parse_mode="Markdown")
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid date format. Use `YYYY-MM-DD`.")
+        return
+
+    if state.startswith("awaiting_scrape_date_end_"):
+        parts = state.split("_")
+        cid = int(parts[4])
+        start_date_str = parts[5]
+        end_date_str = message.text.strip().lower()
+        if end_date_str == "today":
+            end_date_str = datetime.now().strftime("%Y-%m-%d")
+        
+        try:
+            datetime.strptime(end_date_str, "%Y-%m-%d")
+            admin_states.pop(uid, None)
+            bot.reply_to(message, f"📅 Starting date-range scrape for `{cid}`\nFrom `{start_date_str}` to `{end_date_str}`...")
+            async def run_d():
+                await advanced_scrape_task(message.chat.id, cid, start_date=start_date_str, end_date=end_date_str)
+            asyncio.run_coroutine_threadsafe(run_d(), loop)
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid date format. Use `YYYY-MM-DD`.")
+        return
+
+    # --- Release States ---
+    if state.startswith("awaiting_release_count_"):
+        cid = int(state.split("_")[-1])
+        text = message.text.strip().lower()
+        admin_states.pop(uid, None)
+        
+        limit = None
+        if text != "all":
+            try:
+                limit = int(text)
+            except ValueError:
+                bot.reply_to(message, "❌ Invalid number. Release cancelled.")
+                return
+        
+        bot.reply_to(message, f"🚀 Starting release for `{cid}`...")
+        async def run_rel():
+            await release_engine(message.chat.id, source_chat_id=cid, limit=limit)
+        asyncio.run_coroutine_threadsafe(run_rel(), loop)
+        return
+
+    # --- Login States ---
+
+
 
     if state == "awaiting_phone":
         phone = message.text.strip()
@@ -1896,7 +2045,144 @@ def cmd_showmedia(message):
 # -----------------------------
 # Health + keepalive
 # -----------------------------
+async def advanced_scrape_task(admin_chat_id, source_chat_id, mode="count", limit=None, start_date=None, end_date=None):
+    global userbot
+    if not userbot:
+        bot.send_message(admin_chat_id, "❌ Userbot not running.")
+        return
+
+    try:
+        title = get_source_title(source_chat_id) or str(source_chat_id)
+        collected = 0
+        scanned = 0
+        
+        # Parse dates if provided
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) if start_date else None
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) if end_date else None
+        
+        # In Telegram, history goes backwards. So start_date (e.g. 2024) is OLDER than end_date (e.g. 2025).
+        # We start from the end_date (newer) and go back to start_date (older).
+        
+        offset_date = end_dt if end_dt else None
+        
+        status_msg = bot.send_message(admin_chat_id, f"📥 Scraping `{title}`...")
+        
+        f_mode = get_setting("forward_mode", "media")
+
+        async for m in userbot.get_chat_history(source_chat_id, limit=(limit or 1000000), offset_date=offset_date):
+            scanned += 1
+            
+            # Check if we've passed the start date (gone too far back in time)
+            if start_dt and m.date < start_dt:
+                break
+                
+            is_media = bool(m.media)
+            if f_mode == "media" and not is_media:
+                continue
+
+            media_type = m.media.value if is_media else "text"
+            ok = save_collected_media(source_chat_id, m.id, media_type, m.caption or m.text or "")
+            if ok:
+                collected += 1
+            
+            if scanned % 100 == 0:
+                try:
+                    bot.edit_message_text(f"📥 Scraping `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
+                except: pass
+            
+            await asyncio.sleep(0.05)
+
+        bot.send_message(admin_chat_id, f"✅ Done scraping `{title}`\n\nScanned: `{scanned}`\nCollected: `{collected}`")
+    except Exception as e:
+        logger.error(f"Scrape failed: {e}")
+        bot.send_message(admin_chat_id, f"❌ Scrape failed for `{source_chat_id}`: {e}")
+
+
+async def release_engine(admin_chat_id, source_chat_id=None, limit=None):
+    global userbot
+    if not userbot:
+        bot.send_message(admin_chat_id, "❌ Userbot not running.")
+        return
+
+    target_raw = get_target_ref()
+    if not target_raw:
+        bot.send_message(admin_chat_id, "❌ Set target first with /settarget")
+        return
+    
+    # Resolve target ID early
+    try:
+        target_chat = await userbot.get_chat(target_raw)
+        target_id = target_chat.id
+    except Exception as e:
+        bot.send_message(admin_chat_id, f"❌ Cannot access target `{target_raw}`: {e}")
+        return
+
+    try:
+        # Get items to release
+        # If source_chat_id is None, we need to get from all sources
+        # For simplicity, we'll iterate through all sources if None
+        sources = [source_chat_id] if source_chat_id else [row[0] for row in list_source_chats()]
+        
+        total_sent = 0
+        total_failed = 0
+        
+        status_msg = bot.send_message(admin_chat_id, "🚀 *Release Engine Started*...", parse_mode="Markdown")
+
+        for sid in sources:
+            s_title = get_source_title(sid) or str(sid)
+            # If we have a global limit and we've reached it, stop
+            if limit and total_sent >= limit:
+                break
+                
+            # Items for this specific source
+            # If it's a global release, we don't have a per-source limit unless specified
+            current_limit = (limit - total_sent) if limit else 1000000
+            items = get_unreleased_collected(sid, current_limit)
+            
+            if not items:
+                continue
+                
+            for row_id, source_message_id, media_type in items:
+                try:
+                    # Try copy, then forward
+                    delivered = False
+                    try:
+                        await userbot.copy_message(target_id, sid, source_message_id)
+                        delivered = True
+                    except Exception:
+                        try:
+                            await userbot.forward_messages(target_id, sid, source_message_id)
+                            delivered = True
+                        except: pass
+
+                    if delivered:
+                        mark_collected_released(row_id, target_id)
+                        total_sent += 1
+                    else:
+                        total_failed += 1
+                        
+                    if (total_sent + total_failed) % 10 == 0:
+                        try:
+                            bot.edit_message_text(f"🚀 *Release Engine Running*\n\nSent: `{total_sent}`\nFailed: `{total_failed}`\nCurrent Source: `{s_title}`", admin_chat_id, status_msg.message_id, parse_mode="Markdown")
+                        except: pass
+                        
+                    await asyncio.sleep(0.7) # Flood protection
+                    
+                    if limit and total_sent >= limit:
+                        break
+                except Exception as e:
+                    total_failed += 1
+                    logger.error(f"Release engine error for {sid}:{source_message_id}: {e}")
+
+        bot.send_message(admin_chat_id, f"✅ *Release Complete*\n\nTotal Sent: `{total_sent}`\nTotal Failed: `{total_failed}`", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Release engine crashed: {e}")
+        bot.send_message(admin_chat_id, f"❌ Release engine crashed: {e}")
+
+
 app = Flask(__name__)
+
+
 
 
 @app.route("/")
