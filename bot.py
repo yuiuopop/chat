@@ -135,17 +135,22 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pair_id INTEGER,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     media_type TEXT,
                     caption TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
-                    UNIQUE(pair_id, source_message_id)
+                    pair_id INTEGER,
+                    UNIQUE(source_chat_id, source_message_id)
                 )
             """)
             # Migration check
-            try:
-                c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
     logger.info("DB initialized")
 
@@ -353,15 +358,25 @@ async def get_chat_selection_markup(prefix, page=0):
     
     chats = []
     async for dialog in userbot.get_dialogs():
-        if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+        if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL, enums.ChatType.PRIVATE]:
             chats.append(dialog.chat)
     
     # Pagination (10 per page)
     start = page * 10
     end = start + 10
     for chat in chats[start:end]:
-        title = chat.title or "Untitled"
-        markup.add(InlineKeyboardButton(f"{title}", callback_data=f"{prefix}_{chat.id}"))
+        chat_type = chat.type
+        if chat_type == enums.ChatType.PRIVATE:
+            icon = "🤖" if chat.is_bot else "👤"
+            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "User"
+        elif chat_type == enums.ChatType.CHANNEL:
+            icon = "📢"
+            title = chat.title or "Channel"
+        else:
+            icon = "👥"
+            title = chat.title or "Group"
+            
+        markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
     
     nav = []
     if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
@@ -402,12 +417,25 @@ async def start_userbot():
         await userbot.start()
         # Register automation handlers
         await setup_automation_handlers(userbot)
-        # Set a heartbeat/me check
-        await userbot.get_me()
-        return True, "Userbot started successfully"
+        return True, "Userbot started"
     except Exception as e:
-        logger.error(f"Userbot start failed: {e}")
         return False, str(e)
+
+async def ensure_userbot():
+    """Ensures the userbot is connected and ready."""
+    global userbot
+    if not userbot:
+        ok, msg = await start_userbot()
+        if not ok: return False, msg
+    
+    if not userbot.is_connected:
+        try: 
+            await userbot.start()
+            await setup_automation_handlers(userbot)
+        except Exception as e: 
+            return False, f"Connection failed: {e}"
+    
+    return True, "Connected"
 
 async def setup_automation_handlers(client: Client):
     @client.on_message()
@@ -904,15 +932,14 @@ def handle_state_inputs(message):
         bot.send_message(message.chat.id, f"🚀 **Slow Release Started**\nPair: `{pid}` | Interval: `{interval}s`")
         asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, interval=interval), loop)
 
-    # --- History Scraper Flow ---
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
         if not text.isdigit():
-            bot.reply_to(message, "Please send a number.")
+            bot.reply_to(message, "⚠️ Please send a valid number.")
             return
         count = int(text)
         admin_states.pop(uid)
-        bot.send_message(message.chat.id, f"🚀 **Count Scrape Started**\nPair: `{pid}` | Limit: `{count}`")
+        bot.send_message(message.chat.id, f"🔢 **Count-Based Scrape**\n\n🎯 Pair ID: `{pid}`\n📥 Limit: `{count}` messages\n\n🚀 *Initializing engine...*", parse_mode="Markdown")
         asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, limit=count), loop)
 
     elif state.startswith("hist_setup_date_start_"):
@@ -921,25 +948,28 @@ def handle_state_inputs(message):
             dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
             login_data[uid] = {"start_date": dt}
             admin_states[uid] = f"hist_setup_date_end_{pid}"
-            bot.send_message(message.chat.id, "📍 Enter **End Date** (DD/MM/YYYY):")
+            bot.send_message(message.chat.id, "📅 **Start Date Set!**\n\nNow enter **End Date** (DD/MM/YYYY):\n(Example: `10/05/2026`)")
         except ValueError:
-            bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
+            bot.reply_to(message, "⚠️ Invalid format. Please use `DD/MM/YYYY`.")
 
     elif state.startswith("hist_setup_date_end_"):
         pid = int(state.split("_")[-1])
         try:
-            dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
-            start_date = login_data[uid]["start_date"]
-            end_date = dt
+            end_dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+            start_dt = login_data[uid]["start_date"]
             admin_states.pop(uid)
-            login_data.pop(uid)
-            bot.send_message(message.chat.id, f"🚀 **Date Scrape Started**\nPair: `{pid}`\nRange: `{start_date.date()}` to `{end_date.date()}`")
-            asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, start_date=start_date, end_date=end_date), loop)
+            login_data.pop(uid, None)
+            bot.send_message(message.chat.id, f"📅 **Date-Based Scrape**\n\n🎯 Pair ID: `{pid}`\n⏳ Range: `{start_dt.strftime('%d/%b/%Y')}` to `{end_dt.strftime('%d/%b/%Y')}`\n\n🚀 *Starting background collection...*", parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, start_date=start_dt, end_date=end_dt), loop)
         except ValueError:
-            bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
+            bot.reply_to(message, "⚠️ Invalid format. Please use `DD/MM/YYYY`.")
 
 async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None, end_date=None):
-    if not userbot: return
+    is_ok, msg = await ensure_userbot()
+    if not is_ok:
+        bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
+        return
+
     task_key = f"hist_{pair_id}"
     running_tasks[task_key] = True
     
@@ -1012,7 +1042,11 @@ async def resolve_target_id(client: Client, target_ref: str):
     raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
-    if not userbot: return
+    is_ok, msg = await ensure_userbot()
+    if not is_ok:
+        bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
+        return
+        
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
     
@@ -1066,7 +1100,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         running_tasks.pop(task_key, None)
 
 async def run_release(admin_chat_id, pair_id, interval=1.2):
-    if not userbot: return
+    is_ok, msg = await ensure_userbot()
+    if not is_ok:
+        bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
+        return
+
     task_key = f"rel_{pair_id}"
     running_tasks[task_key] = True
     
@@ -1098,15 +1136,32 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             return
 
         sent = 0
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
         
         for row_id, smid in items:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
-                try: await userbot.copy_message(target_id, sid, smid)
-                except: await userbot.forward_messages(target_id, sid, smid)
+                try:
+                    await userbot.copy_message(target_id, sid, smid)
+                except Exception as e:
+                    # If copy fails (e.g. restricted content), try download/upload
+                    try:
+                        msg = await userbot.get_messages(sid, smid)
+                        if msg.media:
+                            path = await msg.download()
+                            if path:
+                                # Send as new document to bypass restriction
+                                await userbot.send_document(target_id, path, caption=msg.caption)
+                                if os.path.exists(path): os.remove(path)
+                        elif msg.text:
+                            await userbot.send_message(target_id, msg.text)
+                    except Exception as e2:
+                        logger.error(f"Deep copy failed: {e2}")
+                        await userbot.forward_messages(target_id, sid, smid)
                 
                 with db_conn() as conn:
                     c = conn.cursor()
@@ -1114,7 +1169,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
+                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
@@ -1238,6 +1293,9 @@ async def main():
         init_db()
     except Exception as e:
         logger.error(f"DB Init Error: {e}")
+    if not DATABASE_URL:
+        logger.warning("⚠️ WARNING: You are using SQLite. Your data (pairs, media) will be DELETED every time Render restarts!")
+        logger.warning("Please set a DATABASE_URL (PostgreSQL) for permanent storage.")
 
     asyncio.create_task(userbot_watchdog())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
