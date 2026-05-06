@@ -488,8 +488,12 @@ def dashboard_text():
     af_emoji = "🟢" if a == "TRUE" else "🔴"
 
     text = f"┏━━━━━━━ SYSTEM CONSOLE ━━━━━━━┓\n"
-    text += f"┃  🤖 BOT: {poll_status}  ┃  📡 USER: {userbot_status}  ┃\n"
+    text += f"┃ 🤖 BOT  : {poll_status:<16}┃\n"
+    text += f"┃ 📡 USER : {userbot_status:<16}┃\n"
     text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+    
+    text += f"💬 *QUOTES*\n"
+    text += f"\"The best way to predict the future is to create it.\"\n\n"
     
     text += f"📊 *QUEUE PERFORMANCE*\n"
     text += f"├─ 📂 Sources: `{len(sources)}` configured\n"
@@ -503,6 +507,7 @@ def dashboard_text():
     
     text += f"🕹 *QUICK ACTIONS*"
     return text
+
 
 
 
