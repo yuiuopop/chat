@@ -241,6 +241,31 @@ def user_account_markup():
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
+async def get_chat_selection_markup(prefix, page=0):
+    markup = InlineKeyboardMarkup(row_width=1)
+    if not userbot or not userbot.is_connected:
+        return None
+    
+    chats = []
+    async for dialog in userbot.get_dialogs():
+        if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+            chats.append(dialog.chat)
+    
+    # Pagination (10 per page)
+    start = page * 10
+    end = start + 10
+    for chat in chats[start:end]:
+        title = chat.title or "Untitled"
+        markup.add(InlineKeyboardButton(f"{title}", callback_data=f"{prefix}_{chat.id}"))
+    
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
+    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
+    if nav: markup.add(*nav)
+    
+    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
+    return markup
+
 # -----------------------------
 # Userbot Logic
 # -----------------------------
@@ -287,6 +312,39 @@ def cmd_start(message):
         parse_mode="Markdown"
     )
 
+@bot.message_handler(commands=["list"])
+def cmd_list(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if not userbot or not userbot.is_connected:
+        bot.send_message(message.chat.id, "❌ Userbot is not connected. Use /start to connect first.")
+        return
+
+    status_msg = bot.send_message(message.chat.id, "🔍 Fetching your chats...")
+    
+    async def fetch_and_list():
+        try:
+            text = "📋 **Your Groups & Channels**\n\n"
+            async for dialog in userbot.get_dialogs(limit=50):
+                if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+                    chat_type = "📢 Channel" if dialog.chat.type == enums.ChatType.CHANNEL else "👥 Group"
+                    title = dialog.chat.title or "Untitled"
+                    text += f"{chat_type}: `{title}`\nID: `{dialog.chat.id}`\n\n"
+            
+            if len(text) > 4000:
+                parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+                for p in parts: bot.send_message(message.chat.id, p, parse_mode="Markdown")
+            else:
+                bot.send_message(message.chat.id, text, parse_mode="Markdown")
+            
+            try: bot.delete_message(message.chat.id, status_msg.message_id)
+            except: pass
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Error fetching chats: {e}")
+
+    asyncio.run_coroutine_threadsafe(fetch_and_list(), loop)
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     global userbot
@@ -304,8 +362,57 @@ def handle_callbacks(call):
 
     elif data == "pair_add_start":
         bot.answer_callback_query(call.id)
-        admin_states[uid] = "awaiting_pair_source"
-        bot.send_message(call.message.chat.id, "📍 Step 1: Send the **Source Chat ID** (where content comes from).")
+        async def show_src_list():
+            markup = await get_chat_selection_markup("sel_src", 0)
+            if markup:
+                bot.edit_message_text("🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            else:
+                bot.send_message(call.message.chat.id, "❌ Userbot not connected.")
+        asyncio.run_coroutine_threadsafe(show_src_list(), loop)
+
+    elif data.startswith("sel_src_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[2] == "page":
+            page = int(parts[3])
+            async def update_src_list():
+                markup = await get_chat_selection_markup("sel_src", page)
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_src_list(), loop)
+        else:
+            sid = int(parts[2])
+            login_data[uid] = {"source_id": sid}
+            async def show_tgt_list():
+                markup = await get_chat_selection_markup("sel_tgt", 0)
+                bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(show_tgt_list(), loop)
+
+    elif data.startswith("sel_tgt_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[2] == "page":
+            page = int(parts[3])
+            async def update_tgt_list():
+                markup = await get_chat_selection_markup("sel_tgt", page)
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
+        else:
+            tid = int(parts[2])
+            sid = login_data[uid]["source_id"]
+            bot.edit_message_text("⏳ Resolving pair...", call.message.chat.id, call.message.message_id)
+            
+            async def finalize_pair():
+                try:
+                    s_chat = await userbot.get_chat(sid)
+                    t_chat = await userbot.get_chat(tid)
+                    s_title = s_chat.title or s_chat.first_name or str(sid)
+                    t_title = t_chat.title or t_chat.first_name or str(tid)
+                    add_target_pair(sid, tid, s_title, t_title)
+                    bot.send_message(call.message.chat.id, f"✅ **Pair Added!**\n`{s_title}` ➔ `{t_title}`", parse_mode="Markdown")
+                    bot.send_message(call.message.chat.id, "🎯 **Target Pairs**", reply_markup=pairs_list_markup())
+                except Exception as e:
+                    bot.send_message(call.message.chat.id, f"❌ Pair error: {e}")
+            asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
 
     elif data.startswith("pair_view_"):
         pid = int(data.split("_")[-1])
@@ -534,41 +641,6 @@ def handle_state_inputs(message):
                 bot.send_message(message.chat.id, f"❌ Password error: {e}")
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
-
-    # --- Target Pair Flow ---
-    elif state == "awaiting_pair_source":
-        try:
-            sid = int(text)
-            login_data[uid] = {"source_id": sid}
-            admin_states[uid] = "awaiting_pair_target"
-            bot.send_message(message.chat.id, "🎯 Step 2: Send the **Target Chat ID** (where content goes).")
-        except ValueError:
-            bot.reply_to(message, "Invalid ID. Please send a numeric Chat ID.")
-
-    elif state == "awaiting_pair_target":
-        try:
-            tid = int(text)
-            sid = login_data[uid]["source_id"]
-            bot.send_message(message.chat.id, "⏳ Resolving chat titles...")
-            
-            async def resolve_pair():
-                try:
-                    s_chat = await userbot.get_chat(sid)
-                    t_chat = await userbot.get_chat(tid)
-                    s_title = s_chat.title or s_chat.first_name or str(sid)
-                    t_title = t_chat.title or t_chat.first_name or str(tid)
-                    
-                    add_target_pair(sid, tid, s_title, t_title)
-                    bot.send_message(message.chat.id, f"✅ **Pair Added!**\n`{s_title}` ➔ `{t_title}`", parse_mode="Markdown")
-                    admin_states.pop(uid, None)
-                    bot.send_message(message.chat.id, "🎯 **Target Pairs**", reply_markup=pairs_list_markup())
-                except Exception as e:
-                    bot.send_message(message.chat.id, f"❌ Resolution Error: {e}\nEnsure your userbot is in both chats.")
-                    admin_states.pop(uid, None)
-
-            asyncio.run_coroutine_threadsafe(resolve_pair(), loop)
-        except ValueError:
-            bot.reply_to(message, "Invalid ID. Please send a numeric Chat ID.")
 
 async def resolve_target_id(client: Client, target_ref: str):
     try:
