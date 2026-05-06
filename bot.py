@@ -272,6 +272,34 @@ def pairs_list_markup():
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
+def show_pair_view(chat_id, message_id, pid):
+    try:
+        row = get_target_pair(pid)
+        if not row:
+            bot.send_message(chat_id, f"❌ Pair not found (ID: {pid}). It may have been deleted.")
+            return
+            
+        pid, sid, tid, s_title, t_title, is_mon, is_live = row
+        stats = get_pair_stats(pid)
+        
+        mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
+        live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
+        
+        text = (
+            f"📁 **Pair Management**\n\n"
+            f"Source: `{s_title}` (`{sid}`)\n"
+            f"Target: `{t_title}` (`{tid}`)\n\n"
+            f"📊 Collected: `{stats['total']}`\n"
+            f"📥 Pending: `{stats['pending']}`\n\n"
+            f"🤖 **Automation Status:**\n"
+            f"Monitor: `{mon_status}`\n"
+            f"Live: `{live_status}`"
+        )
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Pair View Error: {e}")
+        bot.send_message(chat_id, f"❌ Error opening pair management: {e}")
+
 def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
@@ -548,38 +576,15 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_view_"):
         bot.answer_callback_query(call.id)
-        try:
-            pid = int(data.split("_")[-1])
-            row = get_target_pair(pid)
-            
-            if not row:
-                bot.send_message(call.message.chat.id, "❌ Pair not found.")
-                return
-                
-            pid, sid, tid, s_title, t_title, is_mon, is_live = row
-            stats = get_pair_stats(pid)
-            
-            mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
-            live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
-            
-            text = (
-                f"📁 **Pair Management**\n\n"
-                f"Source: `{s_title}` (`{sid}`)\n"
-                f"Target: `{t_title}` (`{tid}`)\n\n"
-                f"📊 Collected: `{stats['total']}`\n"
-                f"📥 Pending: `{stats['pending']}`\n\n"
-                f"🤖 **Automation Status:**\n"
-                f"Monitor: `{mon_status}`\n"
-                f"Live: `{live_status}`"
-            )
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Pair View Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Error opening pair management: {e}")
+        pid = int(data.split("_")[-1])
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_toggle_mon_"):
         pid = int(data.split("_")[-1])
         row = get_target_pair(pid)
+        if not row:
+            bot.answer_callback_query(call.id, "Pair not found")
+            return
         new_val = 0 if row[5] else 1
         with db_conn() as conn:
             c = conn.cursor()
@@ -591,18 +596,21 @@ def handle_callbacks(call):
             asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid, limit=None), loop)
         
         bot.answer_callback_query(call.id, f"Monitor {'Started' if new_val else 'Stopped'}")
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_toggle_live_"):
         pid = int(data.split("_")[-1])
         row = get_target_pair(pid)
+        if not row:
+            bot.answer_callback_query(call.id, "Pair not found")
+            return
         new_val = 0 if row[6] else 1
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
             c.execute(f"UPDATE target_pairs SET is_live = {p} WHERE id = {p}", (new_val, pid))
         bot.answer_callback_query(call.id, f"Live Forward {'Started' if new_val else 'Stopped'}")
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_hist_menu_"):
         pid = int(data.split("_")[-1])
@@ -658,7 +666,7 @@ def handle_callbacks(call):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id, "🚀 Starting Instant Release...")
         asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid, interval=1.5), loop)
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_rel_slow_"):
         pid = int(data.split("_")[-1])
