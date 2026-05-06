@@ -1205,8 +1205,8 @@ async def main():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                # Force delete webhook and drop any stuck updates
-                bot.remove_webhook(drop_pending_updates=True)
+                # Use delete_webhook instead of remove_webhook to avoid argument errors
+                bot.delete_webhook(drop_pending_updates=True)
                 bot.infinity_polling(skip_pending=True, timeout=20)
             except Exception as e:
                 logger.error(f"❌ Polling crashed: {e}. Restarting in 10s...")
