@@ -847,26 +847,30 @@ def run_web():
 # -----------------------------
 async def main():
     # Start web server IMMEDIATELY for Render health checks
+    logger.info(f"Starting web server on port {PORT}...")
     threading.Thread(target=run_web, daemon=True).start()
     
-    init_db()
-    
-    # Start Watchdog
-    asyncio.create_task(userbot_watchdog())
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"DB Init Error: {e}")
 
-    # Start Keep Alive pinger
+    asyncio.create_task(userbot_watchdog())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
     # Try to start existing session
-    ok, msg = await start_userbot()
-    if ok:
-        logger.info("Userbot started from existing session")
-    else:
-        logger.warning(f"No existing session or start failed: {msg}")
+    try:
+        ok, msg = await start_userbot()
+        if ok: logger.info("✅ Userbot started")
+    except Exception as e: logger.error(f"Userbot error: {e}")
 
     # Start telebot polling in thread
-    threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
-    logger.info("Admin bot polling started")
+    def run_polling():
+        bot.remove_webhook()
+        bot.infinity_polling(skip_pending=True)
+    
+    threading.Thread(target=run_polling, daemon=True).start()
+    logger.info("✨ Admin bot polling started")
     
     await idle()
 
