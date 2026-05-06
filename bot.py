@@ -961,6 +961,69 @@ def cmd_start(message):
         return
     bot.reply_to(message, dashboard_text(), reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
 
+@bot.message_handler(commands=["settarget"])
+def cmd_settarget(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /settarget -1001234567890 OR /settarget @channelusername")
+        return
+    target_ref = parts[1].strip()
+    set_setting("target_chat_ref", target_ref)
+    bot.reply_to(message, f"✅ Target set to: `{target_ref}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["showtarget"])
+def cmd_showtarget(message):
+    if not is_admin(message.from_user.id):
+        return
+    t = get_target_ref() or "Not set"
+    bot.reply_to(message, f"🎯 Current target: `{t}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["setapiid"])
+def cmd_setapiid(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /setapiid 123456")
+        return
+    set_setting("api_id", parts[1])
+    bot.reply_to(message, "✅ API ID saved.")
+
+@bot.message_handler(commands=["setapihash"])
+def cmd_setapihash(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /setapihash <hash>")
+        return
+    set_setting("api_hash", parts[1].strip())
+    bot.reply_to(message, "✅ API Hash saved.")
+
+@bot.message_handler(commands=["setsession"])
+def cmd_setsession(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /setsession <string>")
+        return
+    set_setting("user_session_string", parts[1].strip())
+    bot.reply_to(message, "✅ Session saved.")
+
+@bot.message_handler(commands=["startuserbot"])
+def cmd_startuserbot(message):
+    if not is_admin(message.from_user.id):
+        return
+    async def run():
+        ok, msg = await start_or_reload_userbot()
+        bot.reply_to(message, msg)
+    asyncio.run_coroutine_threadsafe(run(), loop)
+    bot.reply_to(message, "Starting userbot...")
+
+
 
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states, content_types=["text"])
 def admin_state_handler(message):
