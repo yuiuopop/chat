@@ -644,16 +644,22 @@ def handle_state_inputs(message):
 
     elif state == "awaiting_otp":
         otp = text.replace(" ", "")
+        bot.send_message(message.chat.id, "⏳ Verifying OTP...")
         async def verify_otp_task():
             client = login_data[uid].get("client")
             try:
+                logger.info(f"OTP: Verifying for {login_data[uid]['phone']}...")
                 await client.sign_in(phone_number=login_data[uid]["phone"], phone_code_hash=login_data[uid]["phone_code_hash"], phone_code=otp)
+                logger.info("OTP: Success! Finalizing login...")
+                bot.send_message(message.chat.id, "✅ OTP Verified! Finalizing setup...")
                 await complete_login(uid, client, message.chat.id)
             except SessionPasswordNeeded:
+                logger.info("OTP: 2FA required.")
                 admin_states[uid] = "awaiting_password"
-                bot.send_message(message.chat.id, "Step 5: Your account has **2FA enabled**. Please send your password.", parse_mode="Markdown")
+                bot.send_message(message.chat.id, "🔐 Step 5: Your account has **2FA enabled**. Please send your **Cloud Password**.", parse_mode="Markdown")
             except Exception as e:
-                bot.send_message(message.chat.id, f"❌ Error: {e}")
+                logger.error(f"OTP Error: {e}")
+                bot.send_message(message.chat.id, f"❌ OTP Verification Failed: {e}")
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_otp_task(), loop)
 
