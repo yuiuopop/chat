@@ -979,7 +979,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     collected = 0
     scanned = 0
-    status_msg = bot.send_message(admin_chat_id, f"📜 Scraping `{s_title}` history...")
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🛑 Stop Scrape", callback_data=f"pair_stop_task_hist_{pair_id}"))
+    status_msg = bot.send_message(admin_chat_id, f"📜 **History Scrape: `{s_title}`**\n\n🔍 Scanned: `0`\n📥 Collected: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
@@ -1017,8 +1019,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             if limit and collected >= limit: break
             
             if scanned % 100 == 0:
-                l_text = f"/{limit}" if limit else ""
-                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
+                l_text = f" / {limit}" if limit else ""
+                try: bot.edit_message_text(f"📜 **History Scrape: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n\n🚀 *Processing...*", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                 except: pass
         
         bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
@@ -1061,7 +1063,9 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     collected = 0
     scanned = 0
     limit_text = f"`{limit}`" if limit else "all"
-    status_msg = bot.send_message(admin_chat_id, f"📥 Collecting {limit_text} from `{title}`...")
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
+    status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
         # Force peer resolution (Anti PeerIdInvalid)
@@ -1091,7 +1095,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                         )
                     if c.rowcount > 0: collected += 1
             if scanned % 100 == 0:
-                try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
+                try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`\n\n🚀 *Downloading metadata...*", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                 except: pass
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
