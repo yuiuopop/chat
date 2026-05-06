@@ -300,7 +300,13 @@ def show_pair_view(chat_id, message_id, pid):
             f"Monitor: `{mon_status}`\n"
             f"Live: `{live_status}`"
         )
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+        except Exception as e:
+            if "message is not modified" in str(e):
+                pass
+            else:
+                raise e
     except Exception as e:
         logger.error(f"Pair View Error: {e}")
         bot.send_message(chat_id, f"❌ Error opening pair management: {e}")
@@ -565,14 +571,18 @@ def handle_callbacks(call):
             page = int(parts[3])
             async def update_src_list():
                 markup = await get_chat_selection_markup("sel_src", page)
-                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                if markup:
+                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
             asyncio.run_coroutine_threadsafe(update_src_list(), loop)
         else:
             sid = int(parts[2])
             login_data[uid] = {"source_id": sid}
             async def show_tgt_list():
                 markup = await get_chat_selection_markup("sel_tgt", 0)
-                bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                if markup:
+                    bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                else:
+                    bot.send_message(call.message.chat.id, "❌ Error: Could not load target list. Is the userbot connected?")
             asyncio.run_coroutine_threadsafe(show_tgt_list(), loop)
 
     elif data.startswith("sel_tgt_"):
@@ -582,7 +592,8 @@ def handle_callbacks(call):
             page = int(parts[3])
             async def update_tgt_list():
                 markup = await get_chat_selection_markup("sel_tgt", page)
-                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                if markup:
+                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
             asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
         else:
             tid = int(parts[2])
