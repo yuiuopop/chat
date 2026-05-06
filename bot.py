@@ -846,6 +846,9 @@ def run_web():
 # Main Loop
 # -----------------------------
 async def main():
+    # Start web server IMMEDIATELY for Render health checks
+    threading.Thread(target=run_web, daemon=True).start()
+    
     init_db()
     
     # Start Watchdog
@@ -864,9 +867,6 @@ async def main():
     # Start telebot polling in thread
     threading.Thread(target=lambda: bot.infinity_polling(), daemon=True).start()
     logger.info("Admin bot polling started")
-    
-    # Keep alive Flask
-    threading.Thread(target=run_web, daemon=True).start()
     
     await idle()
 
