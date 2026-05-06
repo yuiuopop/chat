@@ -118,10 +118,14 @@ def get_dashboard_text():
     status_emoji = "🟢" if is_online else "🔴"
     status_text = "ONLINE" if is_online else "OFFLINE"
     
+    user_display = "Not Connected"
+    if is_online and userbot.me:
+        user_display = f"@{userbot.me.username}" if userbot.me.username else (userbot.me.first_name or str(userbot.me.id))
+
     text = f"┏━━━━━━━ ⚡ SYSTEM CONSOLE ⚡ ━━━━━━━┓\n"
     text += f"┃\n"
     text += f"┃  🤖 STATUS : {status_emoji} {status_text}\n"
-    text += f"┃  👤 USER   : {('@' + userbot.me.username) if (is_online and userbot.me) else 'Not Connected'}\n"
+    text += f"┃  👤 USER   : {user_display}\n"
     text += f"┃\n"
     text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
     
