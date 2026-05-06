@@ -363,7 +363,11 @@ async def start_userbot():
             api_id=int(api_id),
             api_hash=api_hash,
             session_string=session_string,
-            in_memory=True
+            in_memory=True,
+            device_model="PC 64bit",
+            system_version="Windows 11",
+            app_version="4.11.2",
+            sleep_threshold=60 # Handle long floodwaits gracefully
         )
         await userbot.start()
         # Register automation handlers
@@ -914,6 +918,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 break
             
             scanned += 1
+            await asyncio.sleep(0.05) # Anti-ban: micro-delay to look less automated
             # Date filter
             if end_date and m.date > end_date: continue
             if start_date and m.date < start_date: break # History is newest to oldest
@@ -988,6 +993,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
             scanned += 1
+            await asyncio.sleep(0.05) # Anti-ban delay
             if m.media:
                 media_type = m.media.value
                 with db_conn() as conn:
@@ -1063,7 +1069,7 @@ async def run_release(admin_chat_id, pair_id):
             if sent % 5 == 0:
                 try: bot.edit_message_text(f"🚀 Releasing...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
                 except: pass
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.2) # Increased delay for safety (Anti-ban)
         except Exception as e:
             logger.error(f"Release error: {e}")
             
@@ -1196,8 +1202,9 @@ async def main():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                bot.remove_webhook()
-                bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+                # Force delete webhook and drop any stuck updates
+                bot.remove_webhook(drop_pending_updates=True)
+                bot.infinity_polling(skip_pending=True, timeout=20)
             except Exception as e:
                 logger.error(f"❌ Polling crashed: {e}. Restarting in 10s...")
                 time.sleep(10)
