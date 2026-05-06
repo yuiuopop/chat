@@ -1283,42 +1283,55 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             return
 
         sent = 0
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 **Release Started**\nItems: `{len(items)}`", reply_markup=markup, parse_mode="Markdown")
         
         for row_id, smid in items:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
+            
             try:
+                # 1. Try Fast Copy
                 try:
-                    # Step 1: Try Fast Copy
                     await userbot.copy_message(target_id, sid, smid)
                 except:
+                    # 2. Try Standard Forward
                     try:
-                        # Step 2: Try Standard Forward
                         await userbot.forward_messages(target_id, sid, smid)
                     except:
-                        # Step 3: Super Fallback (Download and Re-upload for Restricted Chats)
+                        # 3. Super Fallback (Download and Re-upload)
                         msg = await userbot.get_messages(sid, smid)
                         if msg and msg.media:
                             f_path = await userbot.download_media(msg)
                             if f_path:
-                                await userbot.send_cached_media(target_id, msg.photo or msg.video or msg.document or msg.audio or msg.animation or msg.voice, caption=msg.caption)
-                                # If cached fails, send file
+                                try:
+                                    await userbot.send_cached_media(target_id, msg.photo or msg.video or msg.document or msg.audio or msg.animation or msg.voice, caption=msg.caption)
+                                except:
+                                    # Send the actual file if cache fails
+                                    if msg.photo: await userbot.send_photo(target_id, f_path, caption=msg.caption)
+                                    elif msg.video: await userbot.send_video(target_id, f_path, caption=msg.caption)
+                                    else: await userbot.send_document(target_id, f_path, caption=msg.caption)
                                 if os.path.exists(f_path): os.remove(f_path)
                             else:
                                 await userbot.send_message(target_id, msg.text or msg.caption or "Media restricted")
                         elif msg:
                             await userbot.send_message(target_id, msg.text or "Empty message")
-                    
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 
+                # Mark as released
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    conn.commit()
+
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
+                    try:
+                        markup = InlineKeyboardMarkup()
+                        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+                        bot.edit_message_text(f"🚀 **Release Engine Active**\n━━━━━━━━━━━━━━━\n◈ Source: `{s_title}`\n◈ Progress: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
