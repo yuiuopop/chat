@@ -952,7 +952,7 @@ async def start_or_reload_userbot() -> tuple[bool, str]:
 def setup_wizard_start(call):
     uid = call.from_user.id
     admin_states[uid] = "wizard_api_id"
-    bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id, "Starting Setup Wizard...")
     bot.edit_message_text("🛠 *Connection Wizard (1/4)*\n\nPlease send your **API ID**.\n(You can get it from [my.telegram.org](https://my.telegram.org))", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
 @bot.message_handler(commands=["start", "help"])
@@ -960,6 +960,26 @@ def cmd_start(message):
     if not is_admin(message.from_user.id):
         return
     bot.reply_to(message, dashboard_text(), reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
+
+@bot.message_handler(commands=["login"])
+def cmd_login_wizard(message):
+    if not is_admin(message.from_user.id):
+        return
+    uid = message.from_user.id
+    admin_states[uid] = "wizard_api_id"
+    bot.reply_to(message, "🛠 *Connection Wizard (1/4)*\n\nPlease send your **API ID**.", parse_mode="Markdown")
+
+@bot.message_handler(commands=["addsession", "setsession"])
+def cmd_add_session(message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /addsession <string_session>")
+        return
+    set_setting("user_session_string", parts[1].strip())
+    bot.reply_to(message, "✅ Session string saved manually.")
+
 
 @bot.message_handler(commands=["settarget"])
 def cmd_settarget(message):
