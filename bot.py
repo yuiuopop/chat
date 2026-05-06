@@ -85,6 +85,8 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    caption_mode INTEGER DEFAULT 0, -- 0: Original, 1: Custom
+                    custom_caption TEXT,
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -92,6 +94,10 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN caption_mode INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN custom_caption TEXT")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -193,14 +199,14 @@ def add_target_pair(sid, tid, s_title, t_title):
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, caption_mode, custom_caption FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs WHERE id = {p}", (pair_id,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, caption_mode, custom_caption FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -237,21 +243,29 @@ def get_dashboard_text():
     is_online = userbot and userbot.is_connected
     status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
     
-    text = f"✨ **SYSTEM CONSOLE**\n"
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM target_pairs")
+        stalks = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM collected_media")
+        items = c.fetchone()[0]
+
+    text = f"🛡️ **SYSTEM CONSOLE**\n"
     text += f"Status: `{status}`\n"
-    if is_online and userbot.me:
-        name = userbot.me.first_name or "User"
-        text += f"Account: `{name}`\n"
-    
-    text += "\n_Manage your automation pairs below:_"
+    text += f"🔭 Active Stalks: `{stalks}`\n"
+    text += f"📥 Total Collected: `{items}`\n\n"
+    text += "_Use 🔭 Stalk to find targets or 📊 Stalking to manage them._"
     return text
 
 def get_dashboard_markup():
-    markup = InlineKeyboardMarkup(row_width=1)
+    markup = InlineKeyboardMarkup(row_width=2)
     is_online = userbot and userbot.is_connected
     
     if is_online:
-        markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
+        markup.add(
+            InlineKeyboardButton("🔭 Stalk", callback_data="stalk_main"),
+            InlineKeyboardButton("📊 Stalking", callback_data="stalking_main")
+        )
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
@@ -276,8 +290,11 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, cap_mode, cap_text = pair
     markup = InlineKeyboardMarkup(row_width=2)
+    
+    # Target Status
+    has_target = tid and tid != 0
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
     live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
@@ -286,6 +303,11 @@ def pair_view_markup(pair_id):
         InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
+    
+    if not has_target:
+        markup.add(InlineKeyboardButton("🎯 Set Target", callback_data=f"pair_set_target_{pair_id}"))
+    else:
+        markup.add(InlineKeyboardButton("📝 Caption Settings", callback_data=f"pair_cap_menu_{pair_id}"))
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
@@ -301,8 +323,8 @@ def pair_view_markup(pair_id):
     if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
     else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
 
-    markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
+    markup.add(InlineKeyboardButton("🗑 Delete Stalk", callback_data=f"pair_delete_confirm_{pair_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back to Stalking", callback_data="stalking_main"))
     return markup
 
 def user_account_markup():
@@ -318,29 +340,40 @@ def user_account_markup():
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
-async def get_chat_selection_markup(prefix, page=0):
+async def get_chat_selection_markup(prefix, page=0, filter_type=None):
     markup = InlineKeyboardMarkup(row_width=1)
     if not userbot or not userbot.is_connected:
         return None
     
     chats = []
     async for dialog in userbot.get_dialogs():
-        if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-            chats.append(dialog.chat)
+        ctype = dialog.chat.type
+        if filter_type:
+            if filter_type == "group" and ctype not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]: continue
+            if filter_type == "channel" and ctype != enums.ChatType.CHANNEL: continue
+            if filter_type == "bot" and ctype != enums.ChatType.BOT: continue
+            if filter_type == "personal" and ctype != enums.ChatType.PRIVATE: continue
+        else:
+            # Default behavior for adding target (show common types)
+            if ctype not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+                continue
+        chats.append(dialog.chat)
     
     # Pagination (10 per page)
     start = page * 10
     end = start + 10
     for chat in chats[start:end]:
-        title = chat.title or "Untitled"
+        title = chat.title or chat.first_name or "Untitled"
         markup.add(InlineKeyboardButton(f"{title}", callback_data=f"{prefix}_{chat.id}"))
     
     nav = []
-    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
-    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
+    cb_filter = f"_{filter_type}" if filter_type else ""
+    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}{cb_filter}"))
+    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}{cb_filter}"))
     if nav: markup.add(*nav)
     
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
+    back_cb = "stalk_main" if filter_type else "stalking_main"
+    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=back_cb))
     return markup
 
 # -----------------------------
@@ -386,7 +419,7 @@ async def setup_automation_handlers(client: Client):
     async def auto_handler(c, m):
         # Fetch active pairs
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, cap_mode, cap_text in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
                 # 1) Monitor: Save to DB if monitoring is ON
@@ -401,10 +434,15 @@ async def setup_automation_handlers(client: Client):
                             else:
                                 db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or ""))
                 
-                # 2) Live Forward: Copy message to target if live is ON
+                # 2) Live Forward: Copy/Forward to target if live is ON
                 if is_live:
                     try:
-                        await m.copy(tid)
+                        if cap_mode == 0:
+                            # Original: Forward (shows tag)
+                            await m.forward(tid)
+                        else:
+                            # Custom: Copy (removes tag) with custom text
+                            await m.copy(tid, caption=cap_text)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
@@ -483,14 +521,105 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
-    elif data == "pairs_main":
+    elif data == "stalking_main":
         bot.answer_callback_query(call.id)
         try:
             markup = pairs_list_markup()
-            bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.edit_message_text("📊 **Active Stalking**\nSelect a stalk to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Pairs List Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
+            logger.error(f"Stalking List Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error loading stalks: {e}")
+
+    elif data == "stalk_main":
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("👥 Group", callback_data="stalk_type_group_0"),
+            InlineKeyboardButton("📢 Channel", callback_data="stalk_type_channel_0")
+        )
+        markup.add(
+            InlineKeyboardButton("🤖 Bot", callback_data="stalk_type_bot_0"),
+            InlineKeyboardButton("👤 Personal", callback_data="stalk_type_personal_0")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+        bot.edit_message_text("🔭 **Stalk Mode**\nSelect a category to find a source to monitor:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("stalk_type_"):
+        parts = data.split("_")
+        ctype = parts[2]
+        page = int(parts[3])
+        bot.answer_callback_query(call.id)
+        async def show_stalk_list():
+            markup = await get_chat_selection_markup("sel_stalk", page, filter_type=ctype)
+            bot.edit_message_text(f"🔭 **Select {ctype.title()}**\nChoose the target to stalk:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_stalk_list(), loop)
+
+    elif data.startswith("sel_stalk_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[2] == "page":
+            page = int(parts[3])
+            ctype = parts[4]
+            async def update_stalk_list():
+                markup = await get_chat_selection_markup("sel_stalk", page, filter_type=ctype)
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_stalk_list(), loop)
+        else:
+            sid = int(parts[2])
+            bot.edit_message_text("⏳ Initializing Stalk...", call.message.chat.id, call.message.message_id)
+            
+            async def finalize_stalk():
+                try:
+                    s_chat = await userbot.get_chat(sid)
+                    s_title = s_chat.title or s_chat.first_name or "Unknown"
+                    
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        # Add as monitoring by default
+                        c.execute(
+                            "INSERT INTO target_pairs (source_id, target_id, source_title, target_title, is_monitoring) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (sid, 0, s_title, "No Target Set", 1)
+                        )
+                    bot.send_message(call.message.chat.id, f"✅ Now Stalking: `{s_title}`\nMonitoring is enabled by default.")
+                    handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "stalking_main", 'message': call.message, 'id': call.id}))
+                except Exception as e:
+                    bot.send_message(call.message.chat.id, f"❌ Stalk failed: {e}")
+            asyncio.run_coroutine_threadsafe(finalize_stalk(), loop)
+
+    elif data.startswith("pair_set_target_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        async def show_target_list():
+            markup = await get_chat_selection_markup(f"sel_target_stalk_{pid}", 0)
+            bot.edit_message_text("🎯 **Set Target**\nSelect the group or channel where media should be sent:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_target_list(), loop)
+
+    elif data.startswith("sel_target_stalk_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        pid = int(parts[3])
+        if parts[4] == "page":
+            page = int(parts[5])
+            async def update_target_list():
+                markup = await get_chat_selection_markup(f"sel_target_stalk_{pid}", page)
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_target_list(), loop)
+        else:
+            tid = int(parts[4])
+            async def finalize_target():
+                try:
+                    t_chat = await userbot.get_chat(tid)
+                    t_title = t_chat.title or t_chat.first_name or "Unknown"
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE target_pairs SET target_id = {p}, target_title = {p} WHERE id = {p}", (tid, t_title, pid))
+                    bot.send_message(call.message.chat.id, f"✅ Target set to: `{t_title}`")
+                    handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+                except Exception as e:
+                    bot.send_message(call.message.chat.id, f"❌ Target setting failed: {e}")
+            asyncio.run_coroutine_threadsafe(finalize_target(), loop)
 
     elif data == "pair_add_start":
         bot.answer_callback_query(call.id)
@@ -556,21 +685,22 @@ def handle_callbacks(call):
                 bot.send_message(call.message.chat.id, "❌ Pair not found.")
                 return
                 
-            pid, sid, tid, s_title, t_title, is_mon, is_live = row
+            pid, sid, tid, s_title, t_title, is_mon, is_live, cap_mode, cap_text = row
             stats = get_pair_stats(pid)
             
             mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
             live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
+            cap_status = "📄 Original" if cap_mode == 0 else f"✏️ Custom: `{cap_text[:20]}...`"
             
             text = (
                 f"📁 **Pair Management**\n\n"
-                f"Source: `{s_title}` (`{sid}`)\n"
-                f"Target: `{t_title}` (`{tid}`)\n\n"
-                f"📊 Collected: `{stats['total']}`\n"
-                f"📥 Pending: `{stats['pending']}`\n\n"
+                f"Source: `{s_title}`\n"
+                f"Target: `{t_title}`\n\n"
+                f"📊 Collected: `{stats['total']}` | Pending: `{stats['pending']}`\n\n"
                 f"🤖 **Automation Status:**\n"
                 f"Monitor: `{mon_status}`\n"
-                f"Live: `{live_status}`"
+                f"Live: `{live_status}`\n"
+                f"Caption: `{cap_status}`"
             )
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
         except Exception as e:
@@ -603,6 +733,33 @@ def handle_callbacks(call):
             c.execute(f"UPDATE target_pairs SET is_live = {p} WHERE id = {p}", (new_val, pid))
         bot.answer_callback_query(call.id, f"Live Forward {'Started' if new_val else 'Stopped'}")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("pair_cap_menu_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        row = get_target_pair(pid)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📄 Original (+Forward Tag)", callback_data=f"pair_cap_set_orig_{pid}"),
+            InlineKeyboardButton("✏️ Edit Caption (Remove Tag)", callback_data=f"pair_cap_set_edit_{pid}")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
+        bot.edit_message_text("📝 **Caption Settings**\n\nSelect how media should be released:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("pair_cap_set_orig_"):
+        pid = int(data.split("_")[-1])
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET caption_mode = 0 WHERE id = {p}", (pid,))
+        bot.answer_callback_query(call.id, "Caption set to Original")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("pair_cap_set_edit_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = f"cap_setup_text_{pid}"
+        bot.send_message(call.message.chat.id, "✏️ **Custom Caption**\n\nEnter the new caption for this pair:\n(Forwarding tags will be removed)")
 
     elif data.startswith("pair_hist_menu_"):
         pid = int(data.split("_")[-1])
@@ -645,6 +802,12 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
+        row = get_target_pair(pid)
+        if not row[2] or row[2] == 0:
+            bot.answer_callback_query(call.id, "⚠️ No target set! Please set a target first.")
+            handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_set_target_{pid}", 'message': call.message, 'id': call.id}))
+            return
+            
         bot.answer_callback_query(call.id)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
@@ -896,6 +1059,17 @@ def handle_state_inputs(message):
         bot.send_message(message.chat.id, f"🚀 **Slow Release Started**\nPair: `{pid}` | Interval: `{interval}s`")
         asyncio.run_coroutine_threadsafe(run_release(message.chat.id, pid, interval=interval), loop)
 
+    elif state.startswith("cap_setup_text_"):
+        pid = int(state.split("_")[-1])
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET caption_mode = 1, custom_caption = {p} WHERE id = {p}", (text, pid))
+        admin_states.pop(uid)
+        bot.send_message(message.chat.id, f"✅ Custom caption saved for Pair `{pid}`!")
+        # Trigger pair view refresh
+        handle_callbacks(type('obj', (object,), {'from_user': message.from_user, 'data': f"pair_view_{pid}", 'message': message, 'id': '0'}))
+
     # --- History Scraper Flow ---
     elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
@@ -1097,8 +1271,13 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
-                try: await userbot.copy_message(target_id, sid, smid)
-                except: await userbot.forward_messages(target_id, sid, smid)
+                # Caption & Forward Tag Logic
+                if cap_mode == 0:
+                    # Original Mode: Standard Forward (shows "Forwarded from...")
+                    await userbot.forward_messages(target_id, sid, smid)
+                else:
+                    # Custom Mode: Copy Message with custom text (Removes forward tag)
+                    await userbot.copy_message(target_id, sid, smid, caption=cap_text)
                 
                 with db_conn() as conn:
                     c = conn.cursor()
