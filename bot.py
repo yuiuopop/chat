@@ -547,30 +547,35 @@ def handle_callbacks(call):
             asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
 
     elif data.startswith("pair_view_"):
-        pid = int(data.split("_")[-1])
-        row = get_target_pair(pid)
-        
-        if not row:
-            bot.answer_callback_query(call.id, "Pair not found.")
-            return
+        bot.answer_callback_query(call.id)
+        try:
+            pid = int(data.split("_")[-1])
+            row = get_target_pair(pid)
             
-        pid, sid, tid, s_title, t_title, is_mon, is_live = row
-        stats = get_pair_stats(pid)
-        
-        mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
-        live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
-        
-        text = (
-            f"📁 **Pair Management**\n\n"
-            f"Source: `{s_title}` (`{sid}`)\n"
-            f"Target: `{t_title}` (`{tid}`)\n\n"
-            f"📊 Collected: `{stats['total']}`\n"
-            f"📥 Pending: `{stats['pending']}`\n\n"
-            f"🤖 **Automation Status:**\n"
-            f"Monitor: `{mon_status}`\n"
-            f"Live: `{live_status}`"
-        )
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+            if not row:
+                bot.send_message(call.message.chat.id, "❌ Pair not found.")
+                return
+                
+            pid, sid, tid, s_title, t_title, is_mon, is_live = row
+            stats = get_pair_stats(pid)
+            
+            mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
+            live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
+            
+            text = (
+                f"📁 **Pair Management**\n\n"
+                f"Source: `{s_title}` (`{sid}`)\n"
+                f"Target: `{t_title}` (`{tid}`)\n\n"
+                f"📊 Collected: `{stats['total']}`\n"
+                f"📥 Pending: `{stats['pending']}`\n\n"
+                f"🤖 **Automation Status:**\n"
+                f"Monitor: `{mon_status}`\n"
+                f"Live: `{live_status}`"
+            )
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Pair View Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error opening pair management: {e}")
 
     elif data.startswith("pair_toggle_mon_"):
         pid = int(data.split("_")[-1])
