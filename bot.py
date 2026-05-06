@@ -151,10 +151,17 @@ def set_setting(key, value):
 def add_target_pair(sid, tid, s_title, t_title):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
-            (sid, tid, s_title, t_title)
-        )
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (sid, tid, s_title, t_title)
+            )
+        else:
+            c.execute(
+                "INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                (sid, tid, s_title, t_title)
+            )
 
 def get_target_pairs():
     with db_conn() as conn:
@@ -165,7 +172,8 @@ def get_target_pairs():
 def get_pair_stats(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT COUNT(*), SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) FROM collected_media WHERE pair_id = ?", (pair_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT COUNT(*), SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) FROM collected_media WHERE pair_id = {p}", (pair_id,))
         row = c.fetchone()
         return {"total": row[0] or 0, "pending": row[1] or 0}
 
@@ -466,8 +474,9 @@ def handle_callbacks(call):
         pid = int(data.split("_")[-1])
         with db_conn() as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM target_pairs WHERE id = ?", (pid,))
-            c.execute("DELETE FROM collected_media WHERE pair_id = ?", (pid,))
+            p = get_placeholder()
+            c.execute(f"DELETE FROM target_pairs WHERE id = {p}", (pid,))
+            c.execute(f"DELETE FROM collected_media WHERE pair_id = {p}", (pid,))
         bot.answer_callback_query(call.id, "Pair Deleted")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
 
@@ -481,7 +490,11 @@ def handle_callbacks(call):
         userbot = None
         with db_conn() as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+            p = get_placeholder()
+            if DATABASE_URL:
+                c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+            else:
+                c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
         
         bot.answer_callback_query(call.id, "Session Cleared")
         bot.edit_message_text("✅ **Userbot Logged Out Successfully**\nSession deleted.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
@@ -691,7 +704,8 @@ async def run_collection(admin_chat_id, pair_id):
     if not userbot: return
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT source_id, source_title FROM target_pairs WHERE id = ?", (pair_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT source_id, source_title FROM target_pairs WHERE id = {p}", (pair_id,))
         row = c.fetchone()
     
     if not row: return
@@ -707,10 +721,17 @@ async def run_collection(admin_chat_id, pair_id):
                 media_type = m.media.value
                 with db_conn() as conn:
                     c = conn.cursor()
-                    c.execute(
-                        "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
-                        (pair_id, m.id, media_type, m.caption or "")
-                    )
+                    p = get_placeholder()
+                    if DATABASE_URL:
+                        c.execute(
+                            "INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, m.id, media_type, m.caption or "")
+                        )
+                    else:
+                        c.execute(
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
+                            (pair_id, m.id, media_type, m.caption or "")
+                        )
                     if c.rowcount > 0: collected += 1
             if scanned % 100 == 0:
                 try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
@@ -723,7 +744,8 @@ async def run_release(admin_chat_id, pair_id):
     if not userbot: return
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT source_id, target_id FROM target_pairs WHERE id = ?", (pair_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT source_id, target_id FROM target_pairs WHERE id = {p}", (pair_id,))
         row = c.fetchone()
     
     if not row: return
@@ -738,7 +760,8 @@ async def run_release(admin_chat_id, pair_id):
 
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_message_id FROM collected_media WHERE pair_id = ? AND released = 0", (pair_id,))
+        p = get_placeholder()
+        c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
         items = c.fetchall()
     
     if not items:
@@ -755,7 +778,8 @@ async def run_release(admin_chat_id, pair_id):
             
             with db_conn() as conn:
                 c = conn.cursor()
-                c.execute("UPDATE collected_media SET released = 1 WHERE id = ?", (row_id,))
+                p = get_placeholder()
+                c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
             sent += 1
             if sent % 5 == 0:
                 try: bot.edit_message_text(f"🚀 Releasing...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
