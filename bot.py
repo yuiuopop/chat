@@ -373,8 +373,9 @@ async def get_chat_selection_markup(prefix, page=0):
     for chat in chats[start:end]:
         chat_type = chat.type
         if chat_type == enums.ChatType.PRIVATE:
-            icon = "🤖" if chat.is_bot else "👤"
-            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "User"
+            is_bot = chat.username and chat.username.lower().endswith("bot")
+            icon = "🤖" if is_bot else "👤"
+            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or chat.username or "User"
         elif chat_type == enums.ChatType.CHANNEL:
             icon = "📢"
             title = chat.title or "Channel"
