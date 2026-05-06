@@ -61,6 +61,15 @@ def db_conn():
     finally:
         conn.close()
 
+def edit_msg(chat_id, message_id, text, markup=None, parse_mode="Markdown"):
+    try:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown" if parse_mode=="Markdown" else None)
+    except Exception as e:
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise e
+
 def get_placeholder():
     return "%s" if DATABASE_URL else "?"
 
@@ -300,13 +309,7 @@ def show_pair_view(chat_id, message_id, pid):
             f"Monitor: `{mon_status}`\n"
             f"Live: `{live_status}`"
         )
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
-        except Exception as e:
-            if "message is not modified" in str(e):
-                pass
-            else:
-                raise e
+        edit_msg(chat_id, message_id, text, pair_view_markup(pid))
     except Exception as e:
         logger.error(f"Pair View Error: {e}")
         bot.send_message(chat_id, f"❌ Error opening pair management: {e}")
@@ -568,13 +571,13 @@ def handle_callbacks(call):
     
     if data == "dash_main":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+        edit_msg(call.message.chat.id, call.message.message_id, get_dashboard_text(), get_dashboard_markup())
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
         try:
             markup = pairs_list_markup()
-            bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            edit_msg(call.message.chat.id, call.message.message_id, "🎯 **Target Pairs**\nSelect a pair to manage collection or release:", markup)
         except Exception as e:
             logger.error(f"Pairs List Error: {e}")
             bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
@@ -1197,22 +1200,34 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     # If copy fails (e.g. restricted content), try download/upload
                     try:
                         msg = await userbot.get_messages(sid, smid)
+                        if not msg or msg.empty:
+                             logger.warning(f"Message {smid} not found in {sid}")
+                             continue
+                             
                         if msg.media:
-                            path = await msg.download()
+                            # Use a specific temp folder to avoid permission issues
+                            temp_dir = "temp_media"
+                            if not os.path.exists(temp_dir): os.makedirs(temp_dir)
+                            
+                            path = await userbot.download_media(msg, file_name=f"{temp_dir}/")
                             if path:
                                 caption = msg.caption or ""
-                                if msg.photo:
-                                    await userbot.send_photo(target_id, path, caption=caption)
-                                elif msg.video:
-                                    await userbot.send_video(target_id, path, caption=caption)
-                                elif msg.animation:
-                                    await userbot.send_animation(target_id, path, caption=caption)
-                                elif msg.voice:
-                                    await userbot.send_voice(target_id, path, caption=caption)
-                                elif msg.audio:
-                                    await userbot.send_audio(target_id, path, caption=caption)
-                                else:
-                                    await userbot.send_document(target_id, path, caption=caption)
+                                try:
+                                    if msg.photo:
+                                        await userbot.send_photo(target_id, path, caption=caption)
+                                    elif msg.video:
+                                        await userbot.send_video(target_id, path, caption=caption)
+                                    elif msg.animation:
+                                        await userbot.send_animation(target_id, path, caption=caption)
+                                    elif msg.voice:
+                                        await userbot.send_voice(target_id, path, caption=caption)
+                                    elif msg.audio:
+                                        await userbot.send_audio(target_id, path, caption=caption)
+                                    else:
+                                        await userbot.send_document(target_id, path, caption=caption)
+                                except Exception as upload_err:
+                                    logger.error(f"Stealth Upload Failed: {upload_err}")
+                                    bot.send_message(admin_chat_id, f"⚠️ Stealth Upload Failed for msg `{smid}`: {upload_err}")
                                 
                                 if os.path.exists(path): os.remove(path)
                         elif msg.text:
