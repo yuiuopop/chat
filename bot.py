@@ -241,20 +241,15 @@ def is_task_running(task_key):
 # -----------------------------
 def get_dashboard_text():
     is_online = userbot and userbot.is_connected
-    status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
+    status = "🟢 ONLINE" if is_online else "🔴 OFFLINE"
     
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM target_pairs")
-        stalks = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM collected_media")
-        items = c.fetchone()[0]
-
-    text = f"🛡️ **SYSTEM CONSOLE**\n"
+    text = f"✨ **SYSTEM CONSOLE**\n"
     text += f"Status: `{status}`\n"
-    text += f"🔭 Active Stalks: `{stalks}`\n"
-    text += f"📥 Total Collected: `{items}`\n\n"
-    text += "_Use 🔭 Stalk to find targets or 📊 Stalking to manage them._"
+    if is_online and userbot.me:
+        name = userbot.me.first_name or "User"
+        text += f"Account: `{name}`\n"
+    
+    text += "\n_Choose an action to proceed:_"
     return text
 
 def get_dashboard_markup():
@@ -263,8 +258,8 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(
-            InlineKeyboardButton("🔭 Stalk", callback_data="stalk_main"),
-            InlineKeyboardButton("📊 Stalking", callback_data="stalking_main")
+            InlineKeyboardButton("🔍 Stalk", callback_data="stalk_main"),
+            InlineKeyboardButton("🕵️ Stalking", callback_data="stalking_main")
         )
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
     else:
@@ -293,9 +288,6 @@ def pair_view_markup(pair_id):
     pid, sid, tid, s_title, t_title, is_mon, is_live, cap_mode, cap_text = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
-    # Target Status
-    has_target = tid and tid != 0
-    
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
     live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
     
@@ -303,11 +295,7 @@ def pair_view_markup(pair_id):
         InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
-    
-    if not has_target:
-        markup.add(InlineKeyboardButton("🎯 Set Target", callback_data=f"pair_set_target_{pair_id}"))
-    else:
-        markup.add(InlineKeyboardButton("📝 Caption Settings", callback_data=f"pair_cap_menu_{pair_id}"))
+    markup.add(InlineKeyboardButton("📝 Caption Settings", callback_data=f"pair_cap_menu_{pair_id}"))
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
@@ -320,10 +308,14 @@ def pair_view_markup(pair_id):
     if is_coll: markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
     else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
     
-    if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
-    else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
+    if tid:
+        if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+        else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
+    else:
+        markup.add(InlineKeyboardButton("🎯 Set Target", callback_data=f"pair_set_target_{pair_id}"))
+        markup.add(InlineKeyboardButton("🚀 Release (Set Target First)", callback_data=f"pair_set_target_{pair_id}"))
 
-    markup.add(InlineKeyboardButton("🗑 Delete Stalk", callback_data=f"pair_delete_confirm_{pair_id}"))
+    markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Stalking", callback_data="stalking_main"))
     return markup
 
@@ -340,24 +332,18 @@ def user_account_markup():
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
-async def get_chat_selection_markup(prefix, page=0, filter_type=None):
+async def get_chat_selection_markup(prefix, page=0, types=None):
     markup = InlineKeyboardMarkup(row_width=1)
     if not userbot or not userbot.is_connected:
         return None
     
+    if types is None:
+        types = [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]
+    
     chats = []
     async for dialog in userbot.get_dialogs():
-        ctype = dialog.chat.type
-        if filter_type:
-            if filter_type == "group" and ctype not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]: continue
-            if filter_type == "channel" and ctype != enums.ChatType.CHANNEL: continue
-            if filter_type == "bot" and ctype != enums.ChatType.BOT: continue
-            if filter_type == "personal" and ctype != enums.ChatType.PRIVATE: continue
-        else:
-            # Default behavior for adding target (show common types)
-            if ctype not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                continue
-        chats.append(dialog.chat)
+        if dialog.chat.type in types:
+            chats.append(dialog.chat)
     
     # Pagination (10 per page)
     start = page * 10
@@ -367,13 +353,11 @@ async def get_chat_selection_markup(prefix, page=0, filter_type=None):
         markup.add(InlineKeyboardButton(f"{title}", callback_data=f"{prefix}_{chat.id}"))
     
     nav = []
-    cb_filter = f"_{filter_type}" if filter_type else ""
-    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}{cb_filter}"))
-    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}{cb_filter}"))
+    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
+    if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
     if nav: markup.add(*nav)
     
-    back_cb = "stalk_main" if filter_type else "stalking_main"
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=back_cb))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
 # -----------------------------
@@ -525,155 +509,110 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         try:
             markup = pairs_list_markup()
-            bot.edit_message_text("📊 **Active Stalking**\nSelect a stalk to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.edit_message_text("🕵️ **Stalking List**\nManage your active sources and targets:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Stalking List Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Error loading stalks: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error loading stalking list: {e}")
 
     elif data == "stalk_main":
         bot.answer_callback_query(call.id)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("👥 Group", callback_data="stalk_type_group_0"),
-            InlineKeyboardButton("📢 Channel", callback_data="stalk_type_channel_0")
+            InlineKeyboardButton("👥 Groups", callback_data="stalk_cat_groups_0"),
+            InlineKeyboardButton("📢 Channels", callback_data="stalk_cat_channels_0")
         )
         markup.add(
-            InlineKeyboardButton("🤖 Bot", callback_data="stalk_type_bot_0"),
-            InlineKeyboardButton("👤 Personal", callback_data="stalk_type_personal_0")
+            InlineKeyboardButton("🤖 Bots", callback_data="stalk_cat_bots_0"),
+            InlineKeyboardButton("👤 Personal", callback_data="stalk_cat_personal_0")
         )
         markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
-        bot.edit_message_text("🔭 **Stalk Mode**\nSelect a category to find a source to monitor:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text("🔍 **Stalking Center**\nSelect a category to find a source:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-    elif data.startswith("stalk_type_"):
+    elif data.startswith("stalk_cat_"):
+        bot.answer_callback_query(call.id)
         parts = data.split("_")
-        ctype = parts[2]
+        cat = parts[2]
         page = int(parts[3])
-        bot.answer_callback_query(call.id)
-        async def show_stalk_list():
-            markup = await get_chat_selection_markup("sel_stalk", page, filter_type=ctype)
-            bot.edit_message_text(f"🔭 **Select {ctype.title()}**\nChoose the target to stalk:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(show_stalk_list(), loop)
+        
+        types_map = {
+            "groups": [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP],
+            "channels": [enums.ChatType.CHANNEL],
+            "bots": [enums.ChatType.BOT],
+            "personal": [enums.ChatType.PRIVATE]
+        }
+        
+        async def show_cat_list():
+            markup = await get_chat_selection_markup(f"stalk_sel_{cat}", page, types=types_map.get(cat))
+            bot.edit_message_text(f"🔍 **Stalking {cat.title()}**\nSelect a chat to start collecting:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_cat_list(), loop)
 
-    elif data.startswith("sel_stalk_"):
+    elif data.startswith("stalk_sel_"):
         bot.answer_callback_query(call.id)
         parts = data.split("_")
-        if parts[2] == "page":
-            page = int(parts[3])
-            ctype = parts[4]
-            async def update_stalk_list():
-                markup = await get_chat_selection_markup("sel_stalk", page, filter_type=ctype)
+        # stalk_sel_{cat}_{id} OR stalk_sel_{cat}_page_{num}
+        if parts[3] == "page":
+            cat = parts[2]
+            page = int(parts[4])
+            types_map = {
+                "groups": [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP],
+                "channels": [enums.ChatType.CHANNEL],
+                "bots": [enums.ChatType.BOT],
+                "personal": [enums.ChatType.PRIVATE]
+            }
+            async def update_cat_list():
+                markup = await get_chat_selection_markup(f"stalk_sel_{cat}", page, types=types_map.get(cat))
                 bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-            asyncio.run_coroutine_threadsafe(update_stalk_list(), loop)
+            asyncio.run_coroutine_threadsafe(update_cat_list(), loop)
         else:
-            sid = int(parts[2])
-            bot.edit_message_text("⏳ Initializing Stalk...", call.message.chat.id, call.message.message_id)
-            
-            async def finalize_stalk():
+            cat = parts[2]
+            sid = int(parts[3])
+            async def start_stalking():
                 try:
                     s_chat = await userbot.get_chat(sid)
-                    s_title = s_chat.title or s_chat.first_name or "Unknown"
-                    
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        # Add as monitoring by default
-                        c.execute(
-                            "INSERT INTO target_pairs (source_id, target_id, source_title, target_title, is_monitoring) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (sid, 0, s_title, "No Target Set", 1)
-                        )
-                    bot.send_message(call.message.chat.id, f"✅ Now Stalking: `{s_title}`\nMonitoring is enabled by default.")
-                    handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "stalking_main", 'message': call.message, 'id': call.id}))
+                    s_title = s_chat.title or s_chat.first_name or str(sid)
+                    # Create pair with target=None (0 for simplicity)
+                    add_target_pair(sid, 0, s_title, "No Target Set")
+                    bot.send_message(call.message.chat.id, f"✅ **Stalking Started!**\nNow collecting from `{s_title}`.\nGo to 'Stalking' to set a target or release.")
+                    bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
                 except Exception as e:
-                    bot.send_message(call.message.chat.id, f"❌ Stalk failed: {e}")
-            asyncio.run_coroutine_threadsafe(finalize_stalk(), loop)
+                    bot.send_message(call.message.chat.id, f"❌ Stalk error: {e}")
+            asyncio.run_coroutine_threadsafe(start_stalking(), loop)
 
     elif data.startswith("pair_set_target_"):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
-        async def show_target_list():
-            markup = await get_chat_selection_markup(f"sel_target_stalk_{pid}", 0)
-            bot.edit_message_text("🎯 **Set Target**\nSelect the group or channel where media should be sent:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(show_target_list(), loop)
+        async def show_tgt_list():
+            markup = await get_chat_selection_markup(f"stalk_tgt_{pid}", 0)
+            bot.edit_message_text("🎯 **Select Target Chat**\nChoose where the collected media should be sent:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_tgt_list(), loop)
 
-    elif data.startswith("sel_target_stalk_"):
+    elif data.startswith("stalk_tgt_"):
         bot.answer_callback_query(call.id)
         parts = data.split("_")
-        pid = int(parts[3])
-        if parts[4] == "page":
-            page = int(parts[5])
-            async def update_target_list():
-                markup = await get_chat_selection_markup(f"sel_target_stalk_{pid}", page)
+        # stalk_tgt_{pid}_{id} OR stalk_tgt_{pid}_page_{num}
+        pid = int(parts[2])
+        if parts[3] == "page":
+            page = int(parts[4])
+            async def update_tgt_list():
+                markup = await get_chat_selection_markup(f"stalk_tgt_{pid}", page)
                 bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-            asyncio.run_coroutine_threadsafe(update_target_list(), loop)
+            asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
         else:
-            tid = int(parts[4])
+            tid = int(parts[3])
             async def finalize_target():
                 try:
                     t_chat = await userbot.get_chat(tid)
-                    t_title = t_chat.title or t_chat.first_name or "Unknown"
+                    t_title = t_chat.title or t_chat.first_name or str(tid)
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE target_pairs SET target_id = {p}, target_title = {p} WHERE id = {p}", (tid, t_title, pid))
-                    bot.send_message(call.message.chat.id, f"✅ Target set to: `{t_title}`")
-                    handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+                    bot.send_message(call.message.chat.id, f"✅ **Target Set!**\nNew Target: `{t_title}`")
+                    # Refresh view
+                    handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': '0'}))
                 except Exception as e:
-                    bot.send_message(call.message.chat.id, f"❌ Target setting failed: {e}")
+                    bot.send_message(call.message.chat.id, f"❌ Target error: {e}")
             asyncio.run_coroutine_threadsafe(finalize_target(), loop)
-
-    elif data == "pair_add_start":
-        bot.answer_callback_query(call.id)
-        async def show_src_list():
-            markup = await get_chat_selection_markup("sel_src", 0)
-            if markup:
-                bot.edit_message_text("🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            else:
-                bot.send_message(call.message.chat.id, "❌ Userbot not connected.")
-        asyncio.run_coroutine_threadsafe(show_src_list(), loop)
-
-    elif data.startswith("sel_src_"):
-        bot.answer_callback_query(call.id)
-        parts = data.split("_")
-        if parts[2] == "page":
-            page = int(parts[3])
-            async def update_src_list():
-                markup = await get_chat_selection_markup("sel_src", page)
-                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-            asyncio.run_coroutine_threadsafe(update_src_list(), loop)
-        else:
-            sid = int(parts[2])
-            login_data[uid] = {"source_id": sid}
-            async def show_tgt_list():
-                markup = await get_chat_selection_markup("sel_tgt", 0)
-                bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(show_tgt_list(), loop)
-
-    elif data.startswith("sel_tgt_"):
-        bot.answer_callback_query(call.id)
-        parts = data.split("_")
-        if parts[2] == "page":
-            page = int(parts[3])
-            async def update_tgt_list():
-                markup = await get_chat_selection_markup("sel_tgt", page)
-                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-            asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
-        else:
-            tid = int(parts[2])
-            sid = login_data[uid]["source_id"]
-            bot.edit_message_text("⏳ Resolving pair...", call.message.chat.id, call.message.message_id)
-            
-            async def finalize_pair():
-                try:
-                    s_chat = await userbot.get_chat(sid)
-                    t_chat = await userbot.get_chat(tid)
-                    s_title = s_chat.title or s_chat.first_name or str(sid)
-                    t_title = t_chat.title or t_chat.first_name or str(tid)
-                    add_target_pair(sid, tid, s_title, t_title)
-                    bot.send_message(call.message.chat.id, f"✅ **Pair Added!**\n`{s_title}` ➔ `{t_title}`", parse_mode="Markdown")
-                    bot.send_message(call.message.chat.id, "🎯 **Target Pairs**", reply_markup=pairs_list_markup())
-                except Exception as e:
-                    bot.send_message(call.message.chat.id, f"❌ Pair error: {e}")
-            asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
 
     elif data.startswith("pair_view_"):
         bot.answer_callback_query(call.id)
@@ -688,29 +627,38 @@ def handle_callbacks(call):
             pid, sid, tid, s_title, t_title, is_mon, is_live, cap_mode, cap_text = row
             stats = get_pair_stats(pid)
             
-            mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
-            live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
-            
-            # Fix: Handle NoneType for custom captions
-            safe_cap = (cap_text[:25] + "...") if cap_text else "None"
-            cap_status = "📄 Original" if cap_mode == 0 else f"✏️ Custom: `{safe_cap}`"
-            
-            target_display = f"`{t_title}`" if (tid and tid != 0) else "🔴 **No Target Linked**"
-            
-            text = (
-                f"🔭 **Stalk Management**\n\n"
-                f"Source: `{s_title}`\n"
-                f"Target: {target_display}\n\n"
-                f"📊 Collected: `{stats['total']}` | Pending: `{stats['pending']}`\n\n"
-                f"🤖 **Automation Status:**\n"
-                f"Monitor: `{mon_status}`\n"
-                f"Live: `{live_status}`\n"
-                f"Caption: `{cap_status}`"
-            )
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+            # Fetch total message count for "Stalking" feel
+            async def get_stalk_text():
+                try:
+                    chat = await userbot.get_chat(sid)
+                    total_present = chat.messages_count or "N/A"
+                except:
+                    total_present = "N/A"
+                
+                mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
+                live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
+                cap_status = "📄 Original" if cap_mode == 0 else f"✏️ Custom"
+                
+                target_display = f"`{t_title}`" if tid else "⚠️ **No Target Set**"
+                
+                text = (
+                    f"🕵️ **Stalking Dashboard**\n\n"
+                    f"Source: `{s_title}`\n"
+                    f"Target: {target_display}\n\n"
+                    f"📊 **Data Stats**:\n"
+                    f"Collected: `{stats['total']}`\n"
+                    f"Present in Source: `{total_present}`\n"
+                    f"Pending Release: `{stats['pending']}`\n\n"
+                    f"🤖 **Automation Status:**\n"
+                    f"Monitor: `{mon_status}`\n"
+                    f"Live: `{live_status}`\n"
+                    f"Caption: `{cap_status}`"
+                )
+                bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(get_stalk_text(), loop)
         except Exception as e:
             logger.error(f"Pair View Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Error opening pair management: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error opening stalking dashboard: {e}")
 
     elif data.startswith("pair_toggle_mon_"):
         pid = int(data.split("_")[-1])
@@ -807,12 +755,6 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_release_"):
         pid = int(data.split("_")[-1])
-        row = get_target_pair(pid)
-        if not row[2] or row[2] == 0:
-            bot.answer_callback_query(call.id, "⚠️ No target set! Please set a target first.")
-            handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_set_target_{pid}", 'message': call.message, 'id': call.id}))
-            return
-            
         bot.answer_callback_query(call.id)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
@@ -1443,3 +1385,4 @@ async def main():
 
 if __name__ == "__main__":
     loop.run_until_complete(main())
+
