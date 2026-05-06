@@ -345,6 +345,16 @@ def cmd_list(message):
 
     asyncio.run_coroutine_threadsafe(fetch_and_list(), loop)
 
+@bot.message_handler(commands=["logout"])
+def cmd_logout(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Yes, Logout", callback_data="user_logout_do"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
+    bot.send_message(message.chat.id, "⚠️ **Logout Confirmation**\n\nThis will stop the userbot and delete the session from the database. Are you sure?", reply_markup=markup, parse_mode="Markdown")
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     global userbot
@@ -460,6 +470,22 @@ def handle_callbacks(call):
             c.execute("DELETE FROM collected_media WHERE pair_id = ?", (pid,))
         bot.answer_callback_query(call.id, "Pair Deleted")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
+
+    elif data == "user_logout_do":
+        if userbot:
+            async def stop_ub():
+                try: await userbot.stop()
+                except: pass
+            asyncio.run_coroutine_threadsafe(stop_ub(), loop)
+        
+        userbot = None
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+        
+        bot.answer_callback_query(call.id, "Session Cleared")
+        bot.edit_message_text("✅ **Userbot Logged Out Successfully**\nSession deleted.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
     elif data == "user_connect_start":
         bot.answer_callback_query(call.id)
@@ -735,6 +761,39 @@ async def run_release(admin_chat_id, pair_id):
     bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
 
 # -----------------------------
+# Watchdog
+# -----------------------------
+async def userbot_watchdog():
+    """
+    Periodically check if the userbot session is still valid.
+    If banned or deactivated, clear session and notify admin.
+    """
+    while True:
+        global userbot
+        if userbot and userbot.is_connected:
+            try:
+                await userbot.get_me()
+            except Exception as e:
+                err_msg = str(e).lower()
+                # Common errors for banned/nuked accounts
+                if "deactivated" in err_msg or "authorized" in err_msg or "auth_key" in err_msg:
+                    logger.warning(f"WATCHDOG: Userbot session invalid: {e}")
+                    try: await userbot.stop()
+                    except: pass
+                    userbot = None
+                    
+                    # Clear session from DB
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+                    
+                    bot.send_message(ADMIN_ID, f"⚠️ **USERBOT SESSION EXPIRED/BANNED**\n\nThe account has been deactivated or unauthorized. Session has been cleared.\nError: `{e}`", parse_mode="Markdown")
+                else:
+                    logger.error(f"WATCHDOG: Unexpected error: {e}")
+        
+        await asyncio.sleep(1800) # Check every 30 minutes
+
+# -----------------------------
 # Health + keepalive
 # -----------------------------
 def keep_alive_worker():
@@ -789,6 +848,9 @@ def run_web():
 async def main():
     init_db()
     
+    # Start Watchdog
+    asyncio.create_task(userbot_watchdog())
+
     # Start Keep Alive pinger
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
