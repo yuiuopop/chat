@@ -1200,14 +1200,28 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                         if msg.media:
                             path = await msg.download()
                             if path:
-                                # Send as new document to bypass restriction
-                                await userbot.send_document(target_id, path, caption=msg.caption)
+                                caption = msg.caption or ""
+                                if msg.photo:
+                                    await userbot.send_photo(target_id, path, caption=caption)
+                                elif msg.video:
+                                    await userbot.send_video(target_id, path, caption=caption)
+                                elif msg.animation:
+                                    await userbot.send_animation(target_id, path, caption=caption)
+                                elif msg.voice:
+                                    await userbot.send_voice(target_id, path, caption=caption)
+                                elif msg.audio:
+                                    await userbot.send_audio(target_id, path, caption=caption)
+                                else:
+                                    await userbot.send_document(target_id, path, caption=caption)
+                                
                                 if os.path.exists(path): os.remove(path)
                         elif msg.text:
                             await userbot.send_message(target_id, msg.text)
                     except Exception as e2:
                         logger.error(f"Deep copy failed: {e2}")
-                        await userbot.forward_messages(target_id, sid, smid)
+                        # Final fallback: Try forward
+                        try: await userbot.forward_messages(target_id, sid, smid)
+                        except: pass
                 
                 with db_conn() as conn:
                     c = conn.cursor()
