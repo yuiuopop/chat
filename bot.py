@@ -441,8 +441,46 @@ async def complete_login(uid, client, chat_id):
         bot.send_message(chat_id, f"❌ Failed to start userbot after login: {msg}")
 
 # -----------------------------
-# Flask Health Check
+# Health + keepalive
 # -----------------------------
+def keep_alive_worker():
+    """
+    Periodically ping this service URL to reduce idle/sleep risk on Render.
+    Auto-detects URL from environment variables.
+    """
+    def detect_public_url() -> str:
+        # 1) Render
+        url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        if url: return url.rstrip("/")
+        
+        # 2) Railway
+        url = os.getenv("RAILWAY_STATIC_URL", "").strip()
+        if url:
+            if url.startswith("http"): return url.rstrip("/")
+            return f"https://{url}".rstrip("/")
+        
+        # 3) Generic
+        url = os.getenv("WEB_URL", "").strip()
+        if url: return url.rstrip("/")
+        
+        return ""
+
+    detected_url = ""
+    while True:
+        try:
+            url = detect_public_url()
+            if url:
+                if url != detected_url:
+                    detected_url = url
+                    logger.info(f"KEEP_ALIVE: Detected public URL: {detected_url}")
+                requests.get(url, timeout=12)
+            else:
+                logger.info("KEEP_ALIVE: Public URL not detected yet; skipping ping cycle.")
+        except Exception as e:
+            logger.warning(f"KEEP_ALIVE: Ping failed: {e}")
+        finally:
+            time.sleep(600) # 10 minutes
+
 app = Flask(__name__)
 @app.route("/")
 def health():
@@ -457,6 +495,9 @@ def run_web():
 async def main():
     init_db()
     
+    # Start Keep Alive pinger
+    threading.Thread(target=keep_alive_worker, daemon=True).start()
+
     # Try to start existing session
     ok, msg = await start_userbot()
     if ok:
