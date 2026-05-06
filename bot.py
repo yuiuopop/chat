@@ -448,6 +448,11 @@ def cmd_list(message):
             bot.send_message(message.chat.id, f"❌ Error fetching chats: {e}")
 
     asyncio.run_coroutine_threadsafe(fetch_and_list(), loop)
+    
+@bot.message_handler(commands=['ping'])
+def cmd_ping(message):
+    if message.from_user.id != ADMIN_ID: return
+    bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
@@ -469,10 +474,17 @@ def handle_callbacks(call):
     data = call.data
     
     if data == "dash_main":
+        bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
     elif data == "pairs_main":
-        bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        try:
+            markup = pairs_list_markup()
+            bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Pairs List Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
 
     elif data == "pair_add_start":
         bot.answer_callback_query(call.id)
@@ -1074,17 +1086,21 @@ def keep_alive_worker():
     Auto-detects URL from environment variables.
     """
     def detect_public_url() -> str:
-        # 1) Render
+        # 1) Render Env
         url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
         if url: return url.rstrip("/")
         
-        # 2) Railway
+        # 2) DB Saved (Auto-detected from first visit)
+        url = get_setting("detected_url")
+        if url: return url.rstrip("/")
+        
+        # 3) Railway Env
         url = os.getenv("RAILWAY_STATIC_URL", "").strip()
         if url:
             if url.startswith("http"): return url.rstrip("/")
             return f"https://{url}".rstrip("/")
         
-        # 3) Generic
+        # 4) Manual Generic
         url = os.getenv("WEB_URL", "").strip()
         if url: return url.rstrip("/")
         
@@ -1097,19 +1113,31 @@ def keep_alive_worker():
             if url:
                 if url != detected_url:
                     detected_url = url
-                    logger.info(f"KEEP_ALIVE: Detected public URL: {detected_url}")
-                # Use a random param to avoid cache
-                requests.get(f"{url}?t={int(time.time())}", timeout=12)
+                    logger.info(f"KEEP_ALIVE: Monitoring URL: {detected_url}")
+                
+                resp = requests.get(f"{url}?t={int(time.time())}", timeout=15)
+                logger.info(f"KEEP_ALIVE: Ping sent to {url}, Status: {resp.status_code}")
             else:
-                logger.info("KEEP_ALIVE: Public URL not detected yet; skipping ping cycle.")
+                # If no URL is set in ENV, we can't ping
+                logger.warning("KEEP_ALIVE: No RENDER_EXTERNAL_URL or WEB_URL found. Bot will likely sleep on Render Free tier!")
         except Exception as e:
             logger.warning(f"KEEP_ALIVE: Ping failed: {e}")
         finally:
-            time.sleep(300) # 5 minutes (Render sleep is 15 mins)
+            time.sleep(240) # 4 minutes
+
+from flask import Flask, request
 
 app = Flask(__name__)
 @app.route("/")
 def health():
+    # Auto-detect URL from the first request
+    if not get_setting("detected_url"):
+        # We assume https because Render/Railway use it
+        protocol = "https" if request.is_secure or "https" in request.url_root else "http"
+        detected = f"{protocol}://{request.host}"
+        set_setting("detected_url", detected)
+        logger.info(f"KEEP_ALIVE: Auto-detected and SAVED public URL: {detected}")
+    
     return "Userbot v2 Running", 200
 
 def run_web():
