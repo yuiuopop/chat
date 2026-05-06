@@ -449,7 +449,7 @@ async def setup_automation_handlers(client: Client):
     async def auto_handler(c, m):
         # Fetch active pairs
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
                 # 1) Monitor: Save to DB if monitoring is ON
@@ -1136,6 +1136,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     break
                 
                 scanned += 1
+                if scanned % 50 == 0:
+                    logger.info(f"Scrape Progress: {scanned} scanned, {collected} collected from {s_title}")
+                
                 await asyncio.sleep(0.05) # Anti-ban delay
                 
                 if end_date and m.date > end_date: continue
@@ -1153,13 +1156,15 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                             (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
-                    if c.rowcount > 0: collected += 1
+                    
+                    if c.rowcount > 0:
+                        collected += 1
                 
                 if limit and collected >= limit: break
                 
                 if scanned % 100 == 0:
                     l_text = f"/{limit}" if limit else ""
-                    try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
+                    try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`\n_Status: Processing messages..._", admin_chat_id, status_msg.message_id, parse_mode="Markdown")
                     except: pass
             
             conn.commit() # Ensure everything is saved
