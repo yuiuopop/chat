@@ -117,17 +117,20 @@ def init_db():
             # SQLite
             c.execute("""
                 CREATE TABLE IF NOT EXISTS target_pairs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     source_id BIGINT,
                     target_id BIGINT,
                     source_title TEXT,
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    is_stalking INTEGER DEFAULT 0,
                     UNIQUE(source_id, target_id)
                 )
             """)
             # Migration check
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_stalking INTEGER DEFAULT 0")
+            except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
@@ -252,10 +255,13 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(
-            InlineKeyboardButton("👁️ Stalk", callback_data="stalk_menu"),
-            InlineKeyboardButton("📡 Stalking", callback_data="pairs_main")
+            InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"),
+            InlineKeyboardButton("🔍 Stalk", callback_data="stalk_menu")
         )
-        markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
+        markup.add(
+            InlineKeyboardButton("🕵️ Stalking", callback_data="stalking_main"),
+            InlineKeyboardButton("👤 User Account", callback_data="user_acc_main")
+        )
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
@@ -274,17 +280,37 @@ def stalk_menu_markup():
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
+def stalking_list_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_title, is_monitoring FROM target_pairs WHERE is_stalking = 1")
+        pairs = c.fetchall()
+        
+    for pid, s_title, is_mon in pairs:
+        stats = get_pair_stats(pid)
+        mon_status = "🔍" if is_mon else ""
+        btn_text = f"🕵️ {s_title} {mon_status} ({stats['pending']})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
+    
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    return markup
+
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_title, target_title, is_monitoring, is_live FROM target_pairs WHERE is_stalking = 0")
+        pairs = c.fetchall()
+        
+    for pid, s_title, t_title, is_mon, is_live in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
-        t_text = t_title if tid else "⚠️ NO TARGET"
-        btn_text = f"📁 {s_title} ➔ {t_text} {mon_status}{live_status} ({stats['pending']})"
+        btn_text = f"🎯 {s_title} ➔ {t_title} {mon_status}{live_status}"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
+    markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
@@ -292,10 +318,10 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
-    mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
+    mon_btn = "🛑 Stop Monitor" if is_mon else "🔍 Monitor"
     live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
     
     markup.add(
@@ -514,7 +540,7 @@ def handle_callbacks(call):
 
     elif data == "stalk_menu":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text("👁️ **Stalk Engine**\nSelect a category to find a source:", call.message.chat.id, call.message.message_id, reply_markup=stalk_menu_markup(), parse_mode="Markdown")
+        bot.edit_message_text("🔍 **Stalk Engine**\nSelect a category to find a source:", call.message.chat.id, call.message.message_id, reply_markup=stalk_menu_markup(), parse_mode="Markdown")
 
     elif data.startswith("stalk_list_"):
         parts = data.split("_")
@@ -523,7 +549,7 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         async def show_list():
             markup = await get_chat_selection_markup(f"sel_stalk_{type_str}", page, filter_type=type_str)
-            bot.edit_message_text(f"👁️ **Stalk {type_str.title()}**\nChoose a chat to start stalking:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.edit_message_text(f"🔍 **Stalk {type_str.title()}**\nChoose a chat to start stalking:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         asyncio.run_coroutine_threadsafe(show_list(), loop)
 
     elif data.startswith("sel_stalk_"):
@@ -549,9 +575,11 @@ def handle_callbacks(call):
                     if c.fetchone():
                         bot.send_message(call.message.chat.id, f"⚠️ You are already stalking `{title}`!")
                     else:
-                        c.execute(f"INSERT INTO target_pairs (source_id, source_title, target_id, target_title) VALUES ({p}, {p}, NULL, NULL)", (sid, title))
-                        bot.send_message(call.message.chat.id, f"✅ **Stalking Started!**\nChat: `{title}`\nNow set a target chat in 'Stalking' menu to enable release.")
-                handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
+                        c.execute(f"INSERT INTO target_pairs (source_id, source_title, target_id, target_title, is_stalking, is_monitoring) VALUES ({p}, {p}, NULL, NULL, 1, 1)", (sid, title))
+                        bot.send_message(call.message.chat.id, f"✅ **Stalking Started!**\nChat: `{title}`\nBot is now collecting all history and monitoring new content.")
+                        # Auto-start collection
+                        asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, sid, limit=None), loop)
+                handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "stalking_main", 'message': call.message, 'id': call.id}))
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(start_stalk(), loop)
@@ -591,6 +619,15 @@ def handle_callbacks(call):
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(finalize_target(), loop)
+
+    elif data == "stalking_main":
+        bot.answer_callback_query(call.id)
+        try:
+            markup = stalking_list_markup()
+            bot.edit_message_text("🕵️ **Stalking Engine**\nSelect a source to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Stalking List Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error loading stalking sources: {e}")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
@@ -665,32 +702,43 @@ def handle_callbacks(call):
                 bot.send_message(call.message.chat.id, "❌ Pair not found.")
                 return
                 
-            pid, sid, tid, s_title, t_title, is_mon, is_live = row
+            pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk = row
             stats = get_pair_stats(pid)
             
             async def fetch_stats_and_show():
-                try:
-                    total_in_chat = await userbot.get_chat_history_count(sid)
-                except:
-                    total_in_chat = "N/A"
+                try: total_in_chat = await userbot.get_chat_history_count(sid)
+                except: total_in_chat = "N/A"
                     
                 mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
                 live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
                 
-                t_text = f"`{t_title}`" if tid else "⚠️ **NOT SET** (Set Target to Enable Release)"
+                if is_stalk:
+                    # STALKING VIEW
+                    t_text = f"`{t_title}`" if tid else "⚠️ **NOT SET** (Required for Release)"
+                    text = (
+                        f"🕵️ **Stalking Dashboard**\n\n"
+                        f"Source: `{s_title}`\n"
+                        f"Target: {t_text}\n\n"
+                        f"📊 **Media Stats:**\n"
+                        f"Collected: `{stats['total']}`\n"
+                        f"Present in Chat: `{total_in_chat}`\n"
+                        f"📥 Pending Release: `{stats['pending']}`\n\n"
+                        f"🤖 **Status:** `{mon_status}`"
+                    )
+                else:
+                    # TARGET PAIR VIEW
+                    text = (
+                        f"🎯 **Target Pair Management**\n\n"
+                        f"Source: `{s_title}`\n"
+                        f"Target: `{t_title}`\n\n"
+                        f"📊 **Stats:**\n"
+                        f"Collected: `{stats['total']}`\n"
+                        f"📥 Pending: `{stats['pending']}`\n\n"
+                        f"🤖 **Automation Status:**\n"
+                        f"Monitor: `{mon_status}`\n"
+                        f"Live Forward: `{live_status}`"
+                    )
                 
-                text = (
-                    f"📡 **Stalking Dashboard**\n\n"
-                    f"Source: `{s_title}`\n"
-                    f"Target: {t_text}\n\n"
-                    f"📊 **Media Stats:**\n"
-                    f"Collected: `{stats['total']}`\n"
-                    f"Present in Chat: `{total_in_chat}`\n"
-                    f"📥 Pending Release: `{stats['pending']}`\n\n"
-                    f"🤖 **Automation Status:**\n"
-                    f"Monitor: `{mon_status}`\n"
-                    f"Live: `{live_status}`"
-                )
                 bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(fetch_stats_and_show(), loop)
         except Exception as e:
