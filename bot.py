@@ -573,7 +573,9 @@ def build_temp_client(api_id: int, api_hash: str) -> Client:
 @bot.callback_query_handler(func=lambda call: True)
 
 def handle_callbacks(call):
-    global userbot
+    try:
+        global userbot
+
     uid = call.from_user.id
     if not is_admin(uid):
         bot.answer_callback_query(call.id, "Unauthorized.")
@@ -924,6 +926,17 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "Credentials wiped")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
 
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            logger.error(f"Callback error: {e}")
+            bot.answer_callback_query(call.id, f"❌ Error: {e}")
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {e}")
+
+
 
 
 
@@ -1189,7 +1202,7 @@ def cmd_checktarget(message):
     async def run_check():
         try:
             me = await userbot.get_me()
-            chat = await userbot.get_chat(target_ref)
+            chat = await resolve_target_id(userbot, target_ref)
             title = chat.title or chat.first_name or str(chat.id)
             bot.reply_to(
                 message,
@@ -1198,6 +1211,7 @@ def cmd_checktarget(message):
             )
         except Exception as e:
             bot.reply_to(message, f"❌ Target access failed for current userbot session:\n`{e}`", parse_mode="Markdown")
+
 
     asyncio.run_coroutine_threadsafe(run_check(), loop)
 
@@ -2222,6 +2236,26 @@ async def advanced_scrape_task(admin_chat_id, source_chat_id, mode="count", limi
         bot.send_message(admin_chat_id, f"❌ Scrape failed for `{source_chat_id}`: {e}")
 
 
+async def resolve_target_id(client: Client, target_ref: str):
+    """Robustly resolve a chat ID or username into a Pyrogram chat object."""
+    try:
+        # 1. Try direct resolution (works if in cache)
+        return await client.get_chat(target_ref)
+    except Exception:
+        # 2. Try parsing as integer and using get_chat
+        try:
+            if str(target_ref).lstrip("-").isdigit():
+                return await client.get_chat(int(target_ref))
+        except Exception: pass
+        
+        # 3. Last resort: Scan dialogs to 'meet' the peer
+        async for dialog in client.get_dialogs(limit=50):
+            if str(dialog.chat.id) == str(target_ref) or dialog.chat.username == str(target_ref).replace("@", ""):
+                return dialog.chat
+                
+    raise ValueError(f"Could not find or 'meet' chat: {target_ref}. Try opening the group in your Telegram app first.")
+
+
 async def release_engine(admin_chat_id, source_chat_id=None, limit=None):
     global userbot
     if not userbot:
@@ -2233,13 +2267,14 @@ async def release_engine(admin_chat_id, source_chat_id=None, limit=None):
         bot.send_message(admin_chat_id, "❌ Set target first with /settarget")
         return
     
-    # Resolve target ID early
+    # Resolve target ID robustly
     try:
-        target_chat = await userbot.get_chat(target_raw)
+        target_chat = await resolve_target_id(userbot, target_raw)
         target_id = target_chat.id
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Cannot access target `{target_raw}`: {e}")
         return
+
 
     try:
         # Get items to release
