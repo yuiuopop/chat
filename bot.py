@@ -555,13 +555,22 @@ def handle_callbacks(call):
             bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
 
     elif data == "pair_add_start":
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "🔍 Loading your chats...")
         async def show_src_list():
-            markup = await get_chat_selection_markup("sel_src", 0)
-            if markup:
-                bot.edit_message_text("🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            else:
-                bot.send_message(call.message.chat.id, "❌ Userbot not connected.")
+            try:
+                is_ok, msg = await ensure_userbot()
+                if not is_ok:
+                    bot.send_message(call.message.chat.id, f"❌ Userbot connection failed: {msg}\n\nPlease go to **👤 User Account** and ensure your session is active.")
+                    return
+                
+                markup = await get_chat_selection_markup("sel_src", 0)
+                if markup:
+                    bot.edit_message_text("🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                else:
+                    bot.edit_message_text("❌ No chats found. Make sure your userbot is in at least one group or channel.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+            except Exception as e:
+                logger.error(f"Add Pair Start Error: {e}")
+                bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(show_src_list(), loop)
 
     elif data.startswith("sel_src_"):
