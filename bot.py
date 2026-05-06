@@ -637,7 +637,7 @@ def handle_callbacks(call):
                         p = get_placeholder()
                         c.execute(f"INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES ({p}, {p}, {p}, {p}) ON CONFLICT DO NOTHING", (sid, tid, s_title, t_title))
                     
-                    bot.edit_message_text(f"✅ **Pair Added Successfully!**\n\nSource: `{s_title}`\nTarget: `{t_title}`", call.message.chat.id, call.message.message_id, reply_markup=pairs_main_markup(), parse_mode="Markdown")
+                    bot.edit_message_text(f"✅ **Pair Added Successfully!**\n\nSource: `{s_title}`\nTarget: `{t_title}`", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
                 except Exception as e:
                     logger.error(f"Pair Finalize Error: {e}")
                     bot.send_message(call.message.chat.id, f"❌ Error adding pair: {e}")
