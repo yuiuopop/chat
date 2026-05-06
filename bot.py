@@ -596,8 +596,25 @@ def handle_callbacks(call):
     elif data.startswith("pair_hist_menu_"):
         pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
-        admin_states[uid] = f"hist_setup_count_{pid}"
-        bot.send_message(call.message.chat.id, "📜 **History Scraper**\n\nHow many messages would you like to scrape from this chat?\n(Send a number, e.g., `500`)")
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔢 Count Based", callback_data=f"pair_hist_type_count_{pid}"),
+            InlineKeyboardButton("📅 Date Based", callback_data=f"pair_hist_type_date_{pid}")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
+        bot.edit_message_text("📜 **History Scraper**\n\nChoose your scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("pair_hist_type_count_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = f"hist_setup_count_only_{pid}"
+        bot.send_message(call.message.chat.id, "🔢 **Count Based Scrape**\n\nHow many messages would you like to scrape?")
+
+    elif data.startswith("pair_hist_type_date_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = f"hist_setup_date_start_{pid}"
+        bot.send_message(call.message.chat.id, "📅 **Date Based Scrape**\n\nEnter **Start Date** (DD/MM/YYYY):")
 
     elif data.startswith("pair_stop_task_"):
         parts = data.split("_")
@@ -841,40 +858,40 @@ def handle_state_inputs(message):
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
     # --- History Scraper Flow ---
-    elif state.startswith("hist_setup_count_"):
+    elif state.startswith("hist_setup_count_only_"):
         pid = int(state.split("_")[-1])
         if not text.isdigit():
             bot.reply_to(message, "Please send a number.")
             return
-        login_data[uid] = {"hist_count": int(text)}
-        admin_states[uid] = f"hist_setup_start_date_{pid}"
-        bot.send_message(message.chat.id, "📍 Enter **Start Date** (DD/MM/YYYY):\n(Example: `01/01/2024`)")
+        count = int(text)
+        admin_states.pop(uid)
+        bot.send_message(message.chat.id, f"🚀 **Count Scrape Started**\nPair: `{pid}` | Limit: `{count}`")
+        asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, limit=count), loop)
 
-    elif state.startswith("hist_setup_start_date_"):
+    elif state.startswith("hist_setup_date_start_"):
         pid = int(state.split("_")[-1])
         try:
             dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
-            login_data[uid]["start_date"] = dt
-            admin_states[uid] = f"hist_setup_end_date_{pid}"
-            bot.send_message(message.chat.id, "📍 Enter **End Date** (DD/MM/YYYY):\n(Example: `31/12/2024`)")
+            login_data[uid] = {"start_date": dt}
+            admin_states[uid] = f"hist_setup_date_end_{pid}"
+            bot.send_message(message.chat.id, "📍 Enter **End Date** (DD/MM/YYYY):")
         except ValueError:
             bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
 
-    elif state.startswith("hist_setup_end_date_"):
+    elif state.startswith("hist_setup_date_end_"):
         pid = int(state.split("_")[-1])
         try:
             dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
-            count = login_data[uid]["hist_count"]
             start_date = login_data[uid]["start_date"]
             end_date = dt
             admin_states.pop(uid)
             login_data.pop(uid)
-            bot.send_message(message.chat.id, f"🚀 **Scrape Started**\nPair: `{pid}` | Max: `{count}`\nRange: `{start_date.date()}` to `{end_date.date()}`")
-            asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, count, start_date, end_date), loop)
+            bot.send_message(message.chat.id, f"🚀 **Date Scrape Started**\nPair: `{pid}`\nRange: `{start_date.date()}` to `{end_date.date()}`")
+            asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, start_date=start_date, end_date=end_date), loop)
         except ValueError:
             bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
 
-async def run_history_scrape(admin_chat_id, pair_id, limit, start_date, end_date):
+async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None, end_date=None):
     if not userbot: return
     task_key = f"hist_{pair_id}"
     running_tasks[task_key] = True
@@ -888,14 +905,18 @@ async def run_history_scrape(admin_chat_id, pair_id, limit, start_date, end_date
     status_msg = bot.send_message(admin_chat_id, f"📜 Scraping `{s_title}` history...")
     
     try:
+        # Resolve peer first to avoid PeerIdInvalid
+        await userbot.get_chat(sid)
+        
         async for m in userbot.get_chat_history(sid):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
                 break
-                
+            
             scanned += 1
-            if m.date > end_date: continue
-            if m.date < start_date: break # Assuming history is newest to oldest
+            # Date filter
+            if end_date and m.date > end_date: continue
+            if start_date and m.date < start_date: break # History is newest to oldest
             
             if m.media:
                 media_type = m.media.value
@@ -914,9 +935,11 @@ async def run_history_scrape(admin_chat_id, pair_id, limit, start_date, end_date
                         )
                     if c.rowcount > 0: collected += 1
             
-            if collected >= limit: break
+            if limit and collected >= limit: break
+            
             if scanned % 100 == 0:
-                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}/{limit}`", admin_chat_id, status_msg.message_id)
+                l_text = f"/{limit}" if limit else ""
+                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
                 except: pass
         
         bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
@@ -957,6 +980,9 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     status_msg = bot.send_message(admin_chat_id, f"📥 Collecting {limit_text} from `{title}`...")
     
     try:
+        # Resolve peer first to avoid PeerIdInvalid
+        await userbot.get_chat(sid)
+        
         async for m in userbot.get_chat_history(sid, limit=limit):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
