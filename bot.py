@@ -1067,8 +1067,17 @@ async def start_or_reload_userbot() -> tuple[bool, str]:
         me = await userbot.get_me()
         return True, f"Userbot running as @{me.username or me.id}"
     except Exception as e:
+        error_str = str(e).lower()
+        is_nuked = any(x in error_str for x in ["deactivated", "revoked", "unregistered", "expired"])
+        
+        if is_nuked:
+            logger.error(f"Userbot session is DEAD/NUKED: {e}. Removing from DB.")
+            set_setting("user_session_string", "")
+            bot.send_message(ADMIN_ID, f"🚨 *Userbot Session NUKED*\n\nTelegram has deactivated or revoked this session. It has been automatically removed from the bot config.", parse_mode="Markdown")
+        
         userbot = None
         return False, f"Failed to start userbot: {e}"
+
 
 
 # -----------------------------
