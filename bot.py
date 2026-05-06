@@ -73,6 +73,27 @@ def init_db():
                 value TEXT
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS target_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id BIGINT,
+                target_id BIGINT,
+                source_title TEXT,
+                target_title TEXT,
+                UNIQUE(source_id, target_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS collected_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair_id INTEGER,
+                source_message_id BIGINT,
+                media_type TEXT,
+                caption TEXT,
+                released INTEGER DEFAULT 0,
+                UNIQUE(pair_id, source_message_id)
+            )
+        """)
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
@@ -101,6 +122,27 @@ def set_setting(key, value):
                 (key, str(value))
             )
 
+def add_target_pair(sid, tid, s_title, t_title):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            (sid, tid, s_title, t_title)
+        )
+
+def get_target_pairs():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_id, target_id, source_title, target_title FROM target_pairs")
+        return c.fetchall()
+
+def get_pair_stats(pair_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) FROM collected_media WHERE pair_id = ?", (pair_id,))
+        row = c.fetchone()
+        return {"total": row[0] or 0, "pending": row[1] or 0}
+
 # -----------------------------
 # Global State
 # -----------------------------
@@ -115,41 +157,49 @@ login_data = {} # Temporary storage for login steps
 # -----------------------------
 def get_dashboard_text():
     is_online = userbot and userbot.is_connected
-    status_emoji = "🟢" if is_online else "🔴"
-    status_text = "ONLINE" if is_online else "OFFLINE"
+    status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
     
-    user_display = "Not Connected"
+    text = f"✨ **SYSTEM CONSOLE**\n"
+    text += f"Status: `{status}`\n"
     if is_online and userbot.me:
-        user_display = f"@{userbot.me.username}" if userbot.me.username else (userbot.me.first_name or str(userbot.me.id))
-
-    text = f"┏━━━━━━━ ⚡ SYSTEM CONSOLE ⚡ ━━━━━━━┓\n"
-    text += f"┃\n"
-    text += f"┃  🤖 STATUS : {status_emoji} {status_text}\n"
-    text += f"┃  👤 USER   : {user_display}\n"
-    text += f"┃\n"
-    text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        name = userbot.me.first_name or "User"
+        text += f"Account: `{name}`\n"
     
-    if is_online:
-        text += "✅ Your userbot is active and monitoring.\n"
-        text += "Use the buttons below to manage your account."
-    else:
-        text += "❌ Your userbot is currently disconnected.\n"
-        text += "Please click the **Connect** button to start."
-    
+    text += "\n_Manage your automation pairs below:_"
     return text
 
 def get_dashboard_markup():
-    markup = InlineKeyboardMarkup(row_width=2)
+    markup = InlineKeyboardMarkup(row_width=1)
     is_online = userbot and userbot.is_connected
     
     if is_online:
+        markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
-        markup.add(InlineKeyboardButton("🔄 Refresh Status", callback_data="dash_refresh"))
-        markup.add(InlineKeyboardButton("🔴 Disconnect", callback_data="user_disconnect_confirm"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
-        markup.add(InlineKeyboardButton("🔄 Refresh", callback_data="dash_refresh"))
     
+    return markup
+
+def pairs_list_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    pairs = get_target_pairs()
+    for pid, sid, tid, s_title, t_title in pairs:
+        stats = get_pair_stats(pid)
+        btn_text = f"📁 {s_title} ➔ {t_title} ({stats['pending']})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
+    
+    markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    return markup
+
+def pair_view_markup(pair_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📥 Collect", callback_data=f"pair_collect_{pair_id}"),
+        InlineKeyboardButton("🚀 Release", callback_data=f"pair_release_{pair_id}")
+    )
+    markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
 
 def user_account_markup():
@@ -220,34 +270,68 @@ def handle_callbacks(call):
 
     data = call.data
     
-    if data == "dash_refresh" or data == "dash_main":
-        bot.edit_message_text(
-            get_dashboard_text(),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=get_dashboard_markup(),
-            parse_mode="Markdown"
+    if data == "dash_main":
+        bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+
+    elif data == "pairs_main":
+        bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
+
+    elif data == "pair_add_start":
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = "awaiting_pair_source"
+        bot.send_message(call.message.chat.id, "📍 Step 1: Send the **Source Chat ID** (where content comes from).")
+
+    elif data.startswith("pair_view_"):
+        pid = int(data.split("_")[-1])
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT source_id, target_id, source_title, target_title FROM target_pairs WHERE id = ?", (pid,))
+            row = c.fetchone()
+        
+        if not row:
+            bot.answer_callback_query(call.id, "Pair not found.")
+            return
+            
+        stats = get_pair_stats(pid)
+        text = (
+            f"📁 **Pair Details**\n\n"
+            f"Source: `{row[2]}` (`{row[0]}`)\n"
+            f"Target: `{row[3]}` (`{row[1]}`)\n\n"
+            f"📊 Collected: `{stats['total']}`\n"
+            f"📥 Pending: `{stats['pending']}`"
         )
-        bot.answer_callback_query(call.id, "Dashboard updated")
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+
+    elif data.startswith("pair_collect_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🚀 Starting Collection...")
+        asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
+
+    elif data.startswith("pair_release_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🚀 Starting Release...")
+        asyncio.run_coroutine_threadsafe(run_release(call.message.chat.id, pid), loop)
+
+    elif data.startswith("pair_delete_confirm_"):
+        pid = int(data.split("_")[-1])
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"pair_delete_do_{pid}"))
+        markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"pair_view_{pid}"))
+        bot.edit_message_text("⚠️ Delete this pair and all its collected media history?", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+    elif data.startswith("pair_delete_do_"):
+        pid = int(data.split("_")[-1])
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM target_pairs WHERE id = ?", (pid,))
+            c.execute("DELETE FROM collected_media WHERE pair_id = ?", (pid,))
+        bot.answer_callback_query(call.id, "Pair Deleted")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
 
     elif data == "user_connect_start":
         bot.answer_callback_query(call.id)
         admin_states[uid] = "awaiting_api_id"
         bot.send_message(call.message.chat.id, "Step 1: Please send your **API ID**.\n(Get it from my.telegram.org)", parse_mode="Markdown")
-
-    elif data == "user_disconnect_confirm":
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("✅ Yes, Disconnect", callback_data="user_disconnect_do"))
-        markup.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
-        bot.edit_message_text("⚠️ Are you sure you want to disconnect the userbot?", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-    elif data == "user_disconnect_do":
-        if userbot:
-            async def stop_ub():
-                await userbot.stop()
-            asyncio.run_coroutine_threadsafe(stop_ub(), loop)
-        bot.answer_callback_query(call.id, "Userbot disconnected")
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
 
     elif data == "user_acc_main":
         bot.edit_message_text(
@@ -341,12 +425,31 @@ def handle_callbacks(call):
 
         asyncio.run_coroutine_threadsafe(run_view(), loop)
 
+async def complete_login(uid, client, chat_id):
+    session_string = await client.export_session_string()
+    set_setting("api_id", login_data[uid]["api_id"])
+    set_setting("api_hash", login_data[uid]["api_hash"])
+    set_setting("session_string", session_string)
+    
+    admin_states.pop(uid, None)
+    login_data.pop(uid, None)
+    
+    bot.send_message(chat_id, "✅ **Userbot Connected Successfully!**", parse_mode="Markdown")
+    
+    # Restart the global userbot with new session
+    ok, msg = await start_userbot()
+    if ok:
+        bot.send_message(chat_id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, f"❌ Failed to start userbot after login: {msg}")
+
 @bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(m.from_user.id))
 def handle_state_inputs(message):
     uid = message.from_user.id
     state = admin_states.get(uid)
     text = message.text.strip()
     
+    # --- Login Flow ---
     if state == "awaiting_api_id":
         if not text.isdigit():
             bot.reply_to(message, "Invalid API ID. Please send a numeric ID.")
@@ -365,87 +468,173 @@ def handle_state_inputs(message):
 
     elif state == "awaiting_phone":
         login_data[uid]["phone"] = text
-        
-        # Now start the login process with Pyrogram
         bot.send_message(message.chat.id, "⏳ Sending OTP...")
-        
         async def send_otp_task():
             try:
-                temp_client = Client(
-                    name="temp_login",
-                    api_id=login_data[uid]["api_id"],
-                    api_hash=login_data[uid]["api_hash"],
-                    in_memory=True
-                )
+                temp_client = Client(name="temp_login", api_id=login_data[uid]["api_id"], api_hash=login_data[uid]["api_hash"], in_memory=True)
                 await temp_client.connect()
                 code_info = await temp_client.send_code(login_data[uid]["phone"])
                 login_data[uid]["client"] = temp_client
                 login_data[uid]["phone_code_hash"] = code_info.phone_code_hash
-                
                 admin_states[uid] = "awaiting_otp"
                 bot.send_message(message.chat.id, "Step 4: Please send the **OTP** you received.", parse_mode="Markdown")
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Error: {e}")
                 admin_states.pop(uid, None)
-        
         asyncio.run_coroutine_threadsafe(send_otp_task(), loop)
 
     elif state == "awaiting_otp":
         otp = text.replace(" ", "")
-        
         async def verify_otp_task():
             client = login_data[uid].get("client")
             try:
-                await client.sign_in(
-                    phone_number=login_data[uid]["phone"],
-                    phone_code_hash=login_data[uid]["phone_code_hash"],
-                    phone_code=otp
-                )
-                # Success!
+                await client.sign_in(phone_number=login_data[uid]["phone"], phone_code_hash=login_data[uid]["phone_code_hash"], phone_code=otp)
                 await complete_login(uid, client, message.chat.id)
             except SessionPasswordNeeded:
                 admin_states[uid] = "awaiting_password"
                 bot.send_message(message.chat.id, "Step 5: Your account has **2FA enabled**. Please send your password.", parse_mode="Markdown")
-            except (PhoneCodeInvalid, PhoneCodeExpired):
-                bot.send_message(message.chat.id, "❌ Invalid or expired OTP. Please try /start again.")
-                admin_states.pop(uid, None)
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Error: {e}")
                 admin_states.pop(uid, None)
-
         asyncio.run_coroutine_threadsafe(verify_otp_task(), loop)
 
     elif state == "awaiting_password":
-        password = text
-        
         async def verify_password_task():
             client = login_data[uid].get("client")
             try:
-                await client.check_password(password)
+                await client.check_password(text)
                 await complete_login(uid, client, message.chat.id)
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Password error: {e}")
                 admin_states.pop(uid, None)
-
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
-async def complete_login(uid, client, chat_id):
-    session_string = await client.export_session_string()
-    set_setting("api_id", login_data[uid]["api_id"])
-    set_setting("api_hash", login_data[uid]["api_hash"])
-    set_setting("session_string", session_string)
+    # --- Target Pair Flow ---
+    elif state == "awaiting_pair_source":
+        try:
+            sid = int(text)
+            login_data[uid] = {"source_id": sid}
+            admin_states[uid] = "awaiting_pair_target"
+            bot.send_message(message.chat.id, "🎯 Step 2: Send the **Target Chat ID** (where content goes).")
+        except ValueError:
+            bot.reply_to(message, "Invalid ID. Please send a numeric Chat ID.")
+
+    elif state == "awaiting_pair_target":
+        try:
+            tid = int(text)
+            sid = login_data[uid]["source_id"]
+            bot.send_message(message.chat.id, "⏳ Resolving chat titles...")
+            
+            async def resolve_pair():
+                try:
+                    s_chat = await userbot.get_chat(sid)
+                    t_chat = await userbot.get_chat(tid)
+                    s_title = s_chat.title or s_chat.first_name or str(sid)
+                    t_title = t_chat.title or t_chat.first_name or str(tid)
+                    
+                    add_target_pair(sid, tid, s_title, t_title)
+                    bot.send_message(message.chat.id, f"✅ **Pair Added!**\n`{s_title}` ➔ `{t_title}`", parse_mode="Markdown")
+                    admin_states.pop(uid, None)
+                    bot.send_message(message.chat.id, "🎯 **Target Pairs**", reply_markup=pairs_list_markup())
+                except Exception as e:
+                    bot.send_message(message.chat.id, f"❌ Resolution Error: {e}\nEnsure your userbot is in both chats.")
+                    admin_states.pop(uid, None)
+
+            asyncio.run_coroutine_threadsafe(resolve_pair(), loop)
+        except ValueError:
+            bot.reply_to(message, "Invalid ID. Please send a numeric Chat ID.")
+
+async def resolve_target_id(client: Client, target_ref: str):
+    try:
+        return await client.get_chat(target_ref)
+    except Exception:
+        try:
+            if str(target_ref).lstrip("-").isdigit():
+                return await client.get_chat(int(target_ref))
+        except Exception: pass
+        async for dialog in client.get_dialogs(limit=50):
+            if str(dialog.chat.id) == str(target_ref) or dialog.chat.username == str(target_ref).replace("@", ""):
+                return dialog.chat
+    raise ValueError(f"Could not find chat: {target_ref}")
+
+async def run_collection(admin_chat_id, pair_id):
+    if not userbot: return
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT source_id, source_title FROM target_pairs WHERE id = ?", (pair_id,))
+        row = c.fetchone()
     
-    admin_states.pop(uid, None)
-    login_data.pop(uid, None)
+    if not row: return
+    sid, title = row
+    collected = 0
+    scanned = 0
+    status_msg = bot.send_message(admin_chat_id, f"📥 Collecting from `{title}`...")
     
-    bot.send_message(chat_id, "✅ **Userbot Connected Successfully!**", parse_mode="Markdown")
+    try:
+        async for m in userbot.get_chat_history(sid, limit=300):
+            scanned += 1
+            if m.media:
+                media_type = m.media.value
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
+                        (pair_id, m.id, media_type, m.caption or "")
+                    )
+                    if c.rowcount > 0: collected += 1
+            if scanned % 100 == 0:
+                try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
+                except: pass
+        bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
+    except Exception as e:
+        bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
+
+async def run_release(admin_chat_id, pair_id):
+    if not userbot: return
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT source_id, target_id FROM target_pairs WHERE id = ?", (pair_id,))
+        row = c.fetchone()
     
-    # Restart the global userbot with new session
-    ok, msg = await start_userbot()
-    if ok:
-        bot.send_message(chat_id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
-    else:
-        bot.send_message(chat_id, f"❌ Failed to start userbot after login: {msg}")
+    if not row: return
+    sid, tid_ref = row
+    
+    try:
+        target_chat = await resolve_target_id(userbot, tid_ref)
+        target_id = target_chat.id
+    except Exception as e:
+        bot.send_message(admin_chat_id, f"❌ Target Error: {e}")
+        return
+
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_message_id FROM collected_media WHERE pair_id = ? AND released = 0", (pair_id,))
+        items = c.fetchall()
+    
+    if not items:
+        bot.send_message(admin_chat_id, "No pending items to release.")
+        return
+
+    sent = 0
+    status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
+    
+    for row_id, smid in items:
+        try:
+            try: await userbot.copy_message(target_id, sid, smid)
+            except: await userbot.forward_messages(target_id, sid, smid)
+            
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE collected_media SET released = 1 WHERE id = ?", (row_id,))
+            sent += 1
+            if sent % 5 == 0:
+                try: bot.edit_message_text(f"🚀 Releasing...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
+                except: pass
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            logger.error(f"Release error: {e}")
+            
+    bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
 
 # -----------------------------
 # Health + keepalive
