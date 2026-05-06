@@ -85,6 +85,7 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    is_stalking INTEGER DEFAULT 0,
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -92,6 +93,8 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_stalking INTEGER DEFAULT 0")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -103,15 +106,13 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
-                    UNIQUE(source_chat_id, source_message_id)
+                    UNIQUE(pair_id, source_message_id)
                 )
             """)
             # Migrations for existing tables
             try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             except: pass
         else:
             # SQLite
@@ -124,10 +125,13 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    is_stalking INTEGER DEFAULT 0,
                     UNIQUE(source_id, target_id)
                 )
             """)
             # Migration check
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_stalking INTEGER DEFAULT 0")
+            except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
@@ -193,14 +197,14 @@ def add_target_pair(sid, tid, s_title, t_title):
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_stalking FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs WHERE id = {p}", (pair_id,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_stalking FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -238,12 +242,14 @@ def get_dashboard_text():
     status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
     
     text = f"✨ **SYSTEM CONSOLE**\n"
-    text += f"Status: `{status}`\n"
+    text += f"━━━━━━━━━━━━━━━\n"
+    text += f"◈ Status: `{status}`\n"
     if is_online and userbot.me:
         name = userbot.me.first_name or "User"
-        text += f"Account: `{name}`\n"
+        text += f"◈ Account: `{name}`\n"
     
-    text += "\n_Manage your automation pairs below:_"
+    text += f"━━━━━━━━━━━━━━━\n"
+    text += "Manage your automation and stalking tasks below:"
     return text
 
 def get_dashboard_markup():
@@ -252,10 +258,13 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(
-            InlineKeyboardButton("👁️ Stalk", callback_data="stalk_menu"),
-            InlineKeyboardButton("📡 Stalking", callback_data="pairs_main")
+            InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"),
+            InlineKeyboardButton("🔍 Stalk", callback_data="stalk_menu")
         )
-        markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
+        markup.add(
+            InlineKeyboardButton("🕵️ Stalking", callback_data="stalking_main"),
+            InlineKeyboardButton("👤 User Account", callback_data="user_acc_main")
+        )
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
@@ -274,17 +283,37 @@ def stalk_menu_markup():
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
+def stalking_list_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_title, is_monitoring FROM target_pairs WHERE is_stalking = 1")
+        pairs = c.fetchall()
+        
+    for pid, s_title, is_mon in pairs:
+        stats = get_pair_stats(pid)
+        mon_status = "🔍" if is_mon else ""
+        btn_text = f"🕵️ {s_title} {mon_status} ({stats['pending']})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
+    
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    return markup
+
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, source_title, target_title, is_monitoring, is_live FROM target_pairs WHERE is_stalking = 0")
+        pairs = c.fetchall()
+        
+    for pid, s_title, t_title, is_mon, is_live in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
-        t_text = t_title if tid else "⚠️ NO TARGET"
-        btn_text = f"📁 {s_title} ➔ {t_text} {mon_status}{live_status} ({stats['pending']})"
+        btn_text = f"🎯 {s_title} ➔ {t_title} {mon_status}{live_status}"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
+    markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
@@ -292,10 +321,10 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
-    mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
+    mon_btn = "🛑 Stop Monitor" if is_mon else "🔍 Monitor"
     live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
     
     markup.add(
@@ -318,11 +347,7 @@ def pair_view_markup(pair_id):
     
     markup.add(InlineKeyboardButton("🎯 Set Target", callback_data=f"pair_set_target_{pair_id}"))
     markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"pair_delete_confirm_{pair_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="pairs_main"))
-    return markup
-
-    markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="pairs_main" if not is_stalk else "stalking_main"))
     return markup
 
 def user_account_markup():
@@ -344,8 +369,12 @@ async def get_chat_selection_markup(prefix, page=0, filter_type=None):
         return None
     
     chats = []
+    seen_ids = set()
     async for dialog in userbot.get_dialogs():
         c = dialog.chat
+        if c.id in seen_ids:
+            continue
+            
         if filter_type == "groups" and c.type not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]: continue
         if filter_type == "channels" and c.type != enums.ChatType.CHANNEL: continue
         if filter_type == "bots" and (c.type != enums.ChatType.BOT and not c.is_bot): continue
@@ -356,6 +385,7 @@ async def get_chat_selection_markup(prefix, page=0, filter_type=None):
             continue
             
         chats.append(c)
+        seen_ids.add(c.id)
     
     # Pagination (10 per page)
     start = page * 10
@@ -415,7 +445,7 @@ async def setup_automation_handlers(client: Client):
     async def auto_handler(c, m):
         # Fetch active pairs
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
                 # 1) Monitor: Save to DB if monitoring is ON
@@ -514,7 +544,7 @@ def handle_callbacks(call):
 
     elif data == "stalk_menu":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text("👁️ **Stalk Engine**\nSelect a category to find a source:", call.message.chat.id, call.message.message_id, reply_markup=stalk_menu_markup(), parse_mode="Markdown")
+        bot.edit_message_text("🔍 **Stalk Engine**\nSelect a category to find a source:", call.message.chat.id, call.message.message_id, reply_markup=stalk_menu_markup(), parse_mode="Markdown")
 
     elif data.startswith("stalk_list_"):
         parts = data.split("_")
@@ -523,7 +553,7 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
         async def show_list():
             markup = await get_chat_selection_markup(f"sel_stalk_{type_str}", page, filter_type=type_str)
-            bot.edit_message_text(f"👁️ **Stalk {type_str.title()}**\nChoose a chat to start stalking:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.edit_message_text(f"🔍 **Stalk {type_str.title()}**\nChoose a chat to start stalking:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         asyncio.run_coroutine_threadsafe(show_list(), loop)
 
     elif data.startswith("sel_stalk_"):
@@ -549,9 +579,11 @@ def handle_callbacks(call):
                     if c.fetchone():
                         bot.send_message(call.message.chat.id, f"⚠️ You are already stalking `{title}`!")
                     else:
-                        c.execute(f"INSERT INTO target_pairs (source_id, source_title, target_id, target_title) VALUES ({p}, {p}, NULL, NULL)", (sid, title))
-                        bot.send_message(call.message.chat.id, f"✅ **Stalking Started!**\nChat: `{title}`\nNow set a target chat in 'Stalking' menu to enable release.")
-                handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
+                        c.execute(f"INSERT INTO target_pairs (source_id, source_title, target_id, target_title, is_stalking, is_monitoring) VALUES ({p}, {p}, NULL, NULL, 1, 1)", (sid, title))
+                        bot.send_message(call.message.chat.id, f"✅ **Stalking Started!**\nChat: `{title}`\nBot is now collecting all history and monitoring new content.")
+                        # Auto-start collection
+                        asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, sid, limit=None), loop)
+                handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "stalking_main", 'message': call.message, 'id': call.id}))
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(start_stalk(), loop)
@@ -591,6 +623,15 @@ def handle_callbacks(call):
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(finalize_target(), loop)
+
+    elif data == "stalking_main":
+        bot.answer_callback_query(call.id)
+        try:
+            markup = stalking_list_markup()
+            bot.edit_message_text("🕵️ **Stalking Engine**\nSelect a source to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Stalking List Error: {e}")
+            bot.send_message(call.message.chat.id, f"❌ Error loading stalking sources: {e}")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
@@ -665,32 +706,45 @@ def handle_callbacks(call):
                 bot.send_message(call.message.chat.id, "❌ Pair not found.")
                 return
                 
-            pid, sid, tid, s_title, t_title, is_mon, is_live = row
+            pid, sid, tid, s_title, t_title, is_mon, is_live, is_stalk = row
             stats = get_pair_stats(pid)
             
             async def fetch_stats_and_show():
-                try:
-                    total_in_chat = await userbot.get_chat_history_count(sid)
-                except:
-                    total_in_chat = "N/A"
+                try: total_in_chat = await userbot.get_chat_history_count(sid)
+                except: total_in_chat = "N/A"
                     
                 mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
                 live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
                 
-                t_text = f"`{t_title}`" if tid else "⚠️ **NOT SET** (Set Target to Enable Release)"
+                if is_stalk:
+                    # STALKING VIEW
+                    t_text = f"`{t_title}`" if tid else "⚠️ *Target Not Set*"
+                    text = (
+                        f"🕵️ **STALKING DASHBOARD**\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"◈ **Source:** `{s_title}`\n"
+                        f"◈ **Target:** {t_text}\n\n"
+                        f"📊 **MEDIA STATS**\n"
+                        f"◈ Collected: `{stats['total']}`\n"
+                        f"◈ In Chat: `{total_in_chat}`\n"
+                        f"◈ Pending: `{stats['pending']}`\n\n"
+                        f"🤖 **STATUS:** `{mon_status}`"
+                    )
+                else:
+                    # TARGET PAIR VIEW
+                    text = (
+                        f"🎯 **PAIR MANAGEMENT**\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"◈ **Source:** `{s_title}`\n"
+                        f"◈ **Target:** `{t_title}`\n\n"
+                        f"📊 **PAIR STATS**\n"
+                        f"◈ Collected: `{stats['total']}`\n"
+                        f"◈ Pending: `{stats['pending']}`\n\n"
+                        f"🤖 **AUTOMATION**\n"
+                        f"◈ Monitor: `{mon_status}`\n"
+                        f"◈ Live: `{live_status}`"
+                    )
                 
-                text = (
-                    f"📡 **Stalking Dashboard**\n\n"
-                    f"Source: `{s_title}`\n"
-                    f"Target: {t_text}\n\n"
-                    f"📊 **Media Stats:**\n"
-                    f"Collected: `{stats['total']}`\n"
-                    f"Present in Chat: `{total_in_chat}`\n"
-                    f"📥 Pending Release: `{stats['pending']}`\n\n"
-                    f"🤖 **Automation Status:**\n"
-                    f"Monitor: `{mon_status}`\n"
-                    f"Live: `{live_status}`"
-                )
                 bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(fetch_stats_and_show(), loop)
         except Exception as e:
@@ -851,16 +905,24 @@ def handle_callbacks(call):
             
             # Fetch dialogs
             all_dialogs = []
+            seen_ids = set()
             async for dialog in userbot.get_dialogs():
                 c = dialog.chat
+                if c.id in seen_ids:
+                    continue
+                
                 if category == "groups" and c.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                     all_dialogs.append(c)
+                    seen_ids.add(c.id)
                 elif category == "channels" and c.type == enums.ChatType.CHANNEL:
                     all_dialogs.append(c)
+                    seen_ids.add(c.id)
                 elif category == "bots" and c.type == enums.ChatType.BOT:
                     all_dialogs.append(c)
+                    seen_ids.add(c.id)
                 elif category == "private" and c.type == enums.ChatType.PRIVATE:
                     all_dialogs.append(c)
+                    seen_ids.add(c.id)
             
             # Pagination
             page_size = 8
@@ -1068,22 +1130,26 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved):
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
-                break
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
             
-            scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban: micro-delay to look less automated
-            # Date filter
-            if end_date and m.date > end_date: continue
-            if start_date and m.date < start_date: break # History is newest to oldest
-            
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
+            async for m in userbot.get_chat_history(sid_resolved):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
+                    break
+                
+                scanned += 1
+                if scanned % 50 == 0:
+                    logger.info(f"Scrape Progress: {scanned} scanned, {collected} collected from {s_title}")
+                
+                await asyncio.sleep(0.05) # Anti-ban delay
+                
+                if end_date and m.date > end_date: continue
+                if start_date and m.date < start_date: break
+                
+                if m.media:
+                    media_type = m.media.value
                     if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -1094,14 +1160,18 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                             (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
-                    if c.rowcount > 0: collected += 1
+                    
+                    if c.rowcount > 0:
+                        collected += 1
+                
+                if limit and collected >= limit: break
+                
+                if scanned % 100 == 0:
+                    l_text = f"/{limit}" if limit else ""
+                    try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`\n_Status: Processing messages..._", admin_chat_id, status_msg.message_id, parse_mode="Markdown")
+                    except: pass
             
-            if limit and collected >= limit: break
-            
-            if scanned % 100 == 0:
-                l_text = f"/{limit}" if limit else ""
-                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
-                except: pass
+            conn.commit() # Ensure everything is saved
         
         bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
     except Exception as e:
@@ -1146,17 +1216,18 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
-                break
-            scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban delay
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            
+            async for m in userbot.get_chat_history(sid_resolved, limit=limit):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                    break
+                scanned += 1
+                await asyncio.sleep(0.05) # Anti-ban delay
+                if m.media:
+                    media_type = m.media.value
                     if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -1168,9 +1239,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                             (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
-            if scanned % 100 == 0:
-                try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
-                except: pass
+                if scanned % 100 == 0:
+                    try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
+                    except: pass
+            
+            conn.commit()
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
@@ -1214,23 +1287,55 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             return
 
         sent = 0
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 **Release Started**\nItems: `{len(items)}`", reply_markup=markup, parse_mode="Markdown")
         
         for row_id, smid in items:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
+            
             try:
-                try: await userbot.copy_message(target_id, sid, smid)
-                except: await userbot.forward_messages(target_id, sid, smid)
+                # 1. Try Fast Copy
+                try:
+                    await userbot.copy_message(target_id, sid, smid)
+                except:
+                    # 2. Try Standard Forward
+                    try:
+                        await userbot.forward_messages(target_id, sid, smid)
+                    except:
+                        # 3. Super Fallback (Download and Re-upload)
+                        msg = await userbot.get_messages(sid, smid)
+                        if msg and msg.media:
+                            f_path = await userbot.download_media(msg)
+                            if f_path:
+                                try:
+                                    await userbot.send_cached_media(target_id, msg.photo or msg.video or msg.document or msg.audio or msg.animation or msg.voice, caption=msg.caption)
+                                except:
+                                    # Send the actual file if cache fails
+                                    if msg.photo: await userbot.send_photo(target_id, f_path, caption=msg.caption)
+                                    elif msg.video: await userbot.send_video(target_id, f_path, caption=msg.caption)
+                                    else: await userbot.send_document(target_id, f_path, caption=msg.caption)
+                                if os.path.exists(f_path): os.remove(f_path)
+                            else:
+                                await userbot.send_message(target_id, msg.text or msg.caption or "Media restricted")
+                        elif msg:
+                            await userbot.send_message(target_id, msg.text or "Empty message")
                 
+                # Mark as released
                 with db_conn() as conn:
                     c = conn.cursor()
                     p = get_placeholder()
                     c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    conn.commit()
+
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
+                    try:
+                        markup = InlineKeyboardMarkup()
+                        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+                        bot.edit_message_text(f"🚀 **Release Engine Active**\n━━━━━━━━━━━━━━━\n◈ Source: `{s_title}`\n◈ Progress: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
