@@ -14,7 +14,7 @@ asyncio.set_event_loop(loop)
 import requests
 from flask import Flask
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
@@ -387,9 +387,28 @@ def dashboard_inline_keyboard():
     )
     markup.add(
         InlineKeyboardButton("🚀 Quick Release", callback_data="quick_release_all"),
-        InlineKeyboardButton("⚙️ Settings", callback_data="settings_main")
+        InlineKeyboardButton("👤 User Account", callback_data="user_acc_main")
+    )
+    markup.add(
+        InlineKeyboardButton("⚙️ Settings", callback_data="settings_main"),
+        InlineKeyboardButton("🧹 Clear Sent", callback_data="clear_sent_confirm")
     )
     return markup
+
+
+def user_account_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("👥 Groups", callback_data="user_acc_list_groups_0"),
+        InlineKeyboardButton("📣 Channels", callback_data="user_acc_list_channels_0")
+    )
+    markup.add(
+        InlineKeyboardButton("🤖 Bots", callback_data="user_acc_list_bots_0"),
+        InlineKeyboardButton("👤 Private", callback_data="user_acc_list_private_0")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
 
 
 def settings_inline_keyboard():
@@ -752,12 +771,117 @@ def handle_callbacks(call):
 
 
 
-    elif data == "setup_api_id":
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Please use /setapiid <your_api_id> to update it.")
-    
-    elif data == "setup_api_hash":
-        bot.answer_callback_query(call.id)
+    elif data == "user_acc_main":
+        bot.edit_message_text("👤 *User Account Dashboard*\n\nBrowse and inspect the chats in your account:", call.message.chat.id, call.message.message_id, reply_markup=user_account_keyboard(), parse_mode="Markdown")
+
+    elif data.startswith("user_acc_list_"):
+        # user_acc_list_{category}_{page}
+        parts = data.split("_")
+        category = parts[3]
+        page = int(parts[4])
+        bot.answer_callback_query(call.id, f"Loading {category}...")
+        
+        async def run_list():
+            if not userbot:
+                bot.send_message(call.message.chat.id, "❌ Userbot not running.")
+                return
+            
+            # Fetch dialogs
+            all_dialogs = []
+            async for dialog in userbot.get_dialogs():
+                c = dialog.chat
+                if category == "groups" and c.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+                    all_dialogs.append(c)
+                elif category == "channels" and c.type == enums.ChatType.CHANNEL:
+                    all_dialogs.append(c)
+                elif category == "bots" and c.type == enums.ChatType.BOT:
+                    all_dialogs.append(c)
+                elif category == "private" and c.type == enums.ChatType.PRIVATE:
+                    all_dialogs.append(c)
+            
+            # Pagination
+            page_size = 8
+            start = page * page_size
+            end = start + page_size
+            page_items = all_dialogs[start:end]
+            
+            kb = InlineKeyboardMarkup(row_width=1)
+            for chat in page_items:
+                title = chat.title or chat.first_name or str(chat.id)
+                kb.add(InlineKeyboardButton(f"👁 {title}", callback_data=f"user_acc_view_{chat.id}"))
+            
+            # Nav buttons
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"user_acc_list_{category}_{page-1}"))
+            if end < len(all_dialogs):
+                nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"user_acc_list_{category}_{page+1}"))
+            if nav:
+                kb.add(*nav)
+            
+            kb.add(InlineKeyboardButton("🔙 Back to Categories", callback_data="user_acc_main"))
+            
+            msg = f"👤 *Account Browser:* {category.capitalize()}\nPage {page + 1} | Total: {len(all_dialogs)}"
+            bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+
+        asyncio.run_coroutine_threadsafe(run_list(), loop)
+
+    elif data.startswith("user_acc_view_"):
+        chat_id = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "Fetching details...")
+        
+        async def run_view():
+            if not userbot: return
+            try:
+                chat = await userbot.get_chat(chat_id)
+                msg_count = await userbot.get_chat_history_count(chat_id)
+                title = chat.title or chat.first_name or "Unknown"
+                
+                info = f"📋 *Chat Details:*\n\n"
+                info += f"🏷 *Title:* `{title}`\n"
+                info += f"🆔 *ID:* `{chat.id}`\n"
+                info += f"📂 *Type:* `{chat.type.value}`\n"
+                info += f"💬 *Messages:* `{msg_count}`\n"
+                if hasattr(chat, 'members_count') and chat.members_count:
+                    info += f"👥 *Members:* `{chat.members_count}`\n"
+                if chat.username:
+                    info += f"🔗 *Username:* @{chat.username}\n"
+                
+                kb = InlineKeyboardMarkup(row_width=2)
+                kb.add(
+                    InlineKeyboardButton("➕ Add as Source", callback_data=f"quick_add_src_{chat.id}"),
+                    InlineKeyboardButton("🎯 Set as Target", callback_data=f"quick_set_tgt_{chat.id}")
+                )
+                # Determine category for "Back" button
+                cat = "groups"
+                if chat.type == enums.ChatType.CHANNEL: cat = "channels"
+                elif chat.type == enums.ChatType.BOT: cat = "bots"
+                elif chat.type == enums.ChatType.PRIVATE: cat = "private"
+                
+                kb.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"user_acc_list_{cat}_0"))
+                
+                bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"❌ Error: {e}")
+
+        asyncio.run_coroutine_threadsafe(run_view(), loop)
+
+    elif data.startswith("quick_add_src_"):
+        chat_id = int(data.split("_")[-1])
+        async def do_add():
+            chat = await userbot.get_chat(chat_id)
+            add_source_chat(chat.id, chat.title or chat.first_name or str(chat.id))
+            bot.answer_callback_query(call.id, "✅ Added as Source!")
+            handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"user_acc_view_{chat_id}", 'message': call.message, 'id': call.id}))
+        asyncio.run_coroutine_threadsafe(do_add(), loop)
+
+    elif data.startswith("quick_set_tgt_"):
+        chat_id = int(data.split("_")[-1])
+        set_setting("target_chat_id", chat_id)
+        set_setting("target_chat_ref", str(chat_id))
+        bot.answer_callback_query(call.id, "🎯 Target Updated!")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"user_acc_view_{chat_id}", 'message': call.message, 'id': call.id}))
+
         bot.send_message(call.message.chat.id, "Please use /setapihash <your_api_hash> to update it.")
     
     elif data == "setup_login":
