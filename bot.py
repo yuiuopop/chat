@@ -97,6 +97,13 @@ def init_db():
                     UNIQUE(pair_id, source_message_id)
                 )
             """)
+            # Migration check: Ensure pair_id exists if table was old
+            try:
+                c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            except: pass 
+            try:
+                c.execute("ALTER TABLE collected_media ADD COLUMN source_message_id BIGINT")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -120,6 +127,10 @@ def init_db():
                     UNIQUE(pair_id, source_message_id)
                 )
             """)
+            # Migration check
+            try:
+                c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            except: pass
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
