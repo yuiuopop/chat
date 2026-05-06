@@ -690,12 +690,17 @@ def handle_callbacks(call):
             
             mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
             live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
-            cap_status = "📄 Original" if cap_mode == 0 else f"✏️ Custom: `{cap_text[:20]}...`"
+            
+            # Fix: Handle NoneType for custom captions
+            safe_cap = (cap_text[:25] + "...") if cap_text else "None"
+            cap_status = "📄 Original" if cap_mode == 0 else f"✏️ Custom: `{safe_cap}`"
+            
+            target_display = f"`{t_title}`" if (tid and tid != 0) else "🔴 **No Target Linked**"
             
             text = (
-                f"📁 **Pair Management**\n\n"
+                f"🔭 **Stalk Management**\n\n"
                 f"Source: `{s_title}`\n"
-                f"Target: `{t_title}`\n\n"
+                f"Target: {target_display}\n\n"
                 f"📊 Collected: `{stats['total']}` | Pending: `{stats['pending']}`\n\n"
                 f"🤖 **Automation Status:**\n"
                 f"Monitor: `{mon_status}`\n"
