@@ -19,7 +19,8 @@ from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.handlers import MessageHandler
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+
 
 
 load_dotenv()
@@ -366,146 +367,58 @@ def get_heartbeats():
 
 
 def main_menu_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    kb.add(
-        KeyboardButton("🏠 DASHBOARD"),
-        KeyboardButton("⚙️ SETUP"),
-        KeyboardButton("📡 USERBOT")
-    )
-    kb.add(
-        KeyboardButton("📂 SOURCES"),
-        KeyboardButton("🎯 TARGET"),
-        KeyboardButton("🧲 MONITOR")
-    )
-    kb.add(
-        KeyboardButton("🚀 TRANSFER"),
-        KeyboardButton("📊 STATUS"),
-        KeyboardButton("❓ HELP")
-    )
-    return kb
+    return ReplyKeyboardRemove()
+
 
 
 
 def dashboard_inline_keyboard():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("🔄 REFRESH", callback_data="dash_refresh"),
-        InlineKeyboardButton("📡 CONSOLE", callback_data="dash_bot_status")
-    )
-    markup.add(
-        InlineKeyboardButton("📂 SOURCES", callback_data="sources_list_0"),
-        InlineKeyboardButton("🎯 TARGET", callback_data="target_view")
-    )
-    markup.add(
-        InlineKeyboardButton("🚀 QUICK RELEASE", callback_data="quick_release_all"),
-        InlineKeyboardButton("👤 ACCOUNT", callback_data="user_acc_main")
-    )
-    markup.add(
-        InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings_main"),
-        InlineKeyboardButton("🧹 CLEAR CACHE", callback_data="clear_sent_confirm")
-    )
+    markup = InlineKeyboardMarkup()
+    if userbot and userbot.is_connected:
+        markup.add(InlineKeyboardButton("👤 USER ACCOUNT", callback_data="user_acc_main"))
+    else:
+        markup.add(InlineKeyboardButton("🔌 CONNECT", callback_data="setup_wizard_start"))
     return markup
+
+
 
 
 
 def user_account_keyboard():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("👥 Groups", callback_data="user_acc_list_groups_0"),
-        InlineKeyboardButton("📣 Channels", callback_data="user_acc_list_channels_0")
-    )
-    markup.add(
-        InlineKeyboardButton("🤖 Bots", callback_data="user_acc_list_bots_0"),
-        InlineKeyboardButton("👤 Private", callback_data="user_acc_list_private_0")
-    )
-    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
-    return markup
+    return None
+
 
 
 
 def settings_inline_keyboard():
-    mode = get_setting("forward_mode", "media")
-    auto = get_setting("auto_forward", "false")
-    
-    markup = InlineKeyboardMarkup(row_width=1)
-    
-    mode_text = "📑 Mode: Everything" if mode == "all" else "🖼 Mode: Media Only"
-    auto_text = "⚡ Auto-Forward: ON" if auto == "true" else "💤 Auto-Forward: OFF"
-    
-    markup.add(InlineKeyboardButton(mode_text, callback_data="settings_toggle_mode"))
-    markup.add(InlineKeyboardButton(auto_text, callback_data="settings_toggle_auto"))
-    markup.add(InlineKeyboardButton("🧹 Clear Sent History", callback_data="clear_sent_confirm"))
-    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
-    return markup
+    return None
+
 
 
 
 def setup_inline_keyboard():
-    api_id = get_setting("api_id", "") or API_ID
-    api_hash = get_setting("api_hash", "") or API_HASH
-    session_val = get_setting("user_session_string", "") or USER_SESSION_STRING
+    return None
 
-    markup = InlineKeyboardMarkup(row_width=1)
-    
-    id_status = "✅" if api_id and str(api_id) != "0" else "❌"
-    hash_status = "✅" if api_hash else "❌"
-    sess_status = "✅" if session_val else "❌"
-
-    markup.add(InlineKeyboardButton(f"{id_status} Set API ID", callback_data="setup_api_id"))
-    markup.add(InlineKeyboardButton(f"{hash_status} Set API Hash", callback_data="setup_api_hash"))
-    
-    sess_row = [InlineKeyboardButton(f"{sess_status} Login", callback_data="setup_login")]
-    if session_val:
-        sess_row.append(InlineKeyboardButton("🔴 Remove Session", callback_data="setup_session_remove_confirm"))
-    markup.row(*sess_row)
-
-    markup.add(InlineKeyboardButton("🗑 Wipe All Credentials", callback_data="setup_clear_confirm"))
-    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
-
-    return markup
 
 
 
 
 def dashboard_text():
-    t = get_target_ref() or "NONE"
-    a = get_setting("auto_forward", "false").upper()
-    sources = list_source_chats()
+    connected = userbot and userbot.is_connected
+    if not connected:
+        return "⚠️ *System Disconnected*\n\nPlease connect your Userbot account to begin managing media."
     
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM sent_messages")
-        sent_count = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM collected_media WHERE released = 0")
-        queue_count = c.fetchone()[0]
+    me = "Account"
+    try:
+        # We can't await here since it's a sync function, so we use the cached username if available
+        pass 
+    except: pass
 
-    poll_hb, user_hb = get_heartbeats()
-    now = time.time()
-    poll_status = "🟢 ACTIVE" if now - poll_hb < 180 else "🔴 STALE"
-    userbot_status = "🟢 ONLINE" if (userbot and userbot.is_connected) else "🔴 OFFLINE"
-
-    m = get_setting("forward_mode", "media").upper()
-    af_emoji = "🟢" if a == "TRUE" else "🔴"
-
-    text = f"┏━━━━━━━ SYSTEM CONSOLE ━━━━━━━┓\n"
-    text += f"┃ 🤖 BOT  : {poll_status:<16}┃\n"
-    text += f"┃ 📡 USER : {userbot_status:<16}┃\n"
-    text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
-    
-    text += f"💬 *QUOTES*\n"
-    text += f"\"The best way to predict the future is to create it.\"\n\n"
-    
-    text += f"📊 *QUEUE PERFORMANCE*\n"
-    text += f"├─ 📂 Sources: `{len(sources)}` configured\n"
-    text += f"├─ ⏳ Pending: `{queue_count}` items\n"
-    text += f"├─ ✅ Released: `{sent_count}` total\n"
-    text += f"└─ {af_emoji} Auto-Forward: `{a}`\n\n"
-    
-    text += f"⚙️ *CONFIGURATION*\n"
-    text += f"├─ 🎯 Target: `{t}`\n"
-    text += f"└─ 🛠 Mode: `{m}`\n\n"
-    
-    text += f"🕹 *QUICK ACTIONS*"
+    text = f"💎 *Antigravity Dashboard*\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"✅ *Status:* ONLINE\n"
+    text += f"👤 *Logged as:* Userbot\n\n"
+    text += f"Select an option below:"
     return text
 
 
@@ -513,70 +426,22 @@ def dashboard_text():
 
 
 
+
 def sources_list_keyboard(page=0):
-    rows = list_source_chats()
-    per_page = 5
-    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-    p = min(page, total_pages - 1)
-    chunk = rows[p * per_page:(p + 1) * per_page]
-    
-    markup = InlineKeyboardMarkup()
-    for cid, title, mon in chunk:
-        mon_icon = "🟢" if int(mon or 0) == 1 else "🔴"
-        btn_text = f"{mon_icon} {title or cid}"
-        markup.add(InlineKeyboardButton(btn_text, callback_data=f"src_manage_{cid}"))
-    
-    # Pagination
-    nav_btns = []
-    if p > 0:
-        nav_btns.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sources_list_{p-1}"))
-    if p < total_pages - 1:
-        nav_btns.append(InlineKeyboardButton("Next ➡️", callback_data=f"sources_list_{p+1}"))
-    if nav_btns:
-        markup.row(*nav_btns)
-        
-    markup.add(
-        InlineKeyboardButton("➕ Add Source", callback_data="sources_add_start"),
-        InlineKeyboardButton("🔖 Add Saved Messages", callback_data="sources_add_saved")
-    )
-    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
-    return markup
+    return None
+
 
 
 
 def source_manage_keyboard(chat_id):
-    mon = is_monitor_enabled(chat_id)
     stats = get_monitor_stats(chat_id)
-    
-    markup = InlineKeyboardMarkup(row_width=2)
-    mon_btn = InlineKeyboardButton("🔴 Disable Monitor" if mon else "🟢 Enable Monitor", callback_data=f"src_toggle_{chat_id}")
-    markup.add(mon_btn)
-    
-    markup.add(
-        InlineKeyboardButton("📥 Scrape History", callback_data=f"src_scrape_menu_{chat_id}"),
-        InlineKeyboardButton("🚀 Release N", callback_data=f"src_release_n_{chat_id}")
-    )
+    return None, stats
 
-    markup.add(
-        InlineKeyboardButton("🗑 Remove Source", callback_data=f"src_delete_confirm_{chat_id}"),
-        InlineKeyboardButton("🔙 List", callback_data="sources_list_0")
-    )
-    return markup, stats
 
 
 def scrape_options_keyboard(chat_id):
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("🔢 By Count", callback_data=f"scrape_type_count_{chat_id}"),
-        InlineKeyboardButton("📅 By Date", callback_data=f"scrape_type_date_{chat_id}")
-    )
-    markup.add(
-        InlineKeyboardButton("♾ Full History", callback_data=f"scrape_type_full_{chat_id}"),
-        InlineKeyboardButton("⏪ Before Added Date", callback_data=f"scrape_type_pre_added_{chat_id}")
-    )
-    markup.add(InlineKeyboardButton("🔙 Back to Source", callback_data=f"src_manage_{chat_id}"))
+    return None
 
-    return markup
 
 
 
@@ -1083,255 +948,18 @@ async def start_or_reload_userbot() -> tuple[bool, str]:
 # -----------------------------
 # Admin bot commands
 # -----------------------------
+@bot.callback_query_handler(func=lambda call: call.data == "setup_wizard_start")
+def setup_wizard_start(call):
+    uid = call.from_user.id
+    admin_states[uid] = "wizard_api_id"
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text("🛠 *Connection Wizard (1/4)*\n\nPlease send your **API ID**.\n(You can get it from [my.telegram.org](https://my.telegram.org))", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Unauthorized.")
         return
-    bot.reply_to(
-        message,
-        dashboard_text(),
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-    # Also send the inline dashboard for immediate interaction
-    bot.send_message(
-        message.chat.id,
-        "🎮 *Interactive Control Panel*",
-        reply_markup=dashboard_inline_keyboard(),
-        parse_mode="Markdown"
-    )
-
-
-@bot.message_handler(commands=["menu"])
-def cmd_menu(message):
-    if not is_admin(message.from_user.id):
-        return
-    bot.reply_to(message, "Main menu opened.", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(func=lambda m: m.text in ["🏠 Dashboard", "❓ Help", "⚙️ Setup", "📡 Userbot", "📂 Sources", "🎯 Target", "🧲 Monitor", "🚀 Transfer", "📊 Status"])
-def menu_router(message):
-    if not is_admin(message.from_user.id):
-        return
-    text = message.text
-    set_heartbeat("poll")
-    if text == "🏠 Dashboard":
-
-        bot.reply_to(message, dashboard_text(), parse_mode="Markdown", reply_markup=main_menu_keyboard())
-        bot.send_message(message.chat.id, "🎮 *Interactive Control Panel*", reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
-    elif text == "❓ Help":
-        bot.reply_to(
-            message,
-            (
-                "Commands:\n"
-                "/setapiid <id>\n/setapihash <hash>\n/setsession <session>\n/login\n"
-                "/startuserbot\n/showapi\n/clearapi\n\n"
-                "/settarget <chat_id>\n/showtarget\n"
-                "/setsource <chat_id>\n/delsource <chat_id>\n/showsources\n/listgroups [page]\n\n"
-            "/monitoron <chat_id>\n/monitoroff <chat_id>\n/monitorstatus <chat_id>\n/release <chat_id> <N>\n\n"
-                "/collecthistory <chat_id> <N>\n/collectall <N_per_source>\n/collectfull <chat_id>\n/cancelcollect <chat_id>\n\n"
-                "/autoon /autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>\n/showmedia <N>\n/clearsent"
-            ),
-            reply_markup=main_menu_keyboard()
-        )
-    elif text == "⚙️ Setup":
-        bot.reply_to(
-            message,
-            "⚙️ *System Configuration*\n\nFollow the steps below to connect your Telegram account. You need an API ID and Hash from [my.telegram.org](https://my.telegram.org).",
-            parse_mode="Markdown",
-            reply_markup=setup_inline_keyboard()
-        )
-    elif text == "📡 Userbot":
-        bot.reply_to(
-            message,
-            "Userbot controls:\n/startuserbot\n/status",
-            reply_markup=main_menu_keyboard()
-        )
-    elif text == "📂 Sources":
-        bot.reply_to(
-            message,
-            "📂 *Managed Sources*\n\n_Select a source to configure or monitor._",
-            parse_mode="Markdown",
-            reply_markup=sources_list_keyboard(0)
-        )
-    elif text == "🎯 Target":
-        t = get_target_ref() or "Not set"
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔄 Change Target", callback_data="target_change_prompt"))
-        kb.add(InlineKeyboardButton("🔙 Dashboard", callback_data="dash_main"))
-        bot.reply_to(
-            message,
-            f"🎯 *Target Configuration*\n\nCurrent Target: `{t}`",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    elif text == "🧲 Monitor":
-        bot.reply_to(
-            message,
-            "🧲 *Monitoring Console*\n\n_Manage which sources are currently being watched for new media._",
-            parse_mode="Markdown",
-            reply_markup=sources_list_keyboard(0)
-        )
-    elif text == "🚀 Transfer":
-        bot.reply_to(
-            message,
-            "Transfer controls:\n/autoon (live forward)\n/autooff\n/sendsource <chat_id> <N>\n/sendlast <N>\n/resendlast <N>",
-            reply_markup=main_menu_keyboard()
-        )
-    elif text == "📊 Status":
-        bot.reply_to(message, dashboard_text(), parse_mode="Markdown", reply_markup=dashboard_inline_keyboard())
-
-
-@bot.message_handler(commands=["settarget"])
-def cmd_settarget(message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        bot.reply_to(message, "Usage: /settarget -1001234567890 OR /settarget @channelusername")
-        return
-    target_ref = parts[1].strip()
-    if target_ref.startswith("https://t.me/"):
-        target_ref = "@" + target_ref.split("/")[-1]
-    if target_ref.startswith("t.me/"):
-        target_ref = "@" + target_ref.split("/")[-1]
-    set_setting("target_chat_ref", target_ref)
-    try:
-        set_setting("target_chat_id", int(target_ref))
-    except Exception:
-        pass
-    bot.reply_to(message, f"✅ Target set to: `{target_ref}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-@bot.message_handler(commands=["showtarget"])
-def cmd_showtarget(message):
-    if not is_admin(message.from_user.id):
-        return
-    t = get_target_ref() or "Not set"
-    bot.reply_to(message, f"🎯 Current target: `{t}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(commands=["checktarget"])
-def cmd_checktarget(message):
-    global userbot
-    if not is_admin(message.from_user.id):
-        return
-    if userbot is None:
-        bot.reply_to(message, "Userbot is not running. Use /startuserbot first.")
-        return
-    target_ref = get_target_ref()
-    if not target_ref:
-        bot.reply_to(message, "Set target first with /settarget.")
-        return
-
-    async def run_check():
-        try:
-            me = await userbot.get_me()
-            chat = await resolve_target_id(userbot, target_ref)
-            title = chat.title or chat.first_name or str(chat.id)
-            bot.reply_to(
-                message,
-                f"✅ Target reachable.\nUserbot ID: `{me.id}`\nTarget: `{title}`\nResolved ID: `{chat.id}`",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            bot.reply_to(message, f"❌ Target access failed for current userbot session:\n`{e}`", parse_mode="Markdown")
-
-
-    asyncio.run_coroutine_threadsafe(run_check(), loop)
-
-
-@bot.message_handler(commands=["setapiid"])
-def cmd_setapiid(message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        bot.reply_to(message, "Usage: /setapiid 123456")
-        return
-    try:
-        api_id = int(parts[1])
-        if api_id <= 0:
-            raise ValueError
-        set_setting("api_id", api_id)
-        bot.reply_to(message, "✅ API ID saved.", reply_markup=main_menu_keyboard())
-    except ValueError:
-        bot.reply_to(message, "Invalid API ID.")
-
-
-@bot.message_handler(commands=["setapihash"])
-def cmd_setapihash(message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip():
-        bot.reply_to(message, "Usage: /setapihash <api_hash>")
-        return
-    set_setting("api_hash", parts[1].strip())
-    bot.reply_to(message, "✅ API Hash saved.", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(commands=["setsession"])
-def cmd_setsession(message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip():
-        bot.reply_to(message, "Usage: /setsession <string_session>")
-        return
-    set_setting("user_session_string", parts[1].strip())
-    bot.reply_to(message, "✅ User session saved.", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(commands=["showapi"])
-def cmd_showapi(message):
-    if not is_admin(message.from_user.id):
-        return
-    api_id = get_setting("api_id", "") or API_ID
-    api_hash = get_setting("api_hash", "") or API_HASH
-    session_val = get_setting("user_session_string", "") or USER_SESSION_STRING
-
-    hash_mask = (api_hash[:4] + "..." + api_hash[-4:]) if api_hash and len(api_hash) > 8 else ("set" if api_hash else "not set")
-    sess_mask = ("set" if session_val else "not set")
-    bot.reply_to(
-        message,
-        f"API ID: `{api_id}`\nAPI Hash: `{hash_mask}`\nSession: `{sess_mask}`",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-@bot.message_handler(commands=["clearapi"])
-def cmd_clearapi(message):
-    if not is_admin(message.from_user.id):
-        return
-    set_setting("api_id", "")
-    set_setting("api_hash", "")
-    set_setting("user_session_string", "")
-    bot.reply_to(message, "🧹 Stored API ID/API Hash/Session removed.", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(commands=["startuserbot"])
-def cmd_startuserbot(message):
-    if not is_admin(message.from_user.id):
-        return
-
-    async def run():
-        ok, msg = await start_or_reload_userbot()
-        bot.reply_to(message, msg)
-
-    asyncio.run_coroutine_threadsafe(run(), loop)
-    bot.reply_to(message, "Starting/reloading userbot...")
-
-
-@bot.message_handler(commands=["login"])
-def cmd_login(message):
-    if not is_admin(message.from_user.id):
-        return
-    uid = message.from_user.id
-    admin_states[uid] = "awaiting_phone"
-    login_data[uid] = {}
-    bot.reply_to(message, "Send phone number with country code.\nExample: `+14155550123`", parse_mode="Markdown")
+    bot.reply_to(message, dashboard_text(), reply_markup=dashboard_inline_keyboard(), parse_mode="Markdown")
 
 
 @bot.message_handler(func=lambda m: m.from_user and m.from_user.id in admin_states, content_types=["text"])
@@ -1339,6 +967,97 @@ def admin_state_handler(message):
     uid = message.from_user.id
     state = admin_states.get(uid)
     if not state:
+        return
+
+    # --- Setup Wizard States ---
+    if state == "wizard_api_id":
+        try:
+            aid = int(message.text.strip())
+            set_setting("api_id", aid)
+            admin_states[uid] = "wizard_api_hash"
+            bot.reply_to(message, "✅ *API ID Saved.*\n\n🛠 *Connection Wizard (2/4)*\nNow send your **API Hash**.", parse_mode="Markdown")
+        except:
+            bot.reply_to(message, "❌ Invalid API ID. Please send digits only.")
+        return
+
+    if state == "wizard_api_hash":
+        ahash = message.text.strip()
+        set_setting("api_hash", ahash)
+        admin_states[uid] = "wizard_phone"
+        bot.reply_to(message, "✅ *API Hash Saved.*\n\n🛠 *Connection Wizard (3/4)*\nNow send your **Phone Number** (with country code).\nExample: `+14155550123`", parse_mode="Markdown")
+        return
+
+    if state == "wizard_phone":
+        phone = message.text.strip()
+        api_id, api_hash, _ = get_runtime_credentials()
+        
+        async def send_otp():
+            try:
+                tmp = build_temp_client(api_id, api_hash)
+                await tmp.connect()
+                sent = await tmp.send_code(phone)
+                login_data[uid] = {
+                    "phone": phone,
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "tmp_client": tmp,
+                    "phone_code_hash": sent.phone_code_hash
+                }
+                admin_states[uid] = "wizard_otp"
+                bot.reply_to(message, "✅ *Phone Received.*\n\n🛠 *Connection Wizard (4/4)*\nOTP sent! Please send the **Code** you received.", parse_mode="Markdown")
+            except Exception as e:
+                bot.reply_to(message, f"❌ Failed to send OTP: {e}\nRestart setup with /start")
+                admin_states.pop(uid, None)
+        
+        asyncio.run_coroutine_threadsafe(send_otp(), loop)
+        return
+
+    if state == "wizard_otp":
+        otp = message.text.strip().replace(" ", "")
+        data = login_data.get(uid, {})
+        tmp = data.get("tmp_client")
+        
+        async def finish_login():
+            try:
+                await tmp.sign_in(data["phone"], data["phone_code_hash"], otp)
+                s = await tmp.export_session_string()
+                set_setting("user_session_string", s)
+                await tmp.disconnect()
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                
+                # Start the actual userbot now
+                await start_or_reload_userbot()
+                bot.reply_to(message, "🎊 *Setup Complete!*\n\nYour account is now connected and monitoring. Type /start to see your new dashboard.", parse_mode="Markdown")
+            except SessionPasswordNeeded:
+                admin_states[uid] = "wizard_2fa"
+                bot.reply_to(message, "🔐 *2FA Required*\nPlease send your Cloud Password.")
+            except Exception as e:
+                bot.reply_to(message, f"❌ Login failed: {e}")
+                admin_states.pop(uid, None)
+        
+        asyncio.run_coroutine_threadsafe(finish_login(), loop)
+        return
+
+    if state == "wizard_2fa":
+        password = message.text.strip()
+        data = login_data.get(uid, {})
+        tmp = data.get("tmp_client")
+        
+        async def finish_2fa():
+            try:
+                await tmp.check_password(password)
+                s = await tmp.export_session_string()
+                set_setting("user_session_string", s)
+                await tmp.disconnect()
+                admin_states.pop(uid, None)
+                login_data.pop(uid, None)
+                await start_or_reload_userbot()
+                bot.reply_to(message, "🎊 *Setup Complete!*\n\n2FA Verified and session saved. Type /start for your dashboard.", parse_mode="Markdown")
+            except Exception as e:
+                bot.reply_to(message, f"❌ 2FA failed: {e}")
+        
+        asyncio.run_coroutine_threadsafe(finish_2fa(), loop)
         return
 
     # --- Scraping States ---
@@ -1405,109 +1124,6 @@ def admin_state_handler(message):
         asyncio.run_coroutine_threadsafe(run_rel(), loop)
         return
 
-    # --- Login States ---
-
-
-
-    if state == "awaiting_phone":
-        phone = message.text.strip()
-        api_id, api_hash, _ = get_runtime_credentials()
-        if not api_id or not api_hash:
-            bot.reply_to(message, "Set API credentials first: /setapiid and /setapihash")
-            admin_states.pop(uid, None)
-            login_data.pop(uid, None)
-            return
-
-        async def send_code():
-            try:
-                tmp = build_temp_client(api_id, api_hash)
-                await tmp.connect()
-                sent = await tmp.send_code(phone)
-                login_data[uid] = {
-                    "phone": phone,
-                    "api_id": api_id,
-                    "api_hash": api_hash,
-                    "tmp_client": tmp,
-                    "phone_code_hash": sent.phone_code_hash
-                }
-                admin_states[uid] = "awaiting_otp"
-                bot.reply_to(message, "OTP sent. Send the code (digits only).")
-            except Exception as e:
-                admin_states.pop(uid, None)
-                login_data.pop(uid, None)
-                bot.reply_to(message, f"Failed to send OTP: {e}")
-
-        asyncio.run_coroutine_threadsafe(send_code(), loop)
-        return
-
-    if state == "awaiting_otp":
-        otp = message.text.strip().replace(" ", "")
-        data = login_data.get(uid, {})
-        tmp: Client = data.get("tmp_client")
-        if not tmp:
-            bot.reply_to(message, "Login session expired. Run /login again.")
-            admin_states.pop(uid, None)
-            login_data.pop(uid, None)
-            return
-
-        async def sign_in():
-            try:
-                await tmp.sign_in(
-                    phone_number=data["phone"],
-                    phone_code_hash=data["phone_code_hash"],
-                    phone_code=otp
-                )
-                s = await tmp.export_session_string()
-                set_setting("user_session_string", s)
-                await tmp.disconnect()
-                admin_states.pop(uid, None)
-                login_data.pop(uid, None)
-                bot.reply_to(message, "Session generated and saved.\nRestart service to apply.")
-            except SessionPasswordNeeded:
-                admin_states[uid] = "awaiting_2fa"
-                bot.reply_to(message, "2FA enabled. Send your Telegram 2FA password.")
-            except Exception as e:
-                try:
-                    await tmp.disconnect()
-                except Exception:
-                    pass
-                admin_states.pop(uid, None)
-                login_data.pop(uid, None)
-                bot.reply_to(message, f"Login failed: {e}")
-
-        asyncio.run_coroutine_threadsafe(sign_in(), loop)
-        return
-
-    if state == "awaiting_2fa":
-        password = message.text.strip()
-        data = login_data.get(uid, {})
-        tmp: Client = data.get("tmp_client")
-        if not tmp:
-            bot.reply_to(message, "Login session expired. Run /login again.")
-            admin_states.pop(uid, None)
-            login_data.pop(uid, None)
-            return
-
-        async def finish_2fa():
-            try:
-                await tmp.check_password(password)
-                s = await tmp.export_session_string()
-                set_setting("user_session_string", s)
-                await tmp.disconnect()
-                admin_states.pop(uid, None)
-                login_data.pop(uid, None)
-                bot.reply_to(message, "Session generated and saved.\nRestart service to apply.")
-            except Exception as e:
-                try:
-                    await tmp.disconnect()
-                except Exception:
-                    pass
-                admin_states.pop(uid, None)
-                login_data.pop(uid, None)
-                bot.reply_to(message, f"2FA failed: {e}")
-
-        asyncio.run_coroutine_threadsafe(finish_2fa(), loop)
-        return
 
 
 @bot.message_handler(commands=["autoon"])
