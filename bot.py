@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask
 from dotenv import load_dotenv
+
+# Pyrogram sync import needs a current event loop on Python 3.10+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 from pyrogram import Client, filters, idle, enums
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
@@ -101,8 +106,6 @@ def set_setting(key, value):
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN)
 userbot = None
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
 
 admin_states = {}
 login_data = {} # Temporary storage for login steps
