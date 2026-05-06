@@ -83,9 +83,16 @@ def init_db():
                     target_id BIGINT,
                     source_title TEXT,
                     target_title TEXT,
+                    is_monitoring INTEGER DEFAULT 0,
+                    is_live INTEGER DEFAULT 0,
                     UNIQUE(source_id, target_id)
                 )
             """)
+            # Migration
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
@@ -113,9 +120,16 @@ def init_db():
                     target_id BIGINT,
                     source_title TEXT,
                     target_title TEXT,
+                    is_monitoring INTEGER DEFAULT 0,
+                    is_live INTEGER DEFAULT 0,
                     UNIQUE(source_id, target_id)
                 )
             """)
+            # Migration check
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,8 +191,15 @@ def add_target_pair(sid, tid, s_title, t_title):
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs")
         return c.fetchall()
+
+def get_target_pair(pair_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live FROM target_pairs WHERE id = {p}", (pair_id,))
+        return c.fetchone()
 
 def get_pair_stats(pair_id):
     with db_conn() as conn:
@@ -196,6 +217,16 @@ userbot = None
 
 admin_states = {}
 login_data = {} # Temporary storage for login steps
+running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
+
+def stop_task(task_key):
+    if task_key in running_tasks:
+        running_tasks[task_key] = False
+        return True
+    return False
+
+def is_task_running(task_key):
+    return running_tasks.get(task_key, False)
 
 # -----------------------------
 # UI Helpers
@@ -228,9 +259,11 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
         stats = get_pair_stats(pid)
-        btn_text = f"📁 {s_title} ➔ {t_title} ({stats['pending']})"
+        mon_status = "👁️" if is_mon else ""
+        live_status = "⚡" if is_live else ""
+        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
     markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
@@ -238,11 +271,34 @@ def pairs_list_markup():
     return markup
 
 def pair_view_markup(pair_id):
+    pair = get_target_pair(pair_id)
+    if not pair: return InlineKeyboardMarkup()
+    
+    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
     markup = InlineKeyboardMarkup(row_width=2)
+    
+    mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
+    live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
+    
     markup.add(
-        InlineKeyboardButton("📥 Collect", callback_data=f"pair_collect_{pair_id}"),
-        InlineKeyboardButton("🚀 Release", callback_data=f"pair_release_{pair_id}")
+        InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
+        InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
+    
+    # Check if a manual task is running
+    is_hist = is_task_running(f"hist_{pair_id}")
+    is_coll = is_task_running(f"coll_{pair_id}")
+    is_rel = is_task_running(f"rel_{pair_id}")
+    
+    if is_hist: markup.add(InlineKeyboardButton("🛑 Stop History Scrape", callback_data=f"pair_stop_task_hist_{pair_id}"))
+    else: markup.add(InlineKeyboardButton("📜 History Scraper", callback_data=f"pair_hist_menu_{pair_id}"))
+    
+    if is_coll: markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
+    else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
+    
+    if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+    else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
+
     markup.add(InlineKeyboardButton("🗑 Delete Pair", callback_data=f"pair_delete_confirm_{pair_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Pairs", callback_data="pairs_main"))
     return markup
@@ -310,12 +366,41 @@ async def start_userbot():
             in_memory=True
         )
         await userbot.start()
+        # Register automation handlers
+        await setup_automation_handlers(userbot)
         # Set a heartbeat/me check
         await userbot.get_me()
         return True, "Userbot started successfully"
     except Exception as e:
         logger.error(f"Userbot start failed: {e}")
         return False, str(e)
+
+async def setup_automation_handlers(client: Client):
+    @client.on_message()
+    async def auto_handler(c, m):
+        # Fetch active pairs
+        pairs = get_target_pairs()
+        for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+            # We match numeric IDs
+            if str(m.chat.id) == str(sid):
+                # 1) Monitor: Save to DB if monitoring is ON
+                if is_mon:
+                    if m.media:
+                        m_type = m.media.value
+                        with db_conn() as conn:
+                            db_c = conn.cursor()
+                            p = get_placeholder()
+                            if DATABASE_URL:
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, m.id, m_type, m.caption or ""))
+                            else:
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)", (pid, m.id, m_type, m.caption or ""))
+                
+                # 2) Live Forward: Copy message to target if live is ON
+                if is_live:
+                    try:
+                        await m.copy(tid)
+                    except Exception as e:
+                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -445,24 +530,73 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_view_"):
         pid = int(data.split("_")[-1])
-        with db_conn() as conn:
-            c = conn.cursor()
-            c.execute("SELECT source_id, target_id, source_title, target_title FROM target_pairs WHERE id = ?", (pid,))
-            row = c.fetchone()
+        row = get_target_pair(pid)
         
         if not row:
             bot.answer_callback_query(call.id, "Pair not found.")
             return
             
+        pid, sid, tid, s_title, t_title, is_mon, is_live = row
         stats = get_pair_stats(pid)
+        
+        mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
+        live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
+        
         text = (
-            f"📁 **Pair Details**\n\n"
-            f"Source: `{row[2]}` (`{row[0]}`)\n"
-            f"Target: `{row[3]}` (`{row[1]}`)\n\n"
+            f"📁 **Pair Management**\n\n"
+            f"Source: `{s_title}` (`{sid}`)\n"
+            f"Target: `{t_title}` (`{tid}`)\n\n"
             f"📊 Collected: `{stats['total']}`\n"
-            f"📥 Pending: `{stats['pending']}`"
+            f"📥 Pending: `{stats['pending']}`\n\n"
+            f"🤖 **Automation Status:**\n"
+            f"Monitor: `{mon_status}`\n"
+            f"Live: `{live_status}`"
         )
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+
+    elif data.startswith("pair_toggle_mon_"):
+        pid = int(data.split("_")[-1])
+        row = get_target_pair(pid)
+        new_val = 0 if row[5] else 1
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET is_monitoring = {p} WHERE id = {p}", (new_val, pid))
+        
+        if new_val == 1:
+            bot.send_message(call.message.chat.id, "👁️ Monitoring Started! Initializing full history scan in background...")
+            asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid, limit=None), loop)
+        
+        bot.answer_callback_query(call.id, f"Monitor {'Started' if new_val else 'Stopped'}")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("pair_toggle_live_"):
+        pid = int(data.split("_")[-1])
+        row = get_target_pair(pid)
+        new_val = 0 if row[6] else 1
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET is_live = {p} WHERE id = {p}", (new_val, pid))
+        bot.answer_callback_query(call.id, f"Live Forward {'Started' if new_val else 'Stopped'}")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("pair_hist_menu_"):
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = f"hist_setup_count_{pid}"
+        bot.send_message(call.message.chat.id, "📜 **History Scraper**\n\nHow many messages would you like to scrape from this chat?\n(Send a number, e.g., `500`)")
+
+    elif data.startswith("pair_stop_task_"):
+        parts = data.split("_")
+        type_str = parts[3]
+        pid = int(parts[4])
+        task_key = f"{type_str}_{pid}"
+        if stop_task(task_key):
+            bot.answer_callback_query(call.id, f"Stopping {type_str}...")
+        else:
+            bot.answer_callback_query(call.id, "No active task found.")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
 
     elif data.startswith("pair_collect_"):
         pid = int(data.split("_")[-1])
@@ -672,18 +806,14 @@ def handle_state_inputs(message):
         async def verify_otp_task():
             client = login_data[uid].get("client")
             try:
-                logger.info(f"OTP: Verifying for {login_data[uid]['phone']}...")
                 await client.sign_in(phone_number=login_data[uid]["phone"], phone_code_hash=login_data[uid]["phone_code_hash"], phone_code=otp)
-                logger.info("OTP: Success! Finalizing login...")
                 bot.send_message(message.chat.id, "✅ OTP Verified! Finalizing setup...")
                 await complete_login(uid, client, message.chat.id)
             except SessionPasswordNeeded:
-                logger.info("OTP: 2FA required.")
                 admin_states[uid] = "awaiting_password"
-                bot.send_message(message.chat.id, "🔐 Step 5: Your account has **2FA enabled**. Please send your **Cloud Password**.", parse_mode="Markdown")
+                bot.send_message(message.chat.id, "🔐 Step 5: Please send your **Cloud Password**.", parse_mode="Markdown")
             except Exception as e:
-                logger.error(f"OTP Error: {e}")
-                bot.send_message(message.chat.id, f"❌ OTP Verification Failed: {e}")
+                bot.send_message(message.chat.id, f"❌ OTP Error: {e}")
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_otp_task(), loop)
 
@@ -698,6 +828,91 @@ def handle_state_inputs(message):
                 admin_states.pop(uid, None)
         asyncio.run_coroutine_threadsafe(verify_password_task(), loop)
 
+    # --- History Scraper Flow ---
+    elif state.startswith("hist_setup_count_"):
+        pid = int(state.split("_")[-1])
+        if not text.isdigit():
+            bot.reply_to(message, "Please send a number.")
+            return
+        login_data[uid] = {"hist_count": int(text)}
+        admin_states[uid] = f"hist_setup_start_date_{pid}"
+        bot.send_message(message.chat.id, "📍 Enter **Start Date** (DD/MM/YYYY):\n(Example: `01/01/2024`)")
+
+    elif state.startswith("hist_setup_start_date_"):
+        pid = int(state.split("_")[-1])
+        try:
+            dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+            login_data[uid]["start_date"] = dt
+            admin_states[uid] = f"hist_setup_end_date_{pid}"
+            bot.send_message(message.chat.id, "📍 Enter **End Date** (DD/MM/YYYY):\n(Example: `31/12/2024`)")
+        except ValueError:
+            bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
+
+    elif state.startswith("hist_setup_end_date_"):
+        pid = int(state.split("_")[-1])
+        try:
+            dt = datetime.strptime(text, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+            count = login_data[uid]["hist_count"]
+            start_date = login_data[uid]["start_date"]
+            end_date = dt
+            admin_states.pop(uid)
+            login_data.pop(uid)
+            bot.send_message(message.chat.id, f"🚀 **Scrape Started**\nPair: `{pid}` | Max: `{count}`\nRange: `{start_date.date()}` to `{end_date.date()}`")
+            asyncio.run_coroutine_threadsafe(run_history_scrape(message.chat.id, pid, count, start_date, end_date), loop)
+        except ValueError:
+            bot.reply_to(message, "Invalid format. Use DD/MM/YYYY.")
+
+async def run_history_scrape(admin_chat_id, pair_id, limit, start_date, end_date):
+    if not userbot: return
+    task_key = f"hist_{pair_id}"
+    running_tasks[task_key] = True
+    
+    pair = get_target_pair(pair_id)
+    if not pair: return
+    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
+    
+    collected = 0
+    scanned = 0
+    status_msg = bot.send_message(admin_chat_id, f"📜 Scraping `{s_title}` history...")
+    
+    try:
+        async for m in userbot.get_chat_history(sid):
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
+                break
+                
+            scanned += 1
+            if m.date > end_date: continue
+            if m.date < start_date: break # Assuming history is newest to oldest
+            
+            if m.media:
+                media_type = m.media.value
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    if DATABASE_URL:
+                        c.execute(
+                            "INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, m.id, media_type, m.caption or "")
+                        )
+                    else:
+                        c.execute(
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
+                            (pair_id, m.id, media_type, m.caption or "")
+                        )
+                    if c.rowcount > 0: collected += 1
+            
+            if collected >= limit: break
+            if scanned % 100 == 0:
+                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}/{limit}`", admin_chat_id, status_msg.message_id)
+                except: pass
+        
+        bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
+    except Exception as e:
+        bot.send_message(admin_chat_id, f"❌ Scrape Error: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
+
 async def resolve_target_id(client: Client, target_ref: str):
     try:
         return await client.get_chat(target_ref)
@@ -711,8 +926,11 @@ async def resolve_target_id(client: Client, target_ref: str):
                 return dialog.chat
     raise ValueError(f"Could not find chat: {target_ref}")
 
-async def run_collection(admin_chat_id, pair_id):
+async def run_collection(admin_chat_id, pair_id, limit=300):
     if not userbot: return
+    task_key = f"coll_{pair_id}"
+    running_tasks[task_key] = True
+    
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
@@ -723,10 +941,14 @@ async def run_collection(admin_chat_id, pair_id):
     sid, title = row
     collected = 0
     scanned = 0
-    status_msg = bot.send_message(admin_chat_id, f"📥 Collecting from `{title}`...")
+    limit_text = f"`{limit}`" if limit else "all"
+    status_msg = bot.send_message(admin_chat_id, f"📥 Collecting {limit_text} from `{title}`...")
     
     try:
-        async for m in userbot.get_chat_history(sid, limit=300):
+        async for m in userbot.get_chat_history(sid, limit=limit):
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                break
             scanned += 1
             if m.media:
                 media_type = m.media.value
@@ -750,9 +972,14 @@ async def run_collection(admin_chat_id, pair_id):
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
 
 async def run_release(admin_chat_id, pair_id):
     if not userbot: return
+    task_key = f"rel_{pair_id}"
+    running_tasks[task_key] = True
+    
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
@@ -783,6 +1010,9 @@ async def run_release(admin_chat_id, pair_id):
     status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...")
     
     for row_id, smid in items:
+        if not running_tasks.get(task_key):
+            bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
+            break
         try:
             try: await userbot.copy_message(target_id, sid, smid)
             except: await userbot.forward_messages(target_id, sid, smid)
@@ -800,6 +1030,7 @@ async def run_release(admin_chat_id, pair_id):
             logger.error(f"Release error: {e}")
             
     bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
+    running_tasks.pop(task_key, None)
 
 # -----------------------------
 # Watchdog
@@ -867,13 +1098,14 @@ def keep_alive_worker():
                 if url != detected_url:
                     detected_url = url
                     logger.info(f"KEEP_ALIVE: Detected public URL: {detected_url}")
-                requests.get(url, timeout=12)
+                # Use a random param to avoid cache
+                requests.get(f"{url}?t={int(time.time())}", timeout=12)
             else:
                 logger.info("KEEP_ALIVE: Public URL not detected yet; skipping ping cycle.")
         except Exception as e:
             logger.warning(f"KEEP_ALIVE: Ping failed: {e}")
         finally:
-            time.sleep(600) # 10 minutes
+            time.sleep(300) # 5 minutes (Render sleep is 15 mins)
 
 app = Flask(__name__)
 @app.route("/")
@@ -905,13 +1137,19 @@ async def main():
         if ok: logger.info("✅ Userbot started")
     except Exception as e: logger.error(f"Userbot error: {e}")
 
-    # Start telebot polling in thread
+    # Start telebot polling with AUTO-RESTART
     def run_polling():
-        bot.remove_webhook()
-        bot.infinity_polling(skip_pending=True)
+        while True:
+            try:
+                logger.info("🚀 Starting Admin Bot polling...")
+                bot.remove_webhook()
+                bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+            except Exception as e:
+                logger.error(f"❌ Polling crashed: {e}. Restarting in 10s...")
+                time.sleep(10)
     
     threading.Thread(target=run_polling, daemon=True).start()
-    logger.info("✨ Admin bot polling started")
+    logger.info("✨ Admin bot monitor started")
     
     await idle()
 
