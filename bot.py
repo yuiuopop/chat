@@ -909,10 +909,11 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     status_msg = bot.send_message(admin_chat_id, f"📜 Scraping `{s_title}` history...")
     
     try:
-        # Resolve peer first to avoid PeerIdInvalid
-        await userbot.get_chat(sid)
+        # Force peer resolution (Anti PeerIdInvalid)
+        target_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid):
+        async for m in userbot.get_chat_history(sid_resolved):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
                 break
@@ -955,16 +956,17 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
 async def resolve_target_id(client: Client, target_ref: str):
     try:
+        # 1. Try direct ID (int)
+        if str(target_ref).lstrip("-").isdigit():
+            return await client.get_chat(int(target_ref))
+        # 2. Try username/ref
         return await client.get_chat(target_ref)
     except Exception:
-        try:
-            if str(target_ref).lstrip("-").isdigit():
-                return await client.get_chat(int(target_ref))
-        except Exception: pass
-        async for dialog in client.get_dialogs(limit=50):
-            if str(dialog.chat.id) == str(target_ref) or dialog.chat.username == str(target_ref).replace("@", ""):
+        # 3. Aggressive Search: iterate through many dialogs to find the peer
+        async for dialog in client.get_dialogs(limit=200):
+            if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
                 return dialog.chat
-    raise ValueError(f"Could not find chat: {target_ref}")
+    raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
     if not userbot: return
@@ -985,10 +987,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     status_msg = bot.send_message(admin_chat_id, f"📥 Collecting {limit_text} from `{title}`...")
     
     try:
-        # Resolve peer first to avoid PeerIdInvalid
-        await userbot.get_chat(sid)
+        # Force peer resolution (Anti PeerIdInvalid)
+        target_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid, limit=limit):
+        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
