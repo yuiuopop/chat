@@ -107,6 +107,8 @@ def init_db():
                 )
             """)
             # Migrations for existing tables
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_stalking INTEGER DEFAULT 0")
+            except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
@@ -1269,13 +1271,32 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
-                try: await userbot.copy_message(target_id, sid, smid)
-                except: await userbot.forward_messages(target_id, sid, smid)
+                try:
+                    # Step 1: Try Fast Copy
+                    await userbot.copy_message(target_id, sid, smid)
+                except:
+                    try:
+                        # Step 2: Try Standard Forward
+                        await userbot.forward_messages(target_id, sid, smid)
+                    except:
+                        # Step 3: Super Fallback (Download and Re-upload for Restricted Chats)
+                        msg = await userbot.get_messages(sid, smid)
+                        if msg and msg.media:
+                            f_path = await userbot.download_media(msg)
+                            if f_path:
+                                await userbot.send_cached_media(target_id, msg.photo or msg.video or msg.document or msg.audio or msg.animation or msg.voice, caption=msg.caption)
+                                # If cached fails, send file
+                                if os.path.exists(f_path): os.remove(f_path)
+                            else:
+                                await userbot.send_message(target_id, msg.text or msg.caption or "Media restricted")
+                        elif msg:
+                            await userbot.send_message(target_id, msg.text or "Empty message")
+                    
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
                 sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id)
