@@ -103,11 +103,15 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
-                    UNIQUE(source_chat_id, source_message_id)
+                    UNIQUE(pair_id, source_message_id)
                 )
             """)
             # Migrations for existing tables
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_stalking INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media DROP CONSTRAINT IF EXISTS collected_media_source_chat_id_source_message_id_key")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD UNIQUE (pair_id, source_message_id)")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
             except: pass
@@ -1118,22 +1122,23 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved):
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
-                break
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
             
-            scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban: micro-delay to look less automated
-            # Date filter
-            if end_date and m.date > end_date: continue
-            if start_date and m.date < start_date: break # History is newest to oldest
-            
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
+            async for m in userbot.get_chat_history(sid_resolved):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
+                    break
+                
+                scanned += 1
+                await asyncio.sleep(0.05) # Anti-ban delay
+                
+                if end_date and m.date > end_date: continue
+                if start_date and m.date < start_date: break
+                
+                if m.media:
+                    media_type = m.media.value
                     if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -1145,13 +1150,15 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
+                
+                if limit and collected >= limit: break
+                
+                if scanned % 100 == 0:
+                    l_text = f"/{limit}" if limit else ""
+                    try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
+                    except: pass
             
-            if limit and collected >= limit: break
-            
-            if scanned % 100 == 0:
-                l_text = f"/{limit}" if limit else ""
-                try: bot.edit_message_text(f"📜 Scraping `{s_title}`...\nScanned: `{scanned}`\nCollected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id)
-                except: pass
+            conn.commit() # Ensure everything is saved
         
         bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
     except Exception as e:
@@ -1196,17 +1203,18 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
-                break
-            scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban delay
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            
+            async for m in userbot.get_chat_history(sid_resolved, limit=limit):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                    break
+                scanned += 1
+                await asyncio.sleep(0.05) # Anti-ban delay
+                if m.media:
+                    media_type = m.media.value
                     if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -1218,9 +1226,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                             (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
-            if scanned % 100 == 0:
-                try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
-                except: pass
+                if scanned % 100 == 0:
+                    try: bot.edit_message_text(f"📥 Collecting from `{title}`...\nScanned: `{scanned}`\nCollected: `{collected}`", admin_chat_id, status_msg.message_id)
+                    except: pass
+            
+            conn.commit()
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
