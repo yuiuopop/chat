@@ -45,8 +45,18 @@ logging.basicConfig(
 logger = logging.getLogger("saved_to_target_userbot")
 
 
+# --- Bot Helpers ---
+def safe_edit_message(text, chat_id, message_id, reply_markup=None, parse_mode="Markdown"):
+    try:
+        return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" in e.description:
+            return None
+        raise e
+
 # -----------------------------
 # DB (single-file sqlite)
+
 # -----------------------------
 # Use persistent disk path on Render when provided.
 # Set one of these env vars on Render:
@@ -358,42 +368,44 @@ def get_heartbeats():
 def main_menu_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(
-        KeyboardButton("🏠 Dashboard"),
-        KeyboardButton("⚙️ Setup"),
-        KeyboardButton("📡 Userbot")
+        KeyboardButton("🏠 DASHBOARD"),
+        KeyboardButton("⚙️ SETUP"),
+        KeyboardButton("📡 USERBOT")
     )
     kb.add(
-        KeyboardButton("📂 Sources"),
-        KeyboardButton("🎯 Target"),
-        KeyboardButton("🧲 Monitor")
+        KeyboardButton("📂 SOURCES"),
+        KeyboardButton("🎯 TARGET"),
+        KeyboardButton("🧲 MONITOR")
     )
     kb.add(
-        KeyboardButton("🚀 Transfer"),
-        KeyboardButton("📊 Status"),
-        KeyboardButton("❓ Help")
+        KeyboardButton("🚀 TRANSFER"),
+        KeyboardButton("📊 STATUS"),
+        KeyboardButton("❓ HELP")
     )
     return kb
+
 
 
 def dashboard_inline_keyboard():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("🔄 Refresh Stats", callback_data="dash_refresh"),
-        InlineKeyboardButton("📡 Bot Status", callback_data="dash_bot_status")
+        InlineKeyboardButton("🔄 REFRESH", callback_data="dash_refresh"),
+        InlineKeyboardButton("📡 CONSOLE", callback_data="dash_bot_status")
     )
     markup.add(
-        InlineKeyboardButton("📂 Manage Sources", callback_data="sources_list_0"),
-        InlineKeyboardButton("🎯 Target Config", callback_data="target_view")
+        InlineKeyboardButton("📂 SOURCES", callback_data="sources_list_0"),
+        InlineKeyboardButton("🎯 TARGET", callback_data="target_view")
     )
     markup.add(
-        InlineKeyboardButton("🚀 Quick Release", callback_data="quick_release_all"),
-        InlineKeyboardButton("👤 User Account", callback_data="user_acc_main")
+        InlineKeyboardButton("🚀 QUICK RELEASE", callback_data="quick_release_all"),
+        InlineKeyboardButton("👤 ACCOUNT", callback_data="user_acc_main")
     )
     markup.add(
-        InlineKeyboardButton("⚙️ Settings", callback_data="settings_main"),
-        InlineKeyboardButton("🧹 Clear Sent", callback_data="clear_sent_confirm")
+        InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings_main"),
+        InlineKeyboardButton("🧹 CLEAR CACHE", callback_data="clear_sent_confirm")
     )
     return markup
+
 
 
 def user_account_keyboard():
@@ -456,8 +468,8 @@ def setup_inline_keyboard():
 
 
 def dashboard_text():
-    t = get_target_ref() or "Not set"
-    a = get_setting("auto_forward", "false")
+    t = get_target_ref() or "NONE"
+    a = get_setting("auto_forward", "false").upper()
     sources = list_source_chats()
     
     with db_conn() as conn:
@@ -469,27 +481,30 @@ def dashboard_text():
 
     poll_hb, user_hb = get_heartbeats()
     now = time.time()
-    poll_status = "🟢 Active" if now - poll_hb < 180 else "🔴 Stale"
-    userbot_status = "🟢 Active" if (userbot and userbot.is_connected) else "🔴 Offline"
+    poll_status = "🟢 ACTIVE" if now - poll_hb < 180 else "🔴 STALE"
+    userbot_status = "🟢 ONLINE" if (userbot and userbot.is_connected) else "🔴 OFFLINE"
 
-    m = get_setting("forward_mode", "media")
-    mode_label = "📑 EVERYTHING" if m == "all" else "🖼 MEDIA ONLY"
+    m = get_setting("forward_mode", "media").upper()
+    af_emoji = "🟢" if a == "TRUE" else "🔴"
 
-    text = (
-        "💎 *System Dashboard*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 *Bot Status:* {poll_status}\n"
-        f"📡 *Userbot:* {userbot_status}\n\n"
-        f"🎯 *Target:* `{t}`\n"
-        f"⚡ *Auto-Forward:* `{a.upper()}`\n"
-        f"🛠 *Filter Mode:* `{mode_label}`\n\n"
-        f"📂 *Sources:* `{len(sources)}` configured\n"
-        f"📥 *Queue:* `{queue_count}` unreleased\n"
-        f"📤 *Sent:* `{sent_count}` total\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "💡 _Select an option below to manage the system._"
-    )
+    text = f"┏━━━━━━━ SYSTEM CONSOLE ━━━━━━━┓\n"
+    text += f"┃  🤖 BOT: {poll_status}  ┃  📡 USER: {userbot_status}  ┃\n"
+    text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+    
+    text += f"📊 *QUEUE PERFORMANCE*\n"
+    text += f"├─ 📂 Sources: `{len(sources)}` configured\n"
+    text += f"├─ ⏳ Pending: `{queue_count}` items\n"
+    text += f"├─ ✅ Released: `{sent_count}` total\n"
+    text += f"└─ {af_emoji} Auto-Forward: `{a}`\n\n"
+    
+    text += f"⚙️ *CONFIGURATION*\n"
+    text += f"├─ 🎯 Target: `{t}`\n"
+    text += f"└─ 🛠 Mode: `{m}`\n\n"
+    
+    text += f"🕹 *QUICK ACTIONS*"
     return text
+
+
 
 
 
@@ -573,9 +588,7 @@ def build_temp_client(api_id: int, api_hash: str) -> Client:
 @bot.callback_query_handler(func=lambda call: True)
 
 def handle_callbacks(call):
-    try:
-        global userbot
-
+    global userbot
     uid = call.from_user.id
     if not is_admin(uid):
         bot.answer_callback_query(call.id, "Unauthorized.")
@@ -695,6 +708,14 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "Refreshing connection info...")
         # (This could trigger a quick check or just refresh the dash)
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
+
+    elif data == "dash_main":
+        safe_edit_message(dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=dashboard_inline_keyboard())
+
+    elif data == "dash_refresh":
+        bot.answer_callback_query(call.id, "Stats refreshed!")
+        safe_edit_message(dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=dashboard_inline_keyboard())
+
 
     elif data == "clear_sent_confirm":
         kb = InlineKeyboardMarkup()
@@ -824,7 +845,7 @@ def handle_callbacks(call):
             kb.add(InlineKeyboardButton("🔙 Back to Categories", callback_data="user_acc_main"))
             
             msg = f"👤 *Account Browser:* {category.capitalize()}\nPage {page + 1} | Total: {len(all_dialogs)}"
-            bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+            safe_edit_message(msg, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
         asyncio.run_coroutine_threadsafe(run_list(), loop)
 
@@ -862,7 +883,8 @@ def handle_callbacks(call):
                 
                 kb.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"user_acc_list_{cat}_0"))
                 
-                bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="Markdown")
+                safe_edit_message(info, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
 
@@ -925,17 +947,6 @@ def handle_callbacks(call):
         set_setting("user_session_string", "")
         bot.answer_callback_query(call.id, "Credentials wiped")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "dash_main", 'message': call.message, 'id': call.id}))
-
-    except telebot.apihelper.ApiTelegramException as e:
-        if "message is not modified" in str(e).lower():
-            pass
-        else:
-            logger.error(f"Callback error: {e}")
-            bot.answer_callback_query(call.id, f"❌ Error: {e}")
-    except Exception as e:
-        logger.error(f"Callback error: {e}")
-        bot.answer_callback_query(call.id, f"❌ Error: {e}")
-
 
 
 
