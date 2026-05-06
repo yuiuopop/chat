@@ -96,20 +96,22 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
-                    pair_id INTEGER,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     media_type TEXT,
                     caption TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
-                    UNIQUE(pair_id, source_message_id)
+                    pair_id INTEGER,
+                    UNIQUE(source_chat_id, source_message_id)
                 )
             """)
-            # Migration check: Ensure pair_id exists if table was old
-            try:
-                c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
-            except: pass 
-            try:
-                c.execute("ALTER TABLE collected_media ADD COLUMN source_message_id BIGINT")
+            # Migrations for existing tables
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             except: pass
         else:
             # SQLite
@@ -395,9 +397,9 @@ async def setup_automation_handlers(client: Client):
                             db_c = conn.cursor()
                             p = get_placeholder()
                             if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, m.id, m_type, m.caption or ""))
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.caption or ""))
                             else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)", (pid, m.id, m_type, m.caption or ""))
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or ""))
                 
                 # 2) Live Forward: Copy message to target if live is ON
                 if is_live:
@@ -931,13 +933,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, m.id, media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
-                            (pair_id, m.id, media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
             
@@ -1004,13 +1006,13 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, m.id, media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?)",
-                            (pair_id, m.id, media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
             if scanned % 100 == 0:
