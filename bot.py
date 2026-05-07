@@ -1192,8 +1192,9 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 break
             try:
                 success = False
+                sent_msg = None
                 try:
-                    await userbot.copy_message(target_id, sid, smid)
+                    sent_msg = await userbot.copy_message(target_id, sid, smid)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
@@ -1207,16 +1208,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             if path:
                                 try:
                                     if msg.photo:
-                                        await userbot.send_photo(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption)
                                     elif msg.video:
-                                        await userbot.send_video(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption)
                                     else:
-                                        await userbot.send_document(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            await userbot.send_message(target_id, msg.text)
+                            sent_msg = await userbot.send_message(target_id, msg.text)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
@@ -1235,7 +1236,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             except Exception as e:
                 logger.error(f"Release error: {e}")
                 
-        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
+        last_link = ""
+        if 'sent_msg' in locals() and sent_msg and hasattr(sent_msg, "link") and sent_msg.link:
+            last_link = f"\n\n[🔗 View Last Sent Message]({sent_msg.link})"
+            
+        bot.send_message(admin_chat_id, f"✅ **Release Complete**\nTarget: `{target_chat.title or target_id}`\nSent: `{sent}` items{last_link}", parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
