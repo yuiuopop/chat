@@ -1197,17 +1197,26 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     # If copy fails (e.g. restricted content), try download/upload
                     try:
                         msg = await userbot.get_messages(sid, smid)
-                        if msg.media:
+                        if msg.empty:
+                            logger.error(f"Message {smid} is empty or deleted.")
+                        elif msg.media:
+                            # Try to download
                             path = await msg.download()
                             if path:
-                                # Send as new document to bypass restriction
-                                await userbot.send_document(target_id, path, caption=msg.caption)
-                                if os.path.exists(path): os.remove(path)
+                                try:
+                                    if msg.photo:
+                                        await userbot.send_photo(target_id, path, caption=msg.caption)
+                                    elif msg.video:
+                                        await userbot.send_video(target_id, path, caption=msg.caption)
+                                    else:
+                                        await userbot.send_document(target_id, path, caption=msg.caption)
+                                finally:
+                                    if os.path.exists(path): os.remove(path)
                         elif msg.text:
                             await userbot.send_message(target_id, msg.text)
                     except Exception as e2:
-                        logger.error(f"Deep copy failed: {e2}")
-                        await userbot.forward_messages(target_id, sid, smid)
+                        logger.error(f"Deep copy failed for {smid}: {e2}")
+                        # Don't try forward_messages here because restricted groups block it and it will throw another error
                 
                 with db_conn() as conn:
                     c = conn.cursor()
