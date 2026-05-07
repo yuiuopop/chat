@@ -1191,8 +1191,10 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
+                success = False
                 try:
                     await userbot.copy_message(target_id, sid, smid)
+                    success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
                     try:
@@ -1210,19 +1212,22 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                         await userbot.send_video(target_id, path, caption=msg.caption)
                                     else:
                                         await userbot.send_document(target_id, path, caption=msg.caption)
+                                    success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
                             await userbot.send_message(target_id, msg.text)
+                            success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
-                        # Don't try forward_messages here because restricted groups block it and it will throw another error
+                        bot.send_message(admin_chat_id, f"⚠️ **Failed to send item**\nID: `{smid}`\nError: `{e2}`", parse_mode="Markdown")
                 
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-                sent += 1
+                if success:
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except: pass
