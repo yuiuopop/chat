@@ -594,25 +594,16 @@ async def setup_automation_handlers(client: Client):
                             continue
                         # Try stealth mode if copy fails
                         if "SERVICE_MESSAGE_INVALID" in str(e): continue
+                        # Try forward fallback if copy fails (Pyrogram version might not support send_document with topics)
                         try:
-                            if m.media:
-                                path = await m.download()
-                                if path:
-                                    await c.send_document(
-                                        chat_id=target_id,
-                                        document=path,
-                                        caption=m.caption,
-                                        message_thread_id=t_topic
-                                    )
-                                    if os.path.exists(path): os.remove(path)
-                            else:
-                                await c.send_message(
-                                    chat_id=target_id,
-                                    text=m.text,
-                                    message_thread_id=t_topic
-                                )
+                            await c.forward_messages(
+                                chat_id=target_id,
+                                from_chat_id=m.chat.id,
+                                message_ids=m.id,
+                                message_thread_id=t_topic
+                            )
                         except Exception as e2:
-                            logger.error(f"Live Forward Error for Pair {pid}: {e2}")
+                            logger.error(f"Live Forward Fallback Error for Pair {pid}: {e2}")
 
 # -----------------------------
 # Bot Handlers
@@ -1397,30 +1388,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                         break
                     if "SERVICE_MESSAGE_INVALID" in err_str: continue
 
-                    # If copy fails (e.g. restricted content), try download/upload
+                    # If copy fails (e.g. restricted content), try forward fallback
                     try:
-                        msg = await userbot.get_messages(sid, smid)
-                        if not msg or msg.empty or msg.service: continue
-                        
-                        if msg.media:
-                            path = await msg.download()
-                            if path:
-                                await userbot.send_document(
-                                    chat_id=target_id,
-                                    document=path,
-                                    caption=msg.caption,
-                                    message_thread_id=t_topic
-                                )
-                                if os.path.exists(path): os.remove(path)
-                        elif msg.text:
-                            await userbot.send_message(
-                                chat_id=target_id,
-                                text=msg.text,
-                                message_thread_id=t_topic
-                            )
+                        await userbot.forward_messages(
+                            chat_id=target_id,
+                            from_chat_id=sid,
+                            message_ids=smid,
+                            message_thread_id=t_topic
+                        )
                     except Exception as e2:
-                        logger.error(f"Deep copy failed: {e2}")
-                        await userbot.forward_messages(target_id, sid, smid)
+                        logger.error(f"Release Fallback Error: {e2}")
                 
                 with db_conn() as conn:
                     c = conn.cursor()
