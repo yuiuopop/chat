@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import requests
+import signal
+import sys
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -1333,7 +1335,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             # Topic filtering with fallback detection
             if s_topic:
                 msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
-                if msg_topic != s_topic:
+                if int(msg_topic or 0) != int(s_topic):
                     continue
 
             scanned += 1
@@ -1556,6 +1558,22 @@ def health():
 def run_web():
     app.run(host="0.0.0.0", port=PORT)
 
+def shutdown_handler(*args):
+    logger.warning("🛑 Shutting down cleanly...")
+    try:
+        bot.stop_polling()
+    except:
+        pass
+    try:
+        if userbot and userbot.is_connected:
+            loop.run_until_complete(userbot.stop())
+    except:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
+
 # -----------------------------
 # Main Loop
 # -----------------------------
@@ -1591,14 +1609,15 @@ async def main():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                # Use delete_webhook instead of remove_webhook to avoid argument errors
-                bot.delete_webhook(drop_pending_updates=True)
-                bot.infinity_polling(skip_pending=True, timeout=60)
+                bot.remove_webhook()
+                time.sleep(3) # Delay to allow old polling to close fully
+                bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
-                logger.error(f"❌ Polling crashed: {e}. Restarting in 10s...")
-                time.sleep(10)
+                logger.error(f"❌ Polling crashed: {e}. Restarting in 15s...")
+                time.sleep(15)
     
-    threading.Thread(target=run_polling, daemon=True).start()
+    polling_thread = threading.Thread(target=run_polling, daemon=True)
+    polling_thread.start()
     logger.info("✨ Admin bot monitor started")
     
     await idle()
