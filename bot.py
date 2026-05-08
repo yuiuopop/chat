@@ -631,13 +631,12 @@ async def setup_automation_handlers(client: Client):
                             continue
                         # Try stealth mode if copy fails
                         if "SERVICE_MESSAGE_INVALID" in str(e): continue
-                        # Try forward fallback if copy fails (Pyrogram version might not support send_document with topics)
+                        # Try forward fallback if copy fails (Pyrogram forward_messages doesn't support message_thread_id in this version)
                         try:
                             await c.forward_messages(
                                 chat_id=target_id,
                                 from_chat_id=m.chat.id,
-                                message_ids=m.id,
-                                message_thread_id=t_topic
+                                message_ids=m.id
                             )
                         except Exception as e2:
                             logger.error(f"Live Forward Fallback Error for Pair {pid}: {e2}")
