@@ -80,18 +80,29 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS target_pairs (
                     id SERIAL PRIMARY KEY,
                     source_id BIGINT,
+                    source_topic_id BIGINT DEFAULT NULL,
                     target_id BIGINT,
+                    target_topic_id BIGINT DEFAULT NULL,
                     source_title TEXT,
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
-                    UNIQUE(source_id, target_id)
+                    UNIQUE(source_id, source_topic_id, target_id, target_topic_id)
                 )
             """)
             # Migration
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN source_topic_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN target_topic_id BIGINT DEFAULT NULL")
+            except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            # Update UNIQUE constraint for Postgres
+            try:
+                c.execute("ALTER TABLE target_pairs DROP CONSTRAINT IF EXISTS target_pairs_source_id_target_id_key")
+                c.execute("ALTER TABLE target_pairs ADD CONSTRAINT unique_pair_topics UNIQUE (source_id, source_topic_id, target_id, target_topic_id)")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -1561,7 +1572,7 @@ async def main():
                 logger.info("🚀 Starting Admin Bot polling...")
                 # Use delete_webhook instead of remove_webhook to avoid argument errors
                 bot.delete_webhook(drop_pending_updates=True)
-                bot.infinity_polling(skip_pending=True, timeout=20)
+                bot.infinity_polling(skip_pending=True, timeout=60)
             except Exception as e:
                 logger.error(f"❌ Polling crashed: {e}. Restarting in 10s...")
                 time.sleep(10)
