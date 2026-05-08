@@ -1288,8 +1288,8 @@ async def resolve_target_id(client: Client, target_ref: str):
         # 2. Try username/ref
         return await client.get_chat(target_ref)
     except Exception:
-        # 3. Aggressive Search: iterate through many dialogs to find the peer
-        async for dialog in client.get_dialogs(limit=200):
+        # 3. Aggressive Search: iterate through all dialogs to find the peer and force it into cache
+        async for dialog in client.get_dialogs(limit=9999):
             if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
                 return dialog.chat
     raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
@@ -1401,9 +1401,10 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     
         try:
             source_chat = await resolve_target_id(userbot, sid)
-            source_id = source_chat.id
+            source_peer = source_chat.username if source_chat.username else source_chat.id
+            
             target_chat = await resolve_target_id(userbot, tid_ref)
-            target_id = target_chat.id
+            target_peer = target_chat.username if target_chat.username else target_chat.id
         except Exception as e:
             bot.send_message(admin_chat_id, f"❌ Chat Resolution Error: {e}")
             return
@@ -1420,11 +1421,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
         # Warm up session cache for both chats so Pyrogram knows their access_hash
         try:
-            await userbot.get_chat(source_id)
+            await userbot.get_chat(source_peer)
         except Exception:
             pass
         try:
-            await userbot.get_chat(target_id)
+            await userbot.get_chat(target_peer)
         except Exception:
             pass
 
@@ -1442,7 +1443,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 if source_topic_id:
                     t_name = await get_topic_name(userbot, sid, source_topic_id)
                     if t_name:
-                        target_topic_id = await get_or_create_target_topic(userbot, target_id, t_name)
+                        target_topic_id = await get_or_create_target_topic(userbot, target_peer, t_name)
 
                 success = False
                 sent_msg = None
@@ -1452,12 +1453,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     kwargs["reply_to_message_id"] = target_topic_id
                     
                 try:
-                    sent_msg = await userbot.copy_message(target_id, source_id, smid, **kwargs)
+                    sent_msg = await userbot.copy_message(target_peer, source_peer, smid, **kwargs)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
                     try:
-                        msg = await userbot.get_messages(source_id, smid)
+                        msg = await userbot.get_messages(source_peer, smid)
                         if msg.empty:
                             logger.error(f"Message {smid} is empty or deleted.")
                         elif msg.media:
@@ -1466,16 +1467,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             if path:
                                 try:
                                     if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption, **kwargs)
+                                        sent_msg = await userbot.send_photo(target_peer, path, caption=msg.caption, **kwargs)
                                     elif msg.video:
-                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption, **kwargs)
+                                        sent_msg = await userbot.send_video(target_peer, path, caption=msg.caption, **kwargs)
                                     else:
-                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption, **kwargs)
+                                        sent_msg = await userbot.send_document(target_peer, path, caption=msg.caption, **kwargs)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            sent_msg = await userbot.send_message(target_id, msg.text, **kwargs)
+                            sent_msg = await userbot.send_message(target_peer, msg.text, **kwargs)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
@@ -1498,7 +1499,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         if 'sent_msg' in locals() and sent_msg and hasattr(sent_msg, "link") and sent_msg.link:
             last_link = f"\n\n[🔗 View Last Sent Message]({sent_msg.link})"
             
-        bot.send_message(admin_chat_id, f"✅ **Release Complete**\nTarget: `{target_chat.title or target_id}`\nSent: `{sent}` items{last_link}", parse_mode="Markdown", disable_web_page_preview=True)
+        bot.send_message(admin_chat_id, f"✅ **Release Complete**\nTarget: `{target_chat.title or target_peer}`\nSent: `{sent}` items{last_link}", parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
