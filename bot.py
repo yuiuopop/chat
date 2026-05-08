@@ -648,13 +648,13 @@ def setup_automation_handlers(client: TelegramClient):
             f"FORUM: {getattr(m, 'forum_topic', False)}\n"
             f"==============================="
         )
-        # Strip -100 for reliable supergroup matching
-        current_chat_id = int(str(event.chat_id).replace("-100", ""))
+        # USE RAW TELEGRAM IDS
+        current_chat_id = int(event.chat_id)
         
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            source_chat_id = int(str(sid).replace("-100", ""))
+            source_chat_id = int(sid)
             
             logger.warning(
                 f"\n------ CHECKING PAIR ------\n"
@@ -669,7 +669,7 @@ def setup_automation_handlers(client: TelegramClient):
             )
 
             # Strict integer comparison for IDs
-            if current_chat_id == source_chat_id:
+            if int(current_chat_id) == int(source_chat_id):
                 logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
