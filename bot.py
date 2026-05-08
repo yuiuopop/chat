@@ -566,21 +566,30 @@ async def setup_automation_handlers(client: Client):
                 if m.service:
                     continue
 
-                # Topic filtering if applicable using robust RAW extraction
+                # Topic filtering if applicable using multi-layered detection
                 if s_topic:
                     msg_topic_anchor = None
                     try:
-                        raw = getattr(m, "_raw", None)
-                        if raw and getattr(raw, "reply_to", None):
-                            reply = raw.reply_to
-                            # Try multiple possible raw field names for the thread anchor
-                            msg_topic_anchor = getattr(reply, "reply_to_top_id", None)
-                            if not msg_topic_anchor:
-                                msg_topic_anchor = getattr(reply, "top_msg_id", None)
+                        # Method 1 & 2: High-level Pyrogram fields
+                        msg_topic_anchor = getattr(m, "reply_to_top_message_id", None) or getattr(m, "message_thread_id", None)
+                        
+                        # Method 3: Raw MTProto fallback
+                        if not msg_topic_anchor:
+                            raw = getattr(m, "_raw", None)
+                            if raw and getattr(raw, "reply_to", None):
+                                reply = raw.reply_to
+                                msg_topic_anchor = getattr(reply, "reply_to_top_id", None) or getattr(reply, "top_msg_id", None)
                     except Exception as e:
                         logger.error(f"LIVE TOPIC PARSE ERROR: {e}")
                     
-                    logger.warning(f"TOPIC FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
+                    # Deep Diagnostic Log
+                    logger.warning(
+                        f"MSG:{m.id} | THREAD:{getattr(m, 'message_thread_id', None)} "
+                        f"| TOP:{getattr(m, 'reply_to_top_message_id', None)} "
+                        f"| RAW:{getattr(getattr(m, '_raw', None), 'reply_to', None)} "
+                        f"| MATCHING:{msg_topic_anchor} vs {s_topic}"
+                    )
+                    
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
                         
@@ -1336,66 +1345,54 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        # Logic: If it's a topic group, we must use search_messages() because get_chat_history() often fails 
-        # to return thread metadata in history scraping mode.
-        if s_topic:
-            async for m in userbot.search_messages(chat_id=sid_resolved, limit=limit):
-                if not running_tasks.get(task_key):
-                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
-                    break
-                
-                # Double check thread anchor ID using robust RAW extraction
+        # Scan history (get_chat_history is more reliable for preserving metadata than search_messages)
+        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                break
+            
+            # Topic filtering if applicable using multi-layered detection
+            if s_topic:
                 msg_topic_anchor = None
                 try:
-                    raw = getattr(m, "_raw", None)
-                    if raw and getattr(raw, "reply_to", None):
-                        reply = raw.reply_to
-                        msg_topic_anchor = getattr(reply, "reply_to_top_id", None)
-                        if not msg_topic_anchor:
-                            msg_topic_anchor = getattr(reply, "top_msg_id", None)
-                except: pass
+                    # Method 1 & 2: High-level Pyrogram fields
+                    msg_topic_anchor = getattr(m, "reply_to_top_message_id", None) or getattr(m, "message_thread_id", None)
+                    
+                    # Method 3: Raw MTProto fallback
+                    if not msg_topic_anchor:
+                        raw = getattr(m, "_raw", None)
+                        if raw and getattr(raw, "reply_to", None):
+                            reply = raw.reply_to
+                            msg_topic_anchor = getattr(reply, "reply_to_top_id", None) or getattr(reply, "top_msg_id", None)
+                except Exception as e:
+                    logger.error(f"COLLECTION TOPIC PARSE ERROR: {e}")
                 
-                logger.warning(f"COLLECTION FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
+                # Deep Diagnostic Log
+                if scanned % 10 == 0: # Log every 10th message to avoid cluttering but keep visibility
+                    logger.warning(
+                        f"SCRAPE MSG:{m.id} | THREAD:{getattr(m, 'message_thread_id', None)} "
+                        f"| TOP:{getattr(m, 'reply_to_top_message_id', None)} "
+                        f"| MATCHING:{msg_topic_anchor} vs {s_topic}"
+                    )
+                
                 if str(msg_topic_anchor) != str(s_topic):
                     continue
 
-                scanned += 1
-                await asyncio.sleep(0.05)
-                if m.media:
-                    media_type = m.media.value
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if DATABASE_URL:
-                            c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                        else:
-                            c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                        if c.rowcount > 0: collected += 1
-                
-                if scanned % 50 == 0:
-                    try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                    except: pass
-        else:
-            # Normal group - standard history scan is faster
-            async for m in userbot.get_chat_history(sid_resolved, limit=limit):
-                if not running_tasks.get(task_key):
-                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
-                    break
-                
-                scanned += 1
-                await asyncio.sleep(0.05)
-                if m.media:
-                    media_type = m.media.value
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if DATABASE_URL:
-                            c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                        else:
-                            c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                        if c.rowcount > 0: collected += 1
-                
-                if scanned % 50 == 0:
-                    try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                    except: pass
+            scanned += 1
+            await asyncio.sleep(0.05)
+            if m.media:
+                media_type = m.media.value
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    if DATABASE_URL:
+                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                    else:
+                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                    if c.rowcount > 0: collected += 1
+            
+            if scanned % 50 == 0:
+                try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                except: pass
 
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
