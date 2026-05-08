@@ -377,18 +377,16 @@ async def get_chat_selection_markup(prefix, page=0):
         # Fetch full chat info for the current page to ensure is_forum etc. are populated
         try:
             full_chat = await userbot.get_chat(chat.id)
-            # Comprehensive flag check
+            # Definitive API check for forums
             is_forum = False
-            for attr in ["is_forum", "forum", "forums_enabled"]:
-                if getattr(full_chat, attr, False):
+            if full_chat.type == enums.ChatType.SUPERGROUP:
+                try:
+                    # Attempt to fetch topics; if it fails, it's not a forum
+                    await userbot.get_forum_topics(chat.id, limit=1)
                     is_forum = True
-                    break
+                except:
+                    is_forum = getattr(full_chat, "is_forum", False) or getattr(full_chat, "forum", False)
             
-            if not is_forum:
-                # Last resort: check raw object if possible
-                if hasattr(full_chat, "is_forum") and full_chat.is_forum:
-                    is_forum = True
-
             title = full_chat.title or full_chat.first_name or "Chat"
         except Exception as e:
             logger.error(f"Chat info fetch error for {chat.id}: {e}")
