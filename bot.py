@@ -1075,21 +1075,14 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
 async def resolve_target_id(client: Client, target_ref: str):
     try:
-        # 1. Try internal resolve (fastest)
-        try:
-            return await client.get_chat(target_ref)
-        except Exception:
-            pass
-            
-        # 2. Try direct ID (int)
+        # 1. Try direct ID (int)
         if str(target_ref).lstrip("-").isdigit():
             return await client.get_chat(int(target_ref))
-        # 3. Try username/ref
+        # 2. Try username/ref
         return await client.get_chat(target_ref)
     except Exception:
-        # 4. Aggressive Search: iterate through many dialogs to find the peer
-        # This force-feeds the peers into the session memory
-        async for dialog in client.get_dialogs(limit=300):
+        # 3. Aggressive Search: iterate through many dialogs to find the peer
+        async for dialog in client.get_dialogs(limit=200):
             if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
                 return dialog.chat
     raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
