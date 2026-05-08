@@ -458,7 +458,7 @@ async def start_userbot():
             api_id=int(api_id),
             api_hash=api_hash,
             session_string=session_string,
-            in_memory=True,
+            in_memory=False,
             device_model="PC 64bit",
             system_version="Windows 11",
             app_version="4.11.2",
@@ -1293,17 +1293,32 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         running_tasks.pop(task_key, None)
 
 async def resolve_target_id(client: Client, target_ref: str):
+    """
+    Resolves a target_ref (ID or username) into a Chat object.
+    Uses an aggressive dialog-cache approach to avoid PEER_ID_INVALID.
+    """
+    target_str = str(target_ref).strip()
+    
+    # Try to find in cache first (very fast)
     try:
-        # 1. Try direct ID (int)
-        if str(target_ref).lstrip("-").isdigit():
-            return await client.get_chat(int(target_ref))
-        # 2. Try username/ref
+        if target_str.lstrip("-").isdigit():
+            # Try to get from internal cache without network call if possible
+            # In Pyrogram 2, get_chat(int) might still trigger network.
+            # We'll try to find it in the dialogs list which we warmed up.
+            async for dialog in client.get_dialogs(limit=50):
+                if str(dialog.chat.id) == target_str:
+                    return dialog.chat
+    except: pass
+
+    try:
+        # Try direct resolution (works if already met)
         return await client.get_chat(target_ref)
     except Exception:
-        # 3. Aggressive Search: iterate through all dialogs to find the peer and force it into cache
-        async for dialog in client.get_dialogs(limit=9999):
-            if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
+        # Aggressive Search: iterate through all dialogs to find the peer and force it into cache
+        async for dialog in client.get_dialogs(limit=None):
+            if str(dialog.chat.id) == target_str or (dialog.chat.username and dialog.chat.username.lower() == target_str.replace("@", "").lower()):
                 return dialog.chat
+                
     raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
