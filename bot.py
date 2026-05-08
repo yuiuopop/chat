@@ -649,28 +649,43 @@ def setup_automation_handlers(client: TelegramClient):
             f"FORUM: {getattr(m, 'forum_topic', False)}\n"
             f"==============================="
         )
-        # USE RAW TELEGRAM IDS
+        # USE ROBUST PEER MATCHING (Handles forum migration/ID variance)
         current_chat_id = int(event.chat_id)
-        
+        try:
+            event_input = await event.get_input_chat()
+            real_event_id = getattr(event_input, 'channel_id', getattr(event_input, 'chat_id', current_chat_id))
+        except:
+            real_event_id = current_chat_id
+
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             source_chat_id = int(sid)
             
+            # Resolve source input for comparison
+            try:
+                source_input = await client.get_input_entity(source_chat_id)
+                real_source_id = getattr(source_input, 'channel_id', getattr(source_input, 'chat_id', source_chat_id))
+            except:
+                real_source_id = source_chat_id
+
             logger.warning(
                 f"\n------ CHECKING PAIR ------\n"
                 f"PAIR_ID: {pid}\n"
-                f"EVENT_CHAT: {current_chat_id}\n"
-                f"PAIR_SOURCE: {source_chat_id}\n"
-                f"S_TOPIC: {s_topic}\n"
-                f"T_TOPIC: {t_topic}\n"
-                f"IS_LIVE: {is_live}\n"
-                f"IS_MIRROR: {is_mir}\n"
+                f"EVENT_CHAT_RAW: {current_chat_id}\n"
+                f"EVENT_PEER_ID: {real_event_id}\n"
+                f"SOURCE_PEER_ID: {real_source_id}\n"
                 f"---------------------------"
             )
 
-            # Strict integer comparison for IDs
-            if int(current_chat_id) == int(source_chat_id):
+            # Robust matching: Direct match OR suffix match (handling -100 variants)
+            matched = (
+                int(real_event_id) == int(real_source_id)
+                or str(real_event_id).endswith(str(real_source_id).replace("-100", ""))
+                or str(real_source_id).endswith(str(real_event_id).replace("-100", ""))
+            )
+
+            if matched:
                 logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
                 # Topic filtering (Temporarily disabled for debugging)
                 if False: # s_topic not in [None, 0, "0"]:
