@@ -636,6 +636,7 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage(incoming=True))
     async def auto_handler(event):
         m = event.message
+        logger.warning(f"🔥 REAL EVENT CHAT ID = {event.chat_id}")
         
         logger.warning(
             f"\n========== NEW EVENT ==========\n"
@@ -671,8 +672,8 @@ def setup_automation_handlers(client: TelegramClient):
             # Strict integer comparison for IDs
             if int(current_chat_id) == int(source_chat_id):
                 logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
-                # Topic filtering (0 or None means entire group/chat)
-                if s_topic not in [None, 0, "0"]:
+                # Topic filtering (Temporarily disabled for debugging)
+                if False: # s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = (
                         getattr(m, "reply_to_top_id", None)
                         or getattr(m, "top_msg_id", None)
@@ -776,6 +777,26 @@ def cmd_start(message):
         reply_markup=get_dashboard_markup(),
         parse_mode="Markdown"
     )
+
+@bot.message_handler(commands=['debugpairs'])
+def debug_pairs(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = get_target_pairs()
+    if not rows:
+        bot.reply_to(message, "No pairs found.")
+        return
+    text = "🔍 **DEBUG PAIRS**\n\n"
+    for row in rows:
+        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
+        text += (
+            f"📦 **Pair:** `{pid}`\n"
+            f"📤 **Source:** `{sid}`\n"
+            f"📥 **Target:** `{tid}`\n"
+            f"⚡ **Live:** `{is_live}`\n"
+            f"🧵 **S-Topic:** `{s_topic}`\n\n"
+        )
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=["list"])
 def cmd_list(message):
