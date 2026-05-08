@@ -283,11 +283,13 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
-        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
+        topic_status = "🧵" if (s_topic or t_topic) else ""
+        
+        btn_text = f"📁 {topic_status}{s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
     markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
