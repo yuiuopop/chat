@@ -623,12 +623,12 @@ def setup_automation_handlers(client: TelegramClient):
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            if m.chat_id == sid:
+            if str(abs(int(m.chat_id))) == str(abs(int(sid))):
                 # Topic filtering (0 or None means entire group/chat)
-                if s_topic and str(s_topic) != "0":
-                    msg_topic_anchor = None
-                    if m.reply_to:
-                        msg_topic_anchor = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
+                if s_topic not in [None, 0, "0"]:
+                    msg_topic_anchor = getattr(m, "reply_to_top_id", None)
+                    if not msg_topic_anchor and m.reply_to:
+                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
                     
                     if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
