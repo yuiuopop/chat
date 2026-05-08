@@ -758,7 +758,17 @@ def handle_callbacks(call):
             async def handle_src():
                 try:
                     full_chat = await userbot.get_chat(sid)
-                    is_forum = getattr(full_chat, "forum", False) or getattr(full_chat, "is_forum", False)
+                    # Advanced forum detection synchronized with list view
+                    is_forum = any([
+                        getattr(full_chat, "is_forum", False),
+                        getattr(full_chat, "forum", False),
+                        "forum" in str(full_chat).lower(),
+                        "is_forum=True" in str(full_chat),
+                        (
+                            full_chat.type == enums.ChatType.SUPERGROUP and
+                            "topic" in str(full_chat).lower()
+                        )
+                    ])
                     if is_forum:
                         markup = await get_topic_selection_markup(sid, "sel_src_topic")
                         bot.edit_message_text(f"🧵 **『 {full_chat.title} 』**\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -796,7 +806,17 @@ def handle_callbacks(call):
             async def handle_tgt():
                 try:
                     full_chat = await userbot.get_chat(tid)
-                    is_forum = getattr(full_chat, "forum", False) or getattr(full_chat, "is_forum", False)
+                    # Advanced forum detection synchronized with list view
+                    is_forum = any([
+                        getattr(full_chat, "is_forum", False),
+                        getattr(full_chat, "forum", False),
+                        "forum" in str(full_chat).lower(),
+                        "is_forum=True" in str(full_chat),
+                        (
+                            full_chat.type == enums.ChatType.SUPERGROUP and
+                            "topic" in str(full_chat).lower()
+                        )
+                    ])
                     if is_forum:
                         markup = await get_topic_selection_markup(tid, "sel_tgt_topic")
                         bot.edit_message_text(f"🧵 **『 {full_chat.title} 』**\nSelect a target topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
