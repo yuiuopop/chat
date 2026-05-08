@@ -1429,11 +1429,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT source_id, target_id, source_title, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
+            c.execute(f"SELECT source_id, target_id, source_title, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
             row = c.fetchone()
         
         if not row: return
-        sid, tid_ref, s_title, s_topic, t_topic = row
+        sid, tid_ref, s_title, is_mir, s_topic, t_topic = row
     
         try:
             # Pre-resolve peers to avoid PeerIdInvalid during tasks
@@ -1465,15 +1465,40 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
-                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{t_topic}")
+                target_topic_anchor = t_topic
                 msg = await userbot.get_messages(sid, ids=smid)
                 if not msg:
                     continue
+
+                # MIRROR MODE LOGIC
+                if is_mir and msg.reply_to:
+                    try:
+                        source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
+                        if not source_topic_id: source_topic_id = msg.id
+
+                        src_topics = await userbot(functions.channels.GetForumTopicsRequest(
+                            channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                        ))
+                        
+                        src_title = None
+                        for st in src_topics.topics:
+                            if st.top_message == source_topic_id:
+                                src_title = st.title
+                                break
+                        
+                        if src_title:
+                            mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
+                            if mirrored_id:
+                                target_topic_anchor = mirrored_id
+                    except Exception as me:
+                        logger.error(f"Release Mirror Error: {me}")
+
+                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
                 await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    reply_to=t_topic
+                    reply_to=target_topic_anchor
                 )
                 
                 with db_conn() as conn:
