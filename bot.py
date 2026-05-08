@@ -85,6 +85,9 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    filter_type TEXT DEFAULT 'all',
+                    source_thread_id BIGINT DEFAULT NULL,
+                    target_thread_id BIGINT DEFAULT NULL,
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -92,6 +95,12 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN source_thread_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN target_thread_id BIGINT DEFAULT NULL")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
