@@ -458,37 +458,56 @@ async def get_chat_selection_markup(prefix, page=0):
 
 async def get_topic_selection_markup(chat_id, prefix):
     """
-    Fetches topics from a forum group and returns a markup for selection.
+    Deep-scans chat history to find all active topics/threads.
     """
     markup = InlineKeyboardMarkup(row_width=1)
     try:
-        # We'll use a set to keep track of unique topics found in history
-        forum_topics = []
+        found_topics = {}
+        scanned = 0
         
-        # Method 1: Try get_forum_topics if supported (some versions/bots might fail)
-        try:
-            async for topic in userbot.get_forum_topics(chat_id, limit=50):
-                forum_topics.append((topic.id, topic.title))
-        except Exception as e:
-            logger.debug(f"Direct get_forum_topics failed: {e}. Falling back to history scan.")
-            # Method 2: Scan history for thread IDs
-            async for msg in userbot.get_chat_history(chat_id, limit=150):
-                tid = getattr(msg, "message_thread_id", None)
-                if tid and not any(t[0] == tid for t in forum_topics):
-                    title = f"Topic {tid}"
-                    if msg.forum_topic_created:
-                        title = msg.forum_topic_created.name
-                    forum_topics.append((tid, title))
-        
-        for tid, title in forum_topics:
-            markup.add(InlineKeyboardButton(f"🧵 {title}", callback_data=f"{prefix}_{chat_id}_{tid}"))
+        # Scan deeper into history to find older topics
+        async for msg in userbot.get_chat_history(chat_id, limit=1000):
+            scanned += 1
+            topic_id = getattr(msg, "message_thread_id", None)
             
-        if not forum_topics:
-            markup.add(InlineKeyboardButton("⚠️ No Topics Found / Private", callback_data="noop"))
+            if not topic_id:
+                continue
+                
+            if topic_id in found_topics:
+                continue
+                
+            topic_title = None
+            try:
+                if getattr(msg, "forum_topic_created", None):
+                    topic_title = msg.forum_topic_created.name
+            except:
+                pass
+                
+            if not topic_title:
+                # Use message preview as fallback title
+                if msg.text:
+                    topic_title = msg.text[:30].strip() + "..." if len(msg.text) > 30 else msg.text
+                elif msg.caption:
+                    topic_title = msg.caption[:30].strip() + "..." if len(msg.caption) > 30 else msg.caption
+                else:
+                    topic_title = f"Topic {topic_id}"
+                    
+            found_topics[topic_id] = topic_title
+            
+        for topic_id, topic_title in found_topics.items():
+            markup.add(
+                InlineKeyboardButton(
+                    f"🧵 {topic_title}",
+                    callback_data=f"{prefix}_{chat_id}_{topic_id}"
+                )
+            )
+            
+        if not found_topics:
+            markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
             
     except Exception as e:
         logger.error(f"Topic fetch error: {e}")
-        markup.add(InlineKeyboardButton("❌ Error loading topics", callback_data="noop"))
+        markup.add(InlineKeyboardButton("❌ Error Loading Topics", callback_data="noop"))
         
     markup.add(InlineKeyboardButton("🔙 Back to Chats", callback_data="pair_add_start"))
     return markup
