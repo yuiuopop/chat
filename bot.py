@@ -648,38 +648,57 @@ def setup_automation_handlers(client: TelegramClient):
                     target_topic_anchor = t_topic
                     
                     # Mirroring Logic
-                    if is_mir and m.reply_to:
+                    if is_mir:
                         try:
-                            source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
+                            source_topic_id = None
+                            if getattr(m, "reply_to_top_id", None):
+                                source_topic_id = m.reply_to_top_id
+                            elif m.reply_to:
+                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
+                            elif getattr(m, "forum_topic", False):
+                                source_topic_id = m.id
                             
-                            # Get Source Topic Title
-                            src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                            ))
-                            
-                            src_title = None
-                            for st in src_topics.topics:
-                                if st.top_message == source_topic_id:
-                                    src_title = st.title
-                                    break
-                            
-                            if src_title:
-                                # Get/Create Target Topic
-                                mirrored_id = await get_or_create_target_topic(client, tid, src_title)
-                                if mirrored_id:
-                                    target_topic_anchor = mirrored_id
+                            if source_topic_id:
+                                src_title = None
+                                # 1) Direct metadata
+                                if getattr(m, "reply_to", None):
+                                    forum = getattr(m.reply_to, "forum_topic", None)
+                                    if forum and getattr(forum, "title", None):
+                                        src_title = forum.title
+                                
+                                # 2) Fetch fallback
+                                if not src_title:
+                                    src_topics = await client(functions.channels.GetForumTopicsRequest(
+                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                    ))
+                                    for st in src_topics.topics:
+                                        if (getattr(st, "id", None) == source_topic_id or 
+                                            getattr(st, "top_message", None) == source_topic_id):
+                                            src_title = st.title
+                                            break
+                                
+                                if src_title:
+                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
+                                    if mirrored_id:
+                                        target_topic_anchor = mirrored_id
                         except Exception as me:
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
                         logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
-                        # Telethon send_message with file=m effectively copies it
-                        await client.send_message(
-                            tid,
-                            m.message,
-                            file=m.media,
-                            reply_to=target_topic_anchor
-                        )
+                        if m.media:
+                            await client.send_file(
+                                entity=tid,
+                                file=m.media,
+                                caption=m.message or "",
+                                reply_to=target_topic_anchor
+                            )
+                        else:
+                            await client.send_message(
+                                entity=tid,
+                                message=m.message or "",
+                                reply_to=target_topic_anchor
+                            )
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
