@@ -85,7 +85,6 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
-                    filter_type TEXT DEFAULT 'all',
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -94,15 +93,11 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
             except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
-            except: pass
-            
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
                     source_chat_id BIGINT,
                     source_message_id BIGINT,
-                    thread_id INTEGER,
                     media_type TEXT,
                     caption TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -117,8 +112,6 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN thread_id INTEGER")
             except: pass
         else:
             # SQLite
@@ -146,7 +139,6 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_chat_id BIGINT,
                     source_message_id BIGINT,
-                    thread_id INTEGER,
                     media_type TEXT,
                     caption TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -163,8 +155,6 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN thread_id INTEGER")
             except: pass
     logger.info("DB initialized")
 
@@ -239,7 +229,6 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
-topic_cache = {}   # {(target_id, source_id, thread_id): target_thread_id}
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -280,20 +269,12 @@ def get_dashboard_markup():
 
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    with db_conn() as conn:
-        c = conn.cursor()
-        # Single query to get pairs AND pending counts (Optimization)
-        c.execute("""
-            SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type,
-            (SELECT COUNT(*) FROM collected_media WHERE pair_id = target_pairs.id AND released = 0) as pending
-            FROM target_pairs
-        """)
-        pairs = c.fetchall()
-        
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, pending in pairs:
+    pairs = get_target_pairs()
+    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+        stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
-        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({pending})"
+        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
     markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
@@ -313,10 +294,6 @@ def show_pair_view(chat_id, message_id, pid):
         mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
         live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
         filter_label = filter_type.upper()
-        task_info = ""
-        if is_task_running(f"hist_{pid}"): task_info += "\n🏃 **History Scrape:** `RUNNING`"
-        if is_task_running(f"coll_{pid}"): task_info += "\n🏃 **Collection:** `RUNNING`"
-        if is_task_running(f"rel_{pid}"): task_info += "\n🏃 **Release:** `RUNNING`"
         
         text = (
             f"📁 **Pair Management**\n\n"
@@ -328,7 +305,6 @@ def show_pair_view(chat_id, message_id, pid):
             f"🤖 **Automation Status:**\n"
             f"Monitor: `{mon_status}`\n"
             f"Live: `{live_status}`"
-            f"{task_info}"
         )
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
@@ -371,8 +347,6 @@ def pair_view_markup(pair_id):
     
     if is_coll: markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
     else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
-
-    markup.add(InlineKeyboardButton("🔄 Refresh Stats", callback_data=f"pair_view_{pair_id}"))
     
     if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
     else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
@@ -511,12 +485,8 @@ async def setup_automation_handlers(client: Client):
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
-            # Normalize IDs for matching (Handle -100 prefix variations)
-            m_id_norm = str(m.chat.id).replace("-100", "")
-            s_id_norm = str(sid).replace("-100", "")
-            
-            if m_id_norm == s_id_norm:
-                logger.info(f"📩 Live Match! Message in '{s_title}' (Pair {pid}). Filter: {filter_type}")
+            # We match numeric IDs
+            if str(m.chat.id) == str(sid):
                 # Apply filter
                 if filter_type == "media" and not m.media: continue
                 if filter_type == "text" and m.media: continue
@@ -525,66 +495,28 @@ async def setup_automation_handlers(client: Client):
                 if is_mon:
                     if m.media:
                         m_type = m.media.value
-                        m_thread = getattr(m, "message_thread_id", None)
                         with db_conn() as conn:
                             db_c = conn.cursor()
                             p = get_placeholder()
                             if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_thread, m_type, m.caption or ""))
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.caption or ""))
                             else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)", (pid, sid, m.id, m_thread, m_type, m.caption or ""))
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or ""))
                     elif m.text: # Collect text if allowed
-                        m_thread = getattr(m, "message_thread_id", None)
                         with db_conn() as conn:
                             db_c = conn.cursor()
                             p = get_placeholder()
                             if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_thread, 'text', m.text))
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, 'text', m.text))
                             else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)", (pid, sid, m.id, m_thread, 'text', m.text))
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, 'text', m.text))
 
-                        # 2) Live Forward: Copy message to target if live is ON
-                        if is_live:
-                            try:
-                                # Topic Handling
-                                target_thread = None
-                                m_thread = getattr(m, "message_thread_id", None)
-                                if m_thread:
-                                    cache_key = (tid, sid, m_thread)
-                                    if cache_key in topic_cache:
-                                        target_thread = topic_cache[cache_key]
-                                    else:
-                                        try:
-                                            t_chat = await resolve_target_id(userbot, str(tid))
-                                            if getattr(t_chat, "is_forum", False):
-                                                # Match source topic name to target
-                                                src_topics = await userbot.get_forum_topics(sid)
-                                                src_topic = next((t for t in src_topics if t.id == m_thread), None)
-                                                if src_topic:
-                                                    t_topics = await userbot.get_forum_topics(t_chat.id)
-                                                    match = next((t for t in t_topics if t.title == src_topic.title), None)
-                                                    if match:
-                                                        target_thread = match.id
-                                                    else:
-                                                        # Create matching topic in target
-                                                        try:
-                                                            new_t = await userbot.create_forum_topic(t_chat.id, src_topic.title)
-                                                            target_thread = new_t.id
-                                                            logger.info(f"✨ Created new topic '{src_topic.title}' in target {tid}")
-                                                        except Exception as te:
-                                                            logger.error(f"❌ Failed to create topic in target: {te}")
-                                                    
-                                                    if target_thread:
-                                                        topic_cache[cache_key] = target_thread
-                                        except Exception as fe:
-                                            logger.error(f"Topic Resolution Error for Pair {pid}: {fe}")
-                                
-                                # Compatibility Fix: Only pass message_thread_id if it's NOT None
-                                kwargs = {}
-                                if target_thread: kwargs["message_thread_id"] = target_thread
-                                await m.copy(tid, **kwargs)
-                            except Exception as e:
-                                logger.error(f"Live Forward Error for Pair {pid}: {e}")
+                # 2) Live Forward: Copy message to target if live is ON
+                if is_live:
+                    try:
+                        await m.copy(tid)
+                    except Exception as e:
+                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -716,31 +648,9 @@ def handle_callbacks(call):
                     if not is_ok:
                         bot.send_message(call.message.chat.id, f"❌ Error: {msg}")
                         return
-                    
-                    # Try to get chat info as gracefully as possible
-                    s_chat = None
-                    t_chat = None
-                    
-                    try:
-                        s_chat = await userbot.get_chat(sid)
-                    except RPCError as e:
-                        if "CHANNEL_PRIVATE" in str(e):
-                            # Last ditch effort: search dialogs
-                            async for dialog in userbot.get_dialogs(limit=100):
-                                if dialog.chat.id == sid:
-                                    s_chat = dialog.chat
-                                    break
-                        if not s_chat: raise e
-
-                    try:
-                        t_chat = await resolve_target_id(userbot, tid)
-                    except RPCError as e:
-                        if "CHANNEL_PRIVATE" in str(e):
-                            async for dialog in userbot.get_dialogs(limit=100):
-                                if dialog.chat.id == tid:
-                                    t_chat = dialog.chat
-                                    break
-                        if not t_chat: raise e
+                        
+                    s_chat = await userbot.get_chat(sid)
+                    t_chat = await resolve_target_id(userbot, tid)
                     
                     s_title = s_chat.title or f"{s_chat.first_name or ''} {s_chat.last_name or ''}".strip() or "Source"
                     t_title = t_chat.title or f"{t_chat.first_name or ''} {t_chat.last_name or ''}".strip() or "Target"
@@ -753,10 +663,7 @@ def handle_callbacks(call):
                     bot.edit_message_text(f"✅ **Pair Added Successfully!**\n\nSource: `{s_title}`\nTarget: `{t_title}`", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
                 except Exception as e:
                     logger.error(f"Pair Finalize Error: {e}")
-                    err_msg = str(e)
-                    if "CHANNEL_PRIVATE" in err_msg or "CHAT_WRITE_FORBIDDEN" in err_msg:
-                        err_msg = "❌ The UserAccount is not a part of the Source or Target channel/group. Please join them first and retry. (Or the channel might have been deleted/removed)."
-                    bot.send_message(call.message.chat.id, f"⚠️ **Error adding pair**\n\n{err_msg}", parse_mode="Markdown")
+                    bot.send_message(call.message.chat.id, f"❌ Error adding pair: {e}")
             
             asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
 
@@ -1187,13 +1094,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
             elif m.text:
@@ -1202,13 +1109,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), 'text', m.text)
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, 'text', m.text)
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), 'text', m.text)
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, 'text', m.text)
                         )
                     if c.rowcount > 0: collected += 1
             
@@ -1232,18 +1139,11 @@ async def resolve_target_id(client: Client, target_ref: str):
             return await client.get_chat(int(target_ref))
         # 2. Try username/ref
         return await client.get_chat(target_ref)
-    except Exception as e:
+    except Exception:
         # 3. Aggressive Search: iterate through many dialogs to find the peer
-        try:
-            async for dialog in client.get_dialogs(limit=200):
-                if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
-                    return dialog.chat
-        except: pass
-        
-        err_msg = str(e)
-        if "CHANNEL_PRIVATE" in err_msg or "CHAT_WRITE_FORBIDDEN" in err_msg:
-            raise ValueError("❌ The UserAccount is not a part of the Source or Target channel/group. Please join them first and retry.")
-        raise e
+        async for dialog in client.get_dialogs(limit=200):
+            if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
+                return dialog.chat
     raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
@@ -1281,11 +1181,6 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 break
             scanned += 1
             await asyncio.sleep(0.05) # Anti-ban delay
-            
-            # Apply filter
-            if filter_type == "media" and not m.media: continue
-            if filter_type == "text" and m.media: continue
-
             if m.media:
                 media_type = m.media.value
                 with db_conn() as conn:
@@ -1293,31 +1188,15 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
                         )
                     if c.rowcount > 0: collected += 1
-            elif m.text:
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    if DATABASE_URL:
-                        c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), 'text', m.text)
-                        )
-                    else:
-                        c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, getattr(m, "message_thread_id", None), 'text', m.text)
-                        )
-                    if c.rowcount > 0: collected += 1
-
             if scanned % 100 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`\n\n🚀 *Downloading metadata...*", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                 except: pass
@@ -1356,7 +1235,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT id, source_message_id, thread_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
+            c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
             items = c.fetchall()
         
         if not items:
@@ -1368,48 +1247,15 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
         status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
         
-        for row_id, smid, sthread in items:
+        for row_id, smid in items:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
-                
-            # Topic Handling Logic
-            target_thread = None
-            if sthread:
-                cache_key = (target_id, sid, sthread)
-                if cache_key in topic_cache:
-                    target_thread = topic_cache[cache_key]
-                else:
-                    try:
-                        # Only attempt if target is forum
-                        if getattr(target_chat, "is_forum", False):
-                            # Get source topic name
-                            src_topics = await userbot.get_forum_topics(sid)
-                            src_topic = next((t for t in src_topics if t.id == sthread), None)
-                            if src_topic:
-                                # Find or create in target
-                                try:
-                                    t_topics = await userbot.get_forum_topics(target_id)
-                                    match = next((t for t in t_topics if t.title == src_topic.title), None)
-                                    if match:
-                                        target_thread = match.id
-                                    else:
-                                        # Create new topic
-                                        new_t = await userbot.create_forum_topic(target_id, src_topic.title)
-                                        target_thread = new_t.id
-                                    topic_cache[cache_key] = target_thread
-                                except Exception as e:
-                                    logger.warning(f"Could not create/find topic: {e}")
-                    except Exception as e:
-                        logger.error(f"Topic error: {e}")
-
             try:
                 success = False
                 sent_msg = None
                 try:
-                    kwargs = {}
-                    if target_thread: kwargs["message_thread_id"] = target_thread
-                    sent_msg = await userbot.copy_message(target_id, sid, smid, **kwargs)
+                    sent_msg = await userbot.copy_message(target_id, sid, smid)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
@@ -1422,29 +1268,21 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             path = await msg.download()
                             if path:
                                 try:
-                                    kwargs = {"caption": msg.caption}
-                                    if target_thread: kwargs["message_thread_id"] = target_thread
-                                    
                                     if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_id, path, **kwargs)
+                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption)
                                     elif msg.video:
-                                        sent_msg = await userbot.send_video(target_id, path, **kwargs)
+                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption)
                                     else:
-                                        sent_msg = await userbot.send_document(target_id, path, **kwargs)
+                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            kwargs = {}
-                            if target_thread: kwargs["message_thread_id"] = target_thread
-                            sent_msg = await userbot.send_message(target_id, msg.text, **kwargs)
+                            sent_msg = await userbot.send_message(target_id, msg.text)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
-                        err_msg = str(e2)
-                        if "CHANNEL_PRIVATE" in err_msg or "CHAT_WRITE_FORBIDDEN" in err_msg:
-                            err_msg = "❌ The UserAccount is not a member of the Source or Target chat. Please join them first and retry."
-                        bot.send_message(admin_chat_id, f"⚠️ **Forward Failed**\nMessage ID: `{smid}`\nError: `{err_msg}`", parse_mode="Markdown")
+                        bot.send_message(admin_chat_id, f"⚠️ **Failed to send item**\nID: `{smid}`\nError: `{e2}`", parse_mode="Markdown")
                 
                 if success:
                     with db_conn() as conn:
