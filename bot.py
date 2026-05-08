@@ -1418,6 +1418,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             bot.send_message(admin_chat_id, "No pending items to release.")
             return
 
+        # Warm up session cache for both chats so Pyrogram knows their access_hash
+        try:
+            await userbot.get_chat(source_id)
+        except Exception:
+            pass
+        try:
+            await userbot.get_chat(target_id)
+        except Exception:
+            pass
+
         sent = 0
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
