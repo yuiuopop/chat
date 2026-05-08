@@ -559,10 +559,15 @@ async def setup_automation_handlers(client: Client):
         for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
-                # Topic filtering if applicable
+                # Skip service/system messages
+                if m.service:
+                    continue
+
+                # Topic filtering if applicable with fallback detection
                 if s_topic:
-                    msg_topic = getattr(m, "message_thread_id", None)
-                    if msg_topic != s_topic:
+                    msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
+                    logger.info(f"TOPIC CHECK | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
+                    if int(msg_topic or 0) != int(s_topic):
                         continue
 
                 # 1) Monitor: Save to DB if monitoring is ON
