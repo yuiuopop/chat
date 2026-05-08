@@ -18,6 +18,7 @@ asyncio.set_event_loop(loop)
 from pyrogram import Client, filters, idle, enums
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.raw.functions.channels import GetForumTopics
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -458,61 +459,43 @@ async def get_chat_selection_markup(prefix, page=0):
 
 async def get_topic_selection_markup(chat_id, prefix):
     """
-    Ultra-deep scan of chat history to find all active topics/threads using multiple detection methods.
+    Fetches all topics from a forum group using raw MTProto API.
     """
     markup = InlineKeyboardMarkup(row_width=1)
     try:
-        found_topics = {}
+        # Resolve peer for raw API call
+        peer = await userbot.resolve_peer(chat_id)
         
-        # Scan even deeper to capture all active threads
-        async for msg in userbot.get_chat_history(chat_id, limit=2000):
-            topic_id = None
-            
-            # Method 1: Standard Topic ID
-            if getattr(msg, "message_thread_id", None):
-                topic_id = msg.message_thread_id
-            # Method 2: Fallback for older topics/version variations
-            elif getattr(msg, "reply_to_top_message_id", None):
-                topic_id = msg.reply_to_top_message_id
-                
-            if not topic_id:
-                continue
-                
-            if topic_id in found_topics:
-                continue
-                
-            topic_title = None
-            try:
-                if getattr(msg, "forum_topic_created", None):
-                    topic_title = msg.forum_topic_created.name
-            except:
-                pass
-                
-            if not topic_title:
-                # Use message preview as fallback title
-                if msg.text:
-                    topic_title = msg.text[:40].strip() + "..." if len(msg.text) > 40 else msg.text
-                elif msg.caption:
-                    topic_title = msg.caption[:40].strip() + "..." if len(msg.caption) > 40 else msg.caption
-                else:
-                    topic_title = f"Topic {topic_id}"
-                    
-            found_topics[topic_id] = topic_title
-            
-        for topic_id, topic_title in found_topics.items():
-            markup.add(
-                InlineKeyboardButton(
-                    f"🧵 {topic_title}",
-                    callback_data=f"{prefix}_{chat_id}_{topic_id}"
-                )
+        # Invoke raw MTProto method to get topics
+        result = await userbot.invoke(
+            GetForumTopics(
+                channel=peer,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=100
             )
-            
-        if not found_topics:
+        )
+        
+        topics = getattr(result, "topics", [])
+        
+        if not topics:
             markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
-            
+        else:
+            for topic in topics:
+                topic_id = getattr(topic, "id", None)
+                topic_title = getattr(topic, "title", f"Topic {topic_id}")
+                if topic_id:
+                    markup.add(
+                        InlineKeyboardButton(
+                            f"🧵 {topic_title}",
+                            callback_data=f"{prefix}_{chat_id}_{topic_id}"
+                        )
+                    )
+                    
     except Exception as e:
-        logger.error(f"Topic fetch error: {e}")
-        markup.add(InlineKeyboardButton("❌ Topic Scan Failed", callback_data="noop"))
+        logger.error(f"RAW Topic Fetch Error: {e}")
+        markup.add(InlineKeyboardButton("❌ Failed To Load Topics", callback_data="noop"))
         
     markup.add(InlineKeyboardButton("🔙 Back to Chats", callback_data="pair_add_start"))
     return markup
