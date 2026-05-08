@@ -40,11 +40,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("userbot_v2")
 
+# Topic Mirroring Cache
+# {target_chat_id: {topic_title.lower(): top_message_id}}
+topic_cache = {}
+
 # -----------------------------
 # DB (SQLite/PostgreSQL)
 # -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = "userbot_v2.db"
+USING_POSTGRES = False
 
 @contextmanager
 def db_conn():
@@ -153,6 +158,7 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    is_mirror INTEGER DEFAULT 0,
                     UNIQUE(source_id, source_topic_id, target_id, target_topic_id)
                 )
             """)
@@ -164,6 +170,8 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -231,14 +239,14 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, source_topic_id, target_topic_id FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -299,7 +307,7 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -319,10 +327,11 @@ def show_pair_view(chat_id, message_id, pid):
             bot.send_message(chat_id, f"❌ Pair not found (ID: {pid}). It may have been deleted.")
             return
             
-        pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = row
+        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
         stats = get_pair_stats(pid)
         mon_status = "🟢 Running" if is_mon else "🔴 Stopped"
         live_status = "🟢 Running" if is_live else "🔴 Stopped"
+        mir_status = "🟢 Enabled" if is_mir else "🔴 Disabled"
         
         src_text = f"`{s_title}`" + (f" • Topic: `{s_topic}`" if s_topic else "")
         tgt_text = f"`{t_title}`" + (f" • Topic: `{t_topic}`" if t_topic else "")
@@ -335,7 +344,8 @@ def show_pair_view(chat_id, message_id, pid):
             f"📥 Pending: `{stats['pending']}`\n\n"
             f"🤖 **Automation Status:**\n"
             f"Monitor: `{mon_status}`\n"
-            f"Live: `{live_status}`"
+            f"Live: `{live_status}`\n"
+            f"Mirror: `{mir_status}`"
         )
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
@@ -352,16 +362,18 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
     live_btn = "🛑 Stop Live" if is_live else "⚡ Live Forward"
+    mir_btn = "🛑 Stop Mirror" if is_mir else "🔀 Mirror Mode"
     
     markup.add(
         InlineKeyboardButton(mon_btn, callback_data=f"pair_toggle_mon_{pair_id}"),
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
+    markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
@@ -498,6 +510,62 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
+async def get_or_create_target_topic(client, target_chat_id, topic_title):
+    """
+    Search for a topic by title in target chat. If not found, create it.
+    Uses topic_cache to avoid API spam.
+    """
+    if not topic_title: return None
+    
+    t_chat_id = int(target_chat_id)
+    title_key = topic_title.lower().strip()
+    
+    # 1) Check Cache
+    if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
+        return topic_cache[t_chat_id][title_key]
+    
+    # 2) Fetch Topics from Telegram
+    try:
+        result = await client(functions.channels.GetForumTopicsRequest(
+            channel=t_chat_id,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
+        
+        if t_chat_id not in topic_cache:
+            topic_cache[t_chat_id] = {}
+            
+        for topic in result.topics:
+            topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
+            
+        if title_key in topic_cache[t_chat_id]:
+            return topic_cache[t_chat_id][title_key]
+            
+        # 3) Create if not found
+        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
+        created = await client(functions.channels.CreateForumTopicRequest(
+            channel=t_chat_id,
+            title=topic_title
+        ))
+        
+        # Telethon CreateForumTopic returns updates. Usually the topic is in updates[1]
+        # But let's be safer and re-fetch briefly or search in result
+        await asyncio.sleep(1)
+        res_after = await client(functions.channels.GetForumTopicsRequest(
+            channel=t_chat_id,
+            offset_date=0, offset_id=0, offset_topic=0, limit=20
+        ))
+        for t in res_after.topics:
+            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
+            
+        return topic_cache[t_chat_id].get(title_key)
+        
+    except Exception as e:
+        logger.error(f"Mirroring Error (get_or_create): {e}")
+        return None
+
 async def start_userbot():
     global userbot
     api_id = get_setting("api_id")
@@ -551,7 +619,7 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         # Fetch active pairs
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             if m.chat_id == sid:
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic and str(s_topic) != "0":
@@ -572,16 +640,42 @@ def setup_automation_handlers(client: TelegramClient):
                         else:
                             db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.message or ""))
                 
-                # 2) Live Forward
+                # 2) Live Forward / Mirror
                 if is_live:
+                    target_topic_anchor = t_topic
+                    
+                    # Mirroring Logic
+                    if is_mir and m.reply_to:
+                        try:
+                            source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
+                            
+                            # Get Source Topic Title
+                            src_topics = await client(functions.channels.GetForumTopicsRequest(
+                                channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                            ))
+                            
+                            src_title = None
+                            for st in src_topics.topics:
+                                if st.top_message == source_topic_id:
+                                    src_title = st.title
+                                    break
+                            
+                            if src_title:
+                                # Get/Create Target Topic
+                                mirrored_id = await get_or_create_target_topic(client, tid, src_title)
+                                if mirrored_id:
+                                    target_topic_anchor = mirrored_id
+                        except Exception as me:
+                            logger.error(f"Mirroring Logic Error: {me}")
+
                     try:
-                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{t_topic}")
+                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
                         # Telethon send_message with file=m effectively copies it
                         await client.send_message(
                             tid,
                             m.message,
                             file=m.media,
-                            reply_to=t_topic
+                            reply_to=target_topic_anchor
                         )
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
@@ -733,6 +827,10 @@ def handle_callbacks(call):
         sid = int(sid_str)
         stid = int(stid_str)
         
+        # 0 = entire topic group/forum
+        if stid == 0:
+            stid = None
+            
         login_data[uid] = {"source_id": sid, "source_topic_id": stid}
         async def show_tgt():
             markup = await get_chat_selection_markup("sel_tgt", 0)
@@ -775,6 +873,10 @@ def handle_callbacks(call):
         tid = int(tid_str)
         ttid = int(ttid_str)
         
+        # 0 = entire topic group/forum
+        if ttid == 0:
+            ttid = None
+            
         login_data[uid]["target_id"] = tid
         login_data[uid]["target_topic_id"] = ttid
         asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
@@ -829,6 +931,21 @@ def handle_callbacks(call):
             asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid, limit=None), loop)
         
         bot.answer_callback_query(call.id, f"Monitor {'Started' if new_val else 'Stopped'}")
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
+
+    elif data.startswith("pair_toggle_mir_"):
+        pid = int(data.split("_")[-1])
+        row = get_target_pair(pid)
+        if not row:
+            bot.answer_callback_query(call.id, "Pair not found")
+            return
+        # row[7] is is_mirror
+        new_val = 0 if row[7] else 1
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET is_mirror = {p} WHERE id = {p}", (new_val, pid))
+        bot.answer_callback_query(call.id, f"Mirror Mode {'Enabled' if new_val else 'Disabled'}")
         show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_toggle_live_"):
@@ -1181,7 +1298,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     pair = get_target_pair(pair_id)
     if not pair: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = pair
     
     collected = 0
     scanned = 0
@@ -1258,7 +1375,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     
     row = get_target_pair(pair_id)
     if not row: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = row
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
     collected = 0
     scanned = 0
     markup = InlineKeyboardMarkup()
