@@ -13,17 +13,14 @@ import sys
 from flask import Flask
 from dotenv import load_dotenv
 
-# Pyrogram sync import needs a current event loop on Python 3.10+
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-from pyrogram import Client, filters, idle, enums
-from pyrogram.types import Message
-from pyrogram.errors import RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
-from pyrogram.raw.functions.channels import GetForumTopics
-from pyrogram.raw.functions.messages import GetHistory, GetReplies
+from telethon import TelegramClient, events, functions, types, errors
+from telethon.sessions import StringSession
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+
+# Create a global event loop for Telethon/Asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 load_dotenv()
 
@@ -260,13 +257,13 @@ def is_task_running(task_key):
 # UI Helpers
 # -----------------------------
 def get_dashboard_text():
-    is_online = userbot and userbot.is_connected
+    is_online = userbot and userbot.is_connected()
     status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
     
     text = f"✨ **SYSTEM CONSOLE**\n"
     text += f"Status: `{status}`\n"
-    if is_online and userbot.me:
-        name = userbot.me.first_name or "User"
+    if is_online and hasattr(userbot, '_me') and userbot._me:
+        name = userbot._me.first_name or "User"
         text += f"Account: `{name}`\n"
     
     text += "\n_Manage your automation pairs below:_"
@@ -274,7 +271,7 @@ def get_dashboard_text():
 
 def get_dashboard_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    is_online = userbot and userbot.is_connected
+    is_online = userbot and userbot.is_connected()
     
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
@@ -384,67 +381,48 @@ def user_account_markup():
 
 async def get_chat_selection_markup(prefix, page=0):
     markup = InlineKeyboardMarkup(row_width=1)
-    if not userbot or not userbot.is_connected:
+    if not userbot or not userbot.is_connected():
         return None
     
     chats = []
-    async for dialog in userbot.get_dialogs():
-        if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL, enums.ChatType.PRIVATE]:
-            chats.append(dialog.chat)
+    # Fetch enough dialogs to populate selection
+    async for dialog in userbot.iter_dialogs(limit=100):
+        entity = dialog.entity
+        # Filter for relevant chat types
+        if isinstance(entity, (types.Chat, types.Channel, types.User)):
+            chats.append(dialog)
     
-    # Pagination (10 per page)
+    # Pagination
     start = page * 10
     end = start + 10
-    page_chats = chats[start:end]
+    page_items = chats[start:end]
     
-    for chat in page_chats:
-        # Advanced topic/forum detection
-        is_forum = False
-        try:
-            full_chat = await userbot.get_chat(chat.id)
-            # Multiple fallback checks
-            is_forum = any([
-                getattr(full_chat, "is_forum", False),
-                getattr(full_chat, "forum", False),
-                # Raw telegram attributes string check
-                "topic" in str(full_chat).lower(),
-                # String fallback
-                "is_forum=True" in str(full_chat),
-                # Forum groups usually have linked chat + supergroup
-                (
-                    chat.type == enums.ChatType.SUPERGROUP and
-                    "forum" in str(full_chat).lower()
-                )
-            ])
-        except Exception as e:
-            # inaccessible/dead chat
-            if "CHANNEL_PRIVATE" in str(e):
-                continue
-            logger.warning(f"Forum detect failed for {chat.id}: {e}")
-
+    for dialog in page_items:
+        chat = dialog.entity
+        is_forum = getattr(chat, "forum", False)
+        
         # Better visual distinction
-        if chat.type == enums.ChatType.CHANNEL:
-            icon = "📢"
-            title = chat.title or "Channel"
-        elif chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        if isinstance(chat, types.Channel):
             if is_forum:
                 icon = "🏛️"
                 title = f"『 TOPIC 』 {chat.title}"
+            elif chat.broadcast:
+                icon = "📢"
+                title = chat.title or "Channel"
             else:
                 icon = "👥"
                 title = chat.title or "Group"
-        elif chat.type == enums.ChatType.PRIVATE:
-            is_bot = getattr(chat, "is_bot", False)
-            if is_bot:
-                icon = "🤖"
-            else:
-                icon = "👤"
-            title = chat.first_name or "Private Chat"
+        elif isinstance(chat, types.Chat):
+            icon = "👥"
+            title = chat.title or "Group"
+        elif isinstance(chat, types.User):
+            if chat.bot: icon = "🤖"
+            else: icon = "👤"
+            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "Private Chat"
         else:
             icon = "💬"
             title = "Unknown"
 
-        # SINGLE BUTTON ONLY
         markup.add(
             InlineKeyboardButton(
                 f"{icon} {title}",
@@ -461,24 +439,18 @@ async def get_chat_selection_markup(prefix, page=0):
     return markup
 
 async def get_topic_selection_markup(chat_id, prefix):
-    """
-    Fetches all topics from a forum group using raw MTProto API.
-    """
     markup = InlineKeyboardMarkup(row_width=1)
+    if not userbot or not userbot.is_connected():
+        return None
+    
     try:
-        # Resolve peer for raw API call
-        peer = await userbot.resolve_peer(chat_id)
-        
-        # Invoke raw MTProto method to get topics
-        result = await userbot.invoke(
-            GetForumTopics(
-                channel=peer,
-                offset_date=0,
-                offset_id=0,
-                offset_topic=0,
-                limit=100
-            )
-        )
+        result = await userbot(functions.channels.GetForumTopicsRequest(
+            channel=chat_id,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
         
         topics = getattr(result, "topics", [])
         
@@ -486,7 +458,7 @@ async def get_topic_selection_markup(chat_id, prefix):
             markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
         else:
             for topic in topics:
-                # Use top_message ID because that is what messages actually use in reply_to_top_message_id
+                # Telethon Forum topics: top_message is the anchor/starter message ID
                 topic_anchor_id = getattr(topic, "top_message", None)
                 topic_title = getattr(topic, "title", f"Topic {topic_anchor_id}")
                 if topic_anchor_id:
@@ -498,7 +470,7 @@ async def get_topic_selection_markup(chat_id, prefix):
                     )
                     
     except Exception as e:
-        logger.error(f"RAW Topic Fetch Error: {e}")
+        logger.error(f"Telethon Topic Fetch Error: {e}")
         markup.add(InlineKeyboardButton("❌ Failed To Load Topics", callback_data="noop"))
         
     markup.add(InlineKeyboardButton("🔙 Back to Chats", callback_data="pair_add_start"))
@@ -518,23 +490,22 @@ async def start_userbot():
     
     try:
         if userbot:
-            try: await userbot.stop()
+            try: await userbot.disconnect()
             except: pass
             
-        userbot = Client(
-            name="userbot_session",
-            api_id=int(api_id),
-            api_hash=api_hash,
-            session_string=session_string,
-            in_memory=True,
+        userbot = TelegramClient(
+            StringSession(session_string),
+            int(api_id),
+            api_hash,
             device_model="PC 64bit",
             system_version="Windows 11",
-            app_version="4.11.2",
-            sleep_threshold=60 # Handle long floodwaits gracefully
+            app_version="4.11.2"
         )
-        await userbot.start()
+        await userbot.connect()
+        # Cache user identity for synchronous access in UI
+        userbot._me = await userbot.get_me()
         # Register automation handlers
-        await setup_automation_handlers(userbot)
+        setup_automation_handlers(userbot)
         return True, "Userbot started"
     except Exception as e:
         return False, str(e)
@@ -546,100 +517,54 @@ async def ensure_userbot():
         ok, msg = await start_userbot()
         if not ok: return False, msg
     
-    if not userbot.is_connected:
+    if not userbot.is_connected():
         try: 
-            await userbot.start()
-            await setup_automation_handlers(userbot)
+            await userbot.connect()
+            setup_automation_handlers(userbot)
         except Exception as e: 
             return False, f"Connection failed: {e}"
     
     return True, "Connected"
 
-async def setup_automation_handlers(client: Client):
-    @client.on_message()
-    async def auto_handler(c, m):
+def setup_automation_handlers(client: TelegramClient):
+    @client.on(events.NewMessage)
+    async def auto_handler(event):
+        m = event.message
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
-            # We match numeric IDs
-            if str(m.chat.id) == str(sid):
-                # Skip service/system messages
-                if m.service:
-                    continue
-
-                # Topic filtering if applicable using multi-layered detection
+            if m.chat_id == sid:
+                # Topic filtering
                 if s_topic:
                     msg_topic_anchor = None
-                    try:
-                        # Method 1 & 2: High-level Pyrogram fields
-                        msg_topic_anchor = getattr(m, "reply_to_top_message_id", None) or getattr(m, "message_thread_id", None)
-                        
-                        # Method 3: Raw MTProto fallback
-                        if not msg_topic_anchor:
-                            raw = getattr(m, "_raw", None)
-                            if raw and getattr(raw, "reply_to", None):
-                                reply = raw.reply_to
-                                msg_topic_anchor = getattr(reply, "reply_to_top_id", None) or getattr(reply, "top_msg_id", None)
-                    except Exception as e:
-                        logger.error(f"LIVE TOPIC PARSE ERROR: {e}")
-                    
-                    # Deep Diagnostic Log
-                    logger.warning(
-                        f"MSG:{m.id} | THREAD:{getattr(m, 'message_thread_id', None)} "
-                        f"| TOP:{getattr(m, 'reply_to_top_message_id', None)} "
-                        f"| RAW:{getattr(getattr(m, '_raw', None), 'reply_to', None)} "
-                        f"| MATCHING:{msg_topic_anchor} vs {s_topic}"
-                    )
+                    if m.reply_to:
+                        msg_topic_anchor = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
                     
                     if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
-                        
 
-                # 1) Monitor: Save to DB if monitoring is ON
-                if is_mon:
-                    if m.media:
-                        m_type = m.media.value
-                        with db_conn() as conn:
-                            db_c = conn.cursor()
-                            p = get_placeholder()
-                            if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.caption or ""))
-                            else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or ""))
+                # 1) Monitor
+                if is_mon and m.media:
+                    m_type = type(m.media).__name__
+                    with db_conn() as conn:
+                        db_c = conn.cursor()
+                        if DATABASE_URL:
+                            db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.message or ""))
+                        else:
+                            db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.message or ""))
                 
-                # 2) Live Forward: Copy message to target if live is ON
+                # 2) Live Forward
                 if is_live:
                     try:
-                        # Resolve target
-                        try:
-                            target_chat = await c.get_chat(tid)
-                            target_id = target_chat.id
-                        except Exception as te:
-                            logger.error(f"Live Forward Peer Error for Pair {pid}: {te}")
-                            continue
-
-                        if m.service: continue # Skip service messages
-                        await c.copy_message(
-                            chat_id=target_id,
-                            from_chat_id=m.chat.id,
-                            message_id=m.id,
-                            message_thread_id=t_topic
+                        # Telethon send_message with file=m effectively copies it
+                        await client.send_message(
+                            tid,
+                            m.message,
+                            file=m.media,
+                            reply_to=t_topic
                         )
                     except Exception as e:
-                        if "CHANNEL_PRIVATE" in str(e):
-                            logger.error(f"Live Forward Error: Channel {tid} is private/inaccessible.")
-                            continue
-                        # Try stealth mode if copy fails
-                        if "SERVICE_MESSAGE_INVALID" in str(e): continue
-                        # Try forward fallback if copy fails (Pyrogram forward_messages doesn't support message_thread_id in this version)
-                        try:
-                            await c.forward_messages(
-                                chat_id=target_id,
-                                from_chat_id=m.chat.id,
-                                message_ids=m.id
-                            )
-                        except Exception as e2:
-                            logger.error(f"Live Forward Fallback Error for Pair {pid}: {e2}")
+                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -660,7 +585,7 @@ def cmd_list(message):
     if message.from_user.id != ADMIN_ID:
         return
     
-    if not userbot or not userbot.is_connected:
+    if not userbot or not userbot.is_connected():
         bot.send_message(message.chat.id, "❌ Userbot is not connected. Use /start to connect first.")
         return
 
@@ -669,11 +594,12 @@ def cmd_list(message):
     async def fetch_and_list():
         try:
             text = "📋 **Your Groups & Channels**\n\n"
-            async for dialog in userbot.get_dialogs(limit=50):
-                if dialog.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                    chat_type = "📢 Channel" if dialog.chat.type == enums.ChatType.CHANNEL else "👥 Group"
-                    title = dialog.chat.title or "Untitled"
-                    text += f"{chat_type}: `{title}`\nID: `{dialog.chat.id}`\n\n"
+            async for dialog in userbot.iter_dialogs(limit=50):
+                entity = dialog.entity
+                if isinstance(entity, (types.Chat, types.Channel)):
+                    chat_type = "📢 Channel" if isinstance(entity, types.Channel) and entity.broadcast else "👥 Group"
+                    title = entity.title or "Untitled"
+                    text += f"{chat_type}: `{title}`\nID: `{entity.id}`\n\n"
             
             if len(text) > 4000:
                 parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -717,11 +643,11 @@ async def finalize_pair_task(call, uid):
 
         bot.edit_message_text("⏳ Resolving pair details...", call.message.chat.id, call.message.message_id)
         
-        s_chat = await userbot.get_chat(sid)
-        t_chat = await userbot.get_chat(tid)
+        s_chat = await userbot.get_entity(sid)
+        t_chat = await userbot.get_entity(tid)
         
-        s_title = s_chat.title or s_chat.first_name or str(sid)
-        t_title = t_chat.title or t_chat.first_name or str(tid)
+        s_title = getattr(s_chat, 'title', None) or getattr(s_chat, 'first_name', None) or str(sid)
+        t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
         
         add_target_pair(sid, stid, tid, ttid, s_title, t_title)
         
@@ -807,21 +733,12 @@ def handle_callbacks(call):
             sid = int(parts[2])
             async def handle_src():
                 try:
-                    full_chat = await userbot.get_chat(sid)
-                    # Advanced forum detection synchronized with list view
-                    is_forum = any([
-                        getattr(full_chat, "is_forum", False),
-                        getattr(full_chat, "forum", False),
-                        "forum" in str(full_chat).lower(),
-                        "is_forum=True" in str(full_chat),
-                        (
-                            full_chat.type == enums.ChatType.SUPERGROUP and
-                            "topic" in str(full_chat).lower()
-                        )
-                    ])
+                    full_chat = await userbot.get_entity(sid)
+                    is_forum = getattr(full_chat, "forum", False)
+                    
                     if is_forum:
                         markup = await get_topic_selection_markup(sid, "sel_src_topic")
-                        bot.edit_message_text(f"🧵 **『 {full_chat.title} 』**\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        bot.edit_message_text(f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                     else:
                         login_data[uid] = {"source_id": sid, "source_topic_id": None}
                         markup = await get_chat_selection_markup("sel_tgt", 0)
@@ -856,21 +773,12 @@ def handle_callbacks(call):
             tid = int(parts[2])
             async def handle_tgt():
                 try:
-                    full_chat = await userbot.get_chat(tid)
-                    # Advanced forum detection synchronized with list view
-                    is_forum = any([
-                        getattr(full_chat, "is_forum", False),
-                        getattr(full_chat, "forum", False),
-                        "forum" in str(full_chat).lower(),
-                        "is_forum=True" in str(full_chat),
-                        (
-                            full_chat.type == enums.ChatType.SUPERGROUP and
-                            "topic" in str(full_chat).lower()
-                        )
-                    ])
+                    full_chat = await userbot.get_entity(tid)
+                    is_forum = getattr(full_chat, "forum", False)
+                    
                     if is_forum:
                         markup = await get_topic_selection_markup(tid, "sel_tgt_topic")
-                        bot.edit_message_text(f"🧵 **『 {full_chat.title} 』**\nSelect a target topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        bot.edit_message_text(f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a target topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                     else:
                         login_data[uid]["target_id"] = tid
                         login_data[uid]["target_topic_id"] = None
@@ -999,7 +907,7 @@ def handle_callbacks(call):
     elif data == "user_logout_do":
         if userbot:
             async def stop_ub():
-                try: await userbot.stop()
+                try: await userbot.disconnect()
                 except: pass
             asyncio.run_coroutine_threadsafe(stop_ub(), loop)
         
@@ -1044,16 +952,16 @@ def handle_callbacks(call):
             
             # Fetch dialogs
             all_dialogs = []
-            async for dialog in userbot.get_dialogs():
-                c = dialog.chat
-                if category == "groups" and c.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-                    all_dialogs.append(c)
-                elif category == "channels" and c.type == enums.ChatType.CHANNEL:
-                    all_dialogs.append(c)
-                elif category == "bots" and c.type == enums.ChatType.BOT:
-                    all_dialogs.append(c)
-                elif category == "private" and c.type == enums.ChatType.PRIVATE:
-                    all_dialogs.append(c)
+            async for dialog in userbot.iter_dialogs():
+                entity = dialog.entity
+                if category == "groups" and isinstance(entity, (types.Chat, types.Channel)) and not getattr(entity, 'broadcast', False):
+                    all_dialogs.append(entity)
+                elif category == "channels" and isinstance(entity, types.Channel) and entity.broadcast:
+                    all_dialogs.append(entity)
+                elif category == "bots" and isinstance(entity, types.User) and entity.bot:
+                    all_dialogs.append(entity)
+                elif category == "private" and isinstance(entity, types.User) and not entity.bot:
+                    all_dialogs.append(entity)
             
             # Pagination
             page_size = 8
@@ -1063,7 +971,7 @@ def handle_callbacks(call):
             
             markup = InlineKeyboardMarkup(row_width=1)
             for chat in page_items:
-                title = chat.title or chat.first_name or str(chat.id)
+                title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or str(chat.id)
                 markup.add(InlineKeyboardButton(f"👁 {title}", callback_data=f"user_acc_view_{chat.id}"))
             
             # Nav buttons
@@ -1089,18 +997,19 @@ def handle_callbacks(call):
         async def run_view():
             if not userbot: return
             try:
-                chat = await userbot.get_chat(chat_id)
-                msg_count = await userbot.get_chat_history_count(chat_id)
-                title = chat.title or chat.first_name or "Unknown"
+                chat = await userbot.get_entity(chat_id)
+                # For message count, we can use a trick with limit=0
+                history = await userbot.get_messages(chat, limit=0)
+                msg_count = history.total
+                title = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Unknown')
                 
                 info = f"📋 **Chat Details:**\n\n"
                 info += f"🏷 **Title:** `{title}`\n"
                 info += f"🆔 **ID:** `{chat.id}`\n"
-                info += f"📂 **Type:** `{chat.type.value if hasattr(chat.type, 'value') else chat.type}`\n"
+                info += f"📂 **Type:** `{type(chat).__name__}`\n"
                 info += f"💬 **Messages:** `{msg_count}`\n"
-                if hasattr(chat, 'members_count') and chat.members_count:
-                    info += f"👥 **Members:** `{chat.members_count}`\n"
-                if chat.username:
+                
+                if hasattr(chat, 'username') and chat.username:
                     info += f"🔗 **Username:** @{chat.username}\n"
                 
                 markup = InlineKeyboardMarkup(row_width=1)
@@ -1113,8 +1022,8 @@ def handle_callbacks(call):
 
         asyncio.run_coroutine_threadsafe(run_view(), loop)
 
-async def complete_login(uid, client, chat_id):
-    session_string = await client.export_session_string()
+async def complete_login(uid, client: TelegramClient, chat_id):
+    session_string = client.session.save()
     set_setting("api_id", login_data[uid]["api_id"])
     set_setting("api_hash", login_data[uid]["api_hash"])
     set_setting("session_string", session_string)
@@ -1122,14 +1031,14 @@ async def complete_login(uid, client, chat_id):
     admin_states.pop(uid, None)
     login_data.pop(uid, None)
     
-    bot.send_message(chat_id, "✅ **Userbot Connected Successfully!**", parse_mode="Markdown")
+    bot.send_message(chat_id, "✅ **Userbot Connected (Telethon)!**", parse_mode="Markdown")
     
     # Restart the global userbot with new session
     ok, msg = await start_userbot()
     if ok:
         bot.send_message(chat_id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
     else:
-        bot.send_message(chat_id, f"❌ Failed to start userbot after login: {msg}")
+        bot.send_message(chat_id, f"❌ Failed to start userbot: {msg}")
 
 @bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(m.from_user.id))
 def handle_state_inputs(message):
@@ -1156,14 +1065,14 @@ def handle_state_inputs(message):
 
     elif state == "awaiting_phone":
         login_data[uid]["phone"] = text
-        bot.send_message(message.chat.id, "⏳ Sending OTP...")
+        bot.send_message(message.chat.id, "⏳ Sending OTP (Telethon)...")
         async def send_otp_task():
             try:
-                temp_client = Client(name="temp_login", api_id=login_data[uid]["api_id"], api_hash=login_data[uid]["api_hash"], in_memory=True)
+                temp_client = TelegramClient(StringSession(), login_data[uid]["api_id"], login_data[uid]["api_hash"])
                 await temp_client.connect()
-                code_info = await temp_client.send_code(login_data[uid]["phone"])
+                send_code = await temp_client.send_code_request(login_data[uid]["phone"])
                 login_data[uid]["client"] = temp_client
-                login_data[uid]["phone_code_hash"] = code_info.phone_code_hash
+                login_data[uid]["phone_code_hash"] = send_code.phone_code_hash
                 admin_states[uid] = "awaiting_otp"
                 bot.send_message(message.chat.id, "Step 4: Please send the **OTP** you received.", parse_mode="Markdown")
             except Exception as e:
@@ -1177,10 +1086,10 @@ def handle_state_inputs(message):
         async def verify_otp_task():
             client = login_data[uid].get("client")
             try:
-                await client.sign_in(phone_number=login_data[uid]["phone"], phone_code_hash=login_data[uid]["phone_code_hash"], phone_code=otp)
-                bot.send_message(message.chat.id, "✅ OTP Verified! Finalizing setup...")
+                await client.sign_in(phone=login_data[uid]["phone"], code=otp, phone_code_hash=login_data[uid]["phone_code_hash"])
+                bot.send_message(message.chat.id, "✅ OTP Verified!")
                 await complete_login(uid, client, message.chat.id)
-            except SessionPasswordNeeded:
+            except errors.SessionPasswordNeededError:
                 admin_states[uid] = "awaiting_password"
                 bot.send_message(message.chat.id, "🔐 Step 5: Please send your **Cloud Password**.", parse_mode="Markdown")
             except Exception as e:
@@ -1192,7 +1101,7 @@ def handle_state_inputs(message):
         async def verify_password_task():
             client = login_data[uid].get("client")
             try:
-                await client.check_password(text)
+                await client.sign_in(password=text)
                 await complete_login(uid, client, message.chat.id)
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Password error: {e}")
@@ -1265,40 +1174,40 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved):
+        # Telethon uses iter_messages for history
+        async for m in userbot.iter_messages(sid_resolved):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
                 break
             
             scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban: micro-delay to look less automated
             # Date filter
             if end_date and m.date > end_date: continue
             if start_date and m.date < start_date: break # History is newest to oldest
             
             if m.media:
-                media_type = m.media.value
+                m_type = type(m.media).__name__
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
                         )
                     else:
                         c.execute(
                             "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            (pair_id, sid_resolved, m.id, m_type, m.message or "")
                         )
                     if c.rowcount > 0: collected += 1
             
             if limit and collected >= limit: break
             
-            if scanned % 100 == 0:
+            if scanned % 50 == 0:
                 l_text = f" / {limit}" if limit else ""
-                try: bot.edit_message_text(f"📜 **History Scrape: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`\n\n🚀 *Processing...*", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                try: bot.edit_message_text(f"📜 **History Scrape: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 Collected: `{collected}{l_text}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                 except: pass
+            await asyncio.sleep(0.1)
         
         bot.send_message(admin_chat_id, f"✅ History Scrape Done: `{s_title}`\nCollected: `{collected}`")
     except Exception as e:
@@ -1306,19 +1215,16 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     finally:
         running_tasks.pop(task_key, None)
 
-async def resolve_target_id(client: Client, target_ref: str):
+async def resolve_target_id(client: TelegramClient, target_ref):
     try:
-        # 1. Try direct ID (int)
-        if str(target_ref).lstrip("-").isdigit():
-            return await client.get_chat(int(target_ref))
-        # 2. Try username/ref
-        return await client.get_chat(target_ref)
-    except Exception:
-        # 3. Aggressive Search: iterate through many dialogs to find the peer
-        async for dialog in client.get_dialogs(limit=200):
-            if str(dialog.chat.id) == str(target_ref) or (dialog.chat.username and dialog.chat.username.lower() == str(target_ref).replace("@", "").lower()):
-                return dialog.chat
-    raise ValueError(f"Could not find or access chat: {target_ref}. Make sure the userbot is a member of this chat.")
+        return await client.get_entity(target_ref)
+    except Exception as e:
+        logger.error(f"Entity Resolve Error: {e}")
+        # Try finding via dialogs if ref is just an ID
+        async for dialog in client.iter_dialogs(limit=200):
+            if str(dialog.id) == str(target_ref):
+                return dialog.entity
+    raise ValueError(f"Could not find or access chat: {target_ref}")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
     is_ok, msg = await ensure_userbot()
@@ -1332,104 +1238,36 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     row = get_target_pair(pair_id)
     if not row: return
     pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = row
-    title = s_title
     collected = 0
     scanned = 0
-    limit_text = f"`{limit}`" if limit else "all"
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
-    status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
+    status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
-        # Force peer resolution (Anti PeerIdInvalid)
-        target_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = target_chat.id
-        
-        # NUCLEAR OPTION: Use Raw MTProto GetHistory with reply_to_msg_id
-        # This is the only 100% reliable way to fetch a specific forum thread's history
-        peer = await userbot.resolve_peer(sid_resolved)
-        offset_id = 0
-        
-        while True:
+        # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
+        async for m in userbot.iter_messages(sid, limit=limit, reply_to=s_topic if s_topic else None):
             if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
             
-            # Fetch a chunk of messages
-            if s_topic:
-                # Target the specific topic thread via its anchor message
-                result = await userbot.invoke(
-                    GetReplies(
-                        peer=peer,
-                        msg_id=int(s_topic),
-                        offset_id=offset_id,
-                        offset_date=0,
-                        add_offset=0,
-                        limit=100,
-                        max_id=0,
-                        min_id=0,
-                        hash=0
-                    )
-                )
-            else:
-                # Normal group history
-                result = await userbot.invoke(
-                    GetHistory(
-                        peer=peer,
-                        offset_id=offset_id,
-                        offset_date=0,
-                        add_offset=0,
-                        limit=100,
-                        max_id=0,
-                        min_id=0,
-                        hash=0
-                    )
-                )
+            scanned += 1
+            if m.media:
+                m_type = type(m.media).__name__
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    if DATABASE_URL:
+                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid, m.id, m_type, m.message or ""))
+                    else:
+                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid, m.id, m_type, m.message or ""))
+                    if c.rowcount > 0: collected += 1
             
-            messages = getattr(result, "messages", [])
-            if not messages:
-                break
-                
-            for raw_m in messages:
-                if not running_tasks.get(task_key):
-                    break
-                
-                scanned += 1
-                try:
-                    # Fetch proper Pyrogram message object via public API
-                    # This is more stable than internal _parse()
-                    m = await userbot.get_messages(sid_resolved, raw_m.id)
-                    if not m or not m.media:
-                        continue
-                    
-                    media_type = m.media.value
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if DATABASE_URL:
-                            c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pair_id, sid_resolved, m.id, media_type, m.caption or "")
-                            )
-                        else:
-                            c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, sid_resolved, m.id, media_type, m.caption or "")
-                            )
-                        if c.rowcount > 0: collected += 1
-                except Exception as e:
-                    logger.error(f"TOPIC MESSAGE FETCH ERROR: {e}")
-                
-                offset_id = raw_m.id
+            if scanned % 20 == 0:
+                try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                except: pass
+            await asyncio.sleep(0.5)
 
-            if limit and collected >= limit: break
-            if len(messages) < 100: break # End of history
-            
-            # Progress update
-            try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-            except: pass
-            await asyncio.sleep(1) # Anti-flood delay
-
-        bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
+        bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nNew items: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
@@ -1484,31 +1322,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
+                # Telethon: Fetch message if direct sending ID fails
                 try:
-                    if hasattr(smid, 'service') and smid.service: continue # Skip service messages if applicable
-                    await userbot.copy_message(
-                        chat_id=target_id,
-                        from_chat_id=sid,
-                        message_id=smid,
-                        message_thread_id=t_topic
-                    )
-                except Exception as e:
-                    err_str = str(e)
-                    if "CHANNEL_PRIVATE" in err_str or "CHAT_WRITE_FORBIDDEN" in err_str:
-                        bot.send_message(admin_chat_id, f"⚠️ **Access Error:** I can no longer access the source/target chat for Pair `{pair_id}`. Skipping...")
-                        break
-                    if "SERVICE_MESSAGE_INVALID" in err_str: continue
-
-                    # If copy fails (e.g. restricted content), try forward fallback
-                    try:
-                        await userbot.forward_messages(
-                            chat_id=target_id,
-                            from_chat_id=sid,
-                            message_ids=smid,
-                            message_thread_id=t_topic
-                        )
-                    except Exception as e2:
-                        logger.error(f"Release Fallback Error: {e2}")
+                    await userbot.send_message(tid_ref, file=types.InputMessageID(smid), reply_to=t_topic)
+                except:
+                    # Fallback forward
+                    await userbot.forward_messages(tid_ref, smid, sid)
                 
                 with db_conn() as conn:
                     c = conn.cursor()
@@ -1520,7 +1339,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
-                logger.error(f"Release error: {e}")
+                logger.error(f"Release error for item {smid}: {e}")
                 
         bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
     except Exception as e:
@@ -1539,15 +1358,14 @@ async def userbot_watchdog():
     """
     while True:
         global userbot
-        if userbot and userbot.is_connected:
+        if userbot and userbot.is_connected():
             try:
                 await userbot.get_me()
             except Exception as e:
                 err_msg = str(e).lower()
-                # Common errors for banned/nuked accounts
-                if "deactivated" in err_msg or "authorized" in err_msg or "auth_key" in err_msg:
+                if "deactivated" in err_msg or "authorized" in err_msg:
                     logger.warning(f"WATCHDOG: Userbot session invalid: {e}")
-                    try: await userbot.stop()
+                    try: await userbot.disconnect()
                     except: pass
                     userbot = None
                     
@@ -1635,8 +1453,8 @@ def shutdown_handler(*args):
     except:
         pass
     try:
-        if userbot and userbot.is_connected:
-            loop.run_until_complete(userbot.stop())
+        if userbot and userbot.is_connected():
+            loop.run_until_complete(userbot.disconnect())
     except:
         pass
     sys.exit(0)
@@ -1670,7 +1488,7 @@ async def main():
             logger.info("✅ Userbot started")
             # Cache warmer: fetch dialogs to avoid PeerIdInvalid
             logger.info("📡 Warming up peer cache...")
-            async for _ in userbot.get_dialogs(limit=50): pass
+            async for _ in userbot.iter_dialogs(limit=50): pass
             logger.info("✅ Peer cache warmed")
     except Exception as e: logger.error(f"Userbot error: {e}")
 
@@ -1695,7 +1513,11 @@ async def main():
     polling_thread.start()
     logger.info("✨ Admin bot monitor started")
     
-    await idle()
+    if userbot:
+        await userbot.run_until_disconnected()
+    else:
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     loop.run_until_complete(main())
