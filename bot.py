@@ -154,9 +154,12 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_topic_id BIGINT")
+            except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
             except: pass
     logger.info("DB initialized")
+
 
 def get_setting(key, default=None):
     with db_conn() as conn:
@@ -229,6 +232,7 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
+topic_cache = {} # Mappings: { chat_id: { topic_id: "Topic Name" } } and { chat_id: { "Topic Name": topic_id } }
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -270,7 +274,7 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -479,6 +483,101 @@ async def ensure_userbot():
     
     return True, "Connected"
 
+async def get_topic_name(client, chat_id, topic_id):
+    """Fetches the topic name from a source group."""
+    if not topic_id: return None
+    
+    # Check cache first
+    chat_id_str = str(chat_id)
+    if chat_id_str in topic_cache and topic_id in topic_cache[chat_id_str]:
+        return topic_cache[chat_id_str][topic_id]
+        
+    try:
+        from pyrogram.raw.functions.channels import GetForumTopics
+        peer = await client.resolve_peer(chat_id)
+        result = await client.invoke(GetForumTopics(
+            channel=peer,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
+        
+        if chat_id_str not in topic_cache:
+            topic_cache[chat_id_str] = {}
+            
+        target_title = None
+        for topic in result.topics:
+            # Cache all fetched topics
+            topic_cache[chat_id_str][topic.id] = topic.title
+            if topic.id == topic_id:
+                target_title = topic.title
+                
+        return target_title
+    except Exception as e:
+        logger.error(f"Error getting topic name: {e}")
+        return None
+
+async def get_or_create_target_topic(client, target_chat_id, topic_name):
+    """Finds a topic by name in the target group, or creates it."""
+    if not topic_name: return None
+    
+    chat_id_str = str(target_chat_id)
+    
+    # Check cache first (Reverse mapping: Name -> ID)
+    if chat_id_str in topic_cache and topic_name in topic_cache[chat_id_str]:
+        return topic_cache[chat_id_str][topic_name]
+        
+    try:
+        from pyrogram.raw.functions.channels import GetForumTopics, CreateForumTopic
+        peer = await client.resolve_peer(target_chat_id)
+        
+        # Ensure dict exists
+        if chat_id_str not in topic_cache:
+            topic_cache[chat_id_str] = {}
+            
+        # Try to find it first
+        try:
+            result = await client.invoke(GetForumTopics(
+                channel=peer,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=100
+            ))
+            for topic in result.topics:
+                topic_cache[chat_id_str][topic.title] = topic.id
+                if topic.title == topic_name:
+                    return topic.id
+        except Exception as e:
+            # Maybe not a forum?
+            logger.warning(f"Failed to get target topics (maybe not a forum?): {e}")
+            
+        # Create it if not found
+        try:
+            # icon_color and icon_emoji_id can be left empty
+            import random
+            rand_id = random.randint(10000, 99999999)
+            res = await client.invoke(CreateForumTopic(
+                channel=peer,
+                title=topic_name,
+                random_id=rand_id
+            ))
+            # res is usually Updates, we need to extract the topic ID.
+            # In raw API, the topic ID is usually the message ID of the creation action.
+            for update in res.updates:
+                if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                    new_topic_id = update.message.id
+                    topic_cache[chat_id_str][topic_name] = new_topic_id
+                    return new_topic_id
+        except Exception as e:
+            logger.error(f"Failed to create topic '{topic_name}' in target: {e}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error in topic matching: {e}")
+        return None
+
 async def setup_automation_handlers(client: Client):
     @client.on_message()
     async def auto_handler(c, m):
@@ -492,6 +591,13 @@ async def setup_automation_handlers(client: Client):
                 if filter_type == "text" and m.media: continue
                 
                 # 1) Monitor: Save to DB if monitoring is ON
+                source_topic_id = None
+                try:
+                    if getattr(m, "reply_to_message_id", None):
+                        source_topic_id = getattr(m, "reply_to_top_message_id", getattr(m, "reply_to_message_id", None))
+                except Exception:
+                    pass
+
                 if is_mon:
                     if m.media:
                         m_type = m.media.value
@@ -499,22 +605,29 @@ async def setup_automation_handlers(client: Client):
                             db_c = conn.cursor()
                             p = get_placeholder()
                             if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.caption or ""))
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.caption or "", source_topic_id))
                             else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or ""))
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.caption or "", source_topic_id))
                     elif m.text: # Collect text if allowed
                         with db_conn() as conn:
                             db_c = conn.cursor()
                             p = get_placeholder()
                             if DATABASE_URL:
-                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, 'text', m.text))
+                                db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, 'text', m.text, source_topic_id))
                             else:
-                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, 'text', m.text))
+                                db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)", (pid, sid, m.id, 'text', m.text, source_topic_id))
 
                 # 2) Live Forward: Copy message to target if live is ON
                 if is_live:
                     try:
-                        await m.copy(tid)
+                        kwargs = {}
+                        if source_topic_id:
+                            t_name = await get_topic_name(c, sid, source_topic_id)
+                            if t_name:
+                                tgt_id = await get_or_create_target_topic(c, tid, t_name)
+                                if tgt_id:
+                                    kwargs["reply_to_message_id"] = tgt_id
+                        await m.copy(tid, **kwargs)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
@@ -1087,6 +1200,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             if filter_type == "media" and not m.media: continue
             if filter_type == "text" and m.media: continue
 
+            source_topic_id = None
+            try:
+                if getattr(m, "reply_to_message_id", None):
+                    source_topic_id = getattr(m, "reply_to_top_message_id", getattr(m, "reply_to_message_id", None))
+            except Exception:
+                pass
+
             if m.media:
                 media_type = m.media.value
                 with db_conn() as conn:
@@ -1094,13 +1214,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "", source_topic_id)
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "", source_topic_id)
                         )
                     if c.rowcount > 0: collected += 1
             elif m.text:
@@ -1109,13 +1229,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, 'text', m.text)
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, 'text', m.text, source_topic_id)
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, 'text', m.text)
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, 'text', m.text, source_topic_id)
                         )
                     if c.rowcount > 0: collected += 1
             
@@ -1181,6 +1301,17 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 break
             scanned += 1
             await asyncio.sleep(0.05) # Anti-ban delay
+            # Apply filter
+            if filter_type == "media" and not m.media: continue
+            if filter_type == "text" and m.media: continue
+
+            source_topic_id = None
+            try:
+                if getattr(m, "reply_to_message_id", None):
+                    source_topic_id = getattr(m, "reply_to_top_message_id", getattr(m, "reply_to_message_id", None))
+            except Exception:
+                pass
+
             if m.media:
                 media_type = m.media.value
                 with db_conn() as conn:
@@ -1188,13 +1319,28 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     p = get_placeholder()
                     if DATABASE_URL:
                         c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "", source_topic_id)
                         )
                     else:
                         c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, media_type, m.caption or "", source_topic_id)
+                        )
+                    if c.rowcount > 0: collected += 1
+            elif m.text:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    if DATABASE_URL:
+                        c.execute(
+                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (pair_id, sid_resolved, m.id, 'text', m.text, source_topic_id)
+                        )
+                    else:
+                        c.execute(
+                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, source_topic_id) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pair_id, sid_resolved, m.id, 'text', m.text, source_topic_id)
                         )
                     if c.rowcount > 0: collected += 1
             if scanned % 100 == 0:
@@ -1235,7 +1381,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
+            c.execute(f"SELECT id, source_message_id, source_topic_id FROM collected_media WHERE pair_id = {p} AND released = 0", (pair_id,))
             items = c.fetchall()
         
         if not items:
@@ -1247,15 +1393,26 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
         status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
         
-        for row_id, smid in items:
+        for row_id, smid, source_topic_id in items:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
+                target_topic_id = None
+                if source_topic_id:
+                    t_name = await get_topic_name(userbot, sid, source_topic_id)
+                    if t_name:
+                        target_topic_id = await get_or_create_target_topic(userbot, target_id, t_name)
+
                 success = False
                 sent_msg = None
+                
+                kwargs = {}
+                if target_topic_id:
+                    kwargs["reply_to_message_id"] = target_topic_id
+                    
                 try:
-                    sent_msg = await userbot.copy_message(target_id, sid, smid)
+                    sent_msg = await userbot.copy_message(target_id, sid, smid, **kwargs)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
@@ -1269,16 +1426,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             if path:
                                 try:
                                     if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption, **kwargs)
                                     elif msg.video:
-                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption, **kwargs)
                                     else:
-                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption)
+                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption, **kwargs)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            sent_msg = await userbot.send_message(target_id, msg.text)
+                            sent_msg = await userbot.send_message(target_id, msg.text, **kwargs)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
