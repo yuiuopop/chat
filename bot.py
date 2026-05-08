@@ -565,11 +565,24 @@ async def setup_automation_handlers(client: Client):
                 if m.service:
                     continue
 
-                # Topic filtering if applicable with fallback detection
+                # Topic filtering if applicable with advanced detection
                 if s_topic:
-                    msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
-                    logger.info(f"TOPIC CHECK | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
-                    if int(msg_topic or 0) != int(s_topic):
+                    msg_topic = None
+                    if hasattr(m, "message_thread_id"):
+                        msg_topic = m.message_thread_id
+                    elif hasattr(m, "reply_to_top_message_id"):
+                        msg_topic = m.reply_to_top_message_id
+                    elif getattr(m, "reply_to_message", None):
+                        msg_topic = getattr(m.reply_to_message, "message_thread_id", None)
+                    
+                    if not msg_topic:
+                        try:
+                            if hasattr(m, "_raw"):
+                                msg_topic = getattr(m._raw, "reply_to_top_id", None)
+                        except: pass
+                    
+                    logger.info(f"TOPIC DEBUG | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
+                    if str(msg_topic) != str(s_topic):
                         continue
 
                 # 1) Monitor: Save to DB if monitoring is ON
@@ -1230,7 +1243,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     pair = get_target_pair(pair_id)
     if not pair: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = pair
     
     collected = 0
     scanned = 0
@@ -1307,14 +1320,10 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
     
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"SELECT source_id, source_title, source_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
-        row = c.fetchone()
-    
+    row = get_target_pair(pair_id)
     if not row: return
-    sid, title, s_topic = row
+    pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic = row
+    title = s_title
     collected = 0
     scanned = 0
     limit_text = f"`{limit}`" if limit else "all"
@@ -1332,10 +1341,24 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
             
-            # Topic filtering with fallback detection
+            # Topic filtering with deep detection
             if s_topic:
-                msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
-                if int(msg_topic or 0) != int(s_topic):
+                msg_topic = None
+                if hasattr(m, "message_thread_id"):
+                    msg_topic = m.message_thread_id
+                elif hasattr(m, "reply_to_top_message_id"):
+                    msg_topic = m.reply_to_top_message_id
+                elif getattr(m, "reply_to_message", None):
+                    msg_topic = getattr(m.reply_to_message, "message_thread_id", None)
+                
+                if not msg_topic:
+                    try:
+                        if hasattr(m, "_raw"):
+                            msg_topic = getattr(m._raw, "reply_to_top_id", None)
+                    except: pass
+                
+                logger.info(f"COLLECTION TOPIC DEBUG | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
+                if str(msg_topic) != str(s_topic):
                     continue
 
             scanned += 1
