@@ -641,11 +641,19 @@ def setup_automation_handlers(client: TelegramClient):
             if current_chat_id == source_chat_id:
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
-                    msg_topic_anchor = getattr(m, "reply_to_top_id", None)
-                    if not msg_topic_anchor and m.reply_to:
-                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
-                    
-                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
+                    msg_topic_anchor = (
+                        getattr(m, "reply_to_top_id", None)
+                        or getattr(m, "top_msg_id", None)
+                    )
+                    # topic starter message
+                    if not msg_topic_anchor and getattr(m, "forum_topic", False):
+                        msg_topic_anchor = m.id
+
+                    logger.warning(
+                        f"TOPIC FILTER | MSG:{m.id} | FOUND:{msg_topic_anchor} | NEED:{s_topic}"
+                    )
+
+                    if str(msg_topic_anchor) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -660,6 +668,9 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # 2) Live Forward / Mirror
                 if is_live:
+                    logger.warning(
+                        f"LIVE MATCH SUCCESS | PAIR:{pid} | MSG:{m.id}"
+                    )
                     try:
                         target_topic_anchor = t_topic
                         
