@@ -377,18 +377,23 @@ async def get_chat_selection_markup(prefix, page=0):
         # Fetch full chat info for the current page to ensure is_forum etc. are populated
         try:
             full_chat = await userbot.get_chat(chat.id)
-            # Use direct attribute access with fallbacks
-            is_forum = getattr(full_chat, "is_forum", False) or getattr(chat, "is_forum", False)
+            # Hyper-aggressive forum detection
+            is_forum = False
+            try:
+                if full_chat.is_forum: is_forum = True
+            except: pass
+            
+            if not is_forum:
+                for attr in ["is_forum", "forum", "forums_enabled", "is_topic_group"]:
+                    if getattr(full_chat, attr, False):
+                        is_forum = True
+                        break
+            
             title = full_chat.title or full_chat.first_name or "Chat"
         except Exception as e:
             logger.error(f"Chat info fetch error for {chat.id}: {e}")
             full_chat = chat
-            is_forum = getattr(chat, "is_forum", False)
-            title = chat.title or chat.first_name or "Chat"
-        except Exception as e:
-            logger.error(f"Chat info fetch error for {chat.id}: {e}")
-            full_chat = chat
-            is_forum = getattr(chat, "is_forum", False)
+            is_forum = False
             title = chat.title or chat.first_name or "Chat"
 
         if chat_type == enums.ChatType.PRIVATE:
@@ -398,8 +403,21 @@ async def get_chat_selection_markup(prefix, page=0):
         elif chat_type == enums.ChatType.CHANNEL:
             icon = "📢"
         else:
-            icon = "📂" if is_forum else "👥"
-            if is_forum: title = f"TOPIC: {title}"
+            # Forum check final result
+            icon = "🏛️" if is_forum else "👥"
+            if is_forum: title = f"{title} [Forum/Topics]"
+            
+        markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
+
+        if chat_type == enums.ChatType.PRIVATE:
+            is_bot = chat.username and chat.username.lower().endswith("bot")
+            icon = "🤖" if is_bot else "👤"
+            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or chat.username or "User"
+        elif chat_type == enums.ChatType.CHANNEL:
+            icon = "📢"
+        else:
+            icon = "🏛️" if is_forum else "👥"
+            if is_forum: title = f"{title} [Topics]"
             
         markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
     
