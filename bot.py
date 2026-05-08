@@ -108,6 +108,7 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    is_mirror INTEGER DEFAULT 0,
                     UNIQUE(source_id, source_topic_id, target_id, target_topic_id)
                 )
             """)
@@ -119,6 +120,8 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
             except: pass
             # Update UNIQUE constraint for Postgres
             try:
