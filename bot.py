@@ -565,24 +565,20 @@ async def setup_automation_handlers(client: Client):
                 if m.service:
                     continue
 
-                # Topic filtering if applicable with advanced detection
+                # Topic filtering if applicable using raw MTProto fields
                 if s_topic:
-                    msg_topic = None
-                    if hasattr(m, "message_thread_id"):
-                        msg_topic = m.message_thread_id
-                    elif hasattr(m, "reply_to_top_message_id"):
-                        msg_topic = m.reply_to_top_message_id
-                    elif getattr(m, "reply_to_message", None):
-                        msg_topic = getattr(m.reply_to_message, "message_thread_id", None)
+                    raw_topic_id = None
+                    try:
+                        # Raw MTProto reply header inspection
+                        if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
+                            raw_reply = m._raw.reply_to
+                            # Forum topic ID is stored in reply_to_top_id internally
+                            raw_topic_id = getattr(raw_reply, "reply_to_top_id", None)
+                    except Exception as e:
+                        logger.error(f"RAW TOPIC ERROR: {e}")
                     
-                    if not msg_topic:
-                        try:
-                            if hasattr(m, "_raw"):
-                                msg_topic = getattr(m._raw, "reply_to_top_id", None)
-                        except: pass
-                    
-                    logger.info(f"TOPIC DEBUG | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
-                    if str(msg_topic) != str(s_topic):
+                    logger.warning(f"RAW LIVE DEBUG | Msg:{m.id} | RAW_TOPIC:{raw_topic_id} | EXPECTED:{s_topic}")
+                    if str(raw_topic_id) != str(s_topic):
                         continue
 
                 # 1) Monitor: Save to DB if monitoring is ON
@@ -1344,9 +1340,17 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                     break
                 
-                # Double check thread ID (Search API is much better at providing this)
-                msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
-                if str(msg_topic) != str(s_topic):
+                # Double check thread ID using raw MTProto fields
+                raw_topic_id = None
+                try:
+                    if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
+                        raw_reply = m._raw.reply_to
+                        raw_topic_id = getattr(raw_reply, "reply_to_top_id", None)
+                except:
+                    pass
+                
+                logger.warning(f"COLLECTION RAW DEBUG | Msg:{m.id} | RAW_TOPIC:{raw_topic_id}")
+                if str(raw_topic_id) != str(s_topic):
                     continue
 
                 scanned += 1
