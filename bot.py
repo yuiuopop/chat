@@ -687,8 +687,8 @@ def setup_automation_handlers(client: TelegramClient):
 
             if matched:
                 logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
-                # Topic filtering (Temporarily disabled for debugging)
-                if False: # s_topic not in [None, 0, "0"]:
+                # Topic filtering (0 or None means entire group/chat)
+                if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = (
                         getattr(m, "reply_to_top_id", None)
                         or getattr(m, "top_msg_id", None)
