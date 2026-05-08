@@ -380,8 +380,10 @@ async def get_chat_selection_markup(prefix, page=0):
             icon = "📢"
             title = chat.title or "Channel"
         else:
-            icon = "👥"
+            is_forum = getattr(chat, "is_forum", False)
+            icon = "🏛️" if is_forum else "👥"
             title = chat.title or "Group"
+            if is_forum: title = f"{title} [Topics]"
             
         markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
     
