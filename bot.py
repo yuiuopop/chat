@@ -458,18 +458,23 @@ async def get_chat_selection_markup(prefix, page=0):
 
 async def get_topic_selection_markup(chat_id, prefix):
     """
-    Deep-scans chat history to find all active topics/threads.
+    Ultra-deep scan of chat history to find all active topics/threads using multiple detection methods.
     """
     markup = InlineKeyboardMarkup(row_width=1)
     try:
         found_topics = {}
-        scanned = 0
         
-        # Scan deeper into history to find older topics
-        async for msg in userbot.get_chat_history(chat_id, limit=1000):
-            scanned += 1
-            topic_id = getattr(msg, "message_thread_id", None)
+        # Scan even deeper to capture all active threads
+        async for msg in userbot.get_chat_history(chat_id, limit=2000):
+            topic_id = None
             
+            # Method 1: Standard Topic ID
+            if getattr(msg, "message_thread_id", None):
+                topic_id = msg.message_thread_id
+            # Method 2: Fallback for older topics/version variations
+            elif getattr(msg, "reply_to_top_message_id", None):
+                topic_id = msg.reply_to_top_message_id
+                
             if not topic_id:
                 continue
                 
@@ -486,9 +491,9 @@ async def get_topic_selection_markup(chat_id, prefix):
             if not topic_title:
                 # Use message preview as fallback title
                 if msg.text:
-                    topic_title = msg.text[:30].strip() + "..." if len(msg.text) > 30 else msg.text
+                    topic_title = msg.text[:40].strip() + "..." if len(msg.text) > 40 else msg.text
                 elif msg.caption:
-                    topic_title = msg.caption[:30].strip() + "..." if len(msg.caption) > 30 else msg.caption
+                    topic_title = msg.caption[:40].strip() + "..." if len(msg.caption) > 40 else msg.caption
                 else:
                     topic_title = f"Topic {topic_id}"
                     
@@ -507,7 +512,7 @@ async def get_topic_selection_markup(chat_id, prefix):
             
     except Exception as e:
         logger.error(f"Topic fetch error: {e}")
-        markup.add(InlineKeyboardButton("❌ Error Loading Topics", callback_data="noop"))
+        markup.add(InlineKeyboardButton("❌ Topic Scan Failed", callback_data="noop"))
         
     markup.add(InlineKeyboardButton("🔙 Back to Chats", callback_data="pair_add_start"))
     return markup
