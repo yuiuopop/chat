@@ -281,7 +281,7 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -305,6 +305,10 @@ def show_pair_view(chat_id, message_id, pid):
         mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
         live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
         filter_label = filter_type.upper()
+        task_info = ""
+        if is_task_running(f"hist_{pid}"): task_info += "\n🏃 **History Scrape:** `RUNNING`"
+        if is_task_running(f"coll_{pid}"): task_info += "\n🏃 **Collection:** `RUNNING`"
+        if is_task_running(f"rel_{pid}"): task_info += "\n🏃 **Release:** `RUNNING`"
         
         text = (
             f"📁 **Pair Management**\n\n"
@@ -316,6 +320,7 @@ def show_pair_view(chat_id, message_id, pid):
             f"🤖 **Automation Status:**\n"
             f"Monitor: `{mon_status}`\n"
             f"Live: `{live_status}`"
+            f"{task_info}"
         )
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
@@ -358,6 +363,8 @@ def pair_view_markup(pair_id):
     
     if is_coll: markup.add(InlineKeyboardButton("🛑 Stop Collection", callback_data=f"pair_stop_task_coll_{pair_id}"))
     else: markup.add(InlineKeyboardButton("📥 Collect Now", callback_data=f"pair_collect_{pair_id}"))
+
+    markup.add(InlineKeyboardButton("🔄 Refresh Stats", callback_data=f"pair_view_{pair_id}"))
     
     if is_rel: markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
     else: markup.add(InlineKeyboardButton("🚀 Release Now", callback_data=f"pair_release_{pair_id}"))
