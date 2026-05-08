@@ -370,19 +370,28 @@ async def get_chat_selection_markup(prefix, page=0):
     # Pagination (10 per page)
     start = page * 10
     end = start + 10
-    for chat in chats[start:end]:
+    page_chats = chats[start:end]
+    
+    for chat in page_chats:
         chat_type = chat.type
+        # Fetch full chat info for the current page to ensure is_forum etc. are populated
+        try:
+            full_chat = await userbot.get_chat(chat.id)
+            is_forum = getattr(full_chat, "is_forum", False)
+            title = full_chat.title or full_chat.first_name or "Chat"
+        except:
+            full_chat = chat
+            is_forum = getattr(chat, "is_forum", False)
+            title = chat.title or chat.first_name or "Chat"
+
         if chat_type == enums.ChatType.PRIVATE:
             is_bot = chat.username and chat.username.lower().endswith("bot")
             icon = "🤖" if is_bot else "👤"
             title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or chat.username or "User"
         elif chat_type == enums.ChatType.CHANNEL:
             icon = "📢"
-            title = chat.title or "Channel"
         else:
-            is_forum = getattr(chat, "is_forum", False)
             icon = "🏛️" if is_forum else "👥"
-            title = chat.title or "Group"
             if is_forum: title = f"{title} [Topics]"
             
         markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
