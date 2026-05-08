@@ -1484,15 +1484,27 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                         logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
                         
                         if source_topic_id:
-                            src_topics = await userbot(functions.channels.GetForumTopicsRequest(
-                                channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                            ))
-                            
                             src_title = None
-                            for st in src_topics.topics:
-                                if st.top_message == source_topic_id:
-                                    src_title = st.title
-                                    break
+                            # 1) Try direct forum object first (fastest)
+                            if getattr(msg, "reply_to", None):
+                                forum = getattr(msg.reply_to, "forum_topic", None)
+                                if forum and getattr(forum, "title", None):
+                                    src_title = forum.title
+                            
+                            # 2) Fallback to topic fetch (thorough)
+                            if not src_title:
+                                src_topics = await userbot(functions.channels.GetForumTopicsRequest(
+                                    channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                ))
+                                for st in src_topics.topics:
+                                    logger.warning(
+                                        f"TOPIC CHECK | ID:{getattr(st,'id',None)} | "
+                                        f"TOP:{getattr(st,'top_message',None)} | TITLE:{getattr(st,'title',None)}"
+                                    )
+                                    if (getattr(st, "id", None) == source_topic_id or 
+                                        getattr(st, "top_message", None) == source_topic_id):
+                                        src_title = st.title
+                                        break
                             
                             logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
