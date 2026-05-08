@@ -571,6 +571,7 @@ def setup_automation_handlers(client: TelegramClient):
                 # 2) Live Forward
                 if is_live:
                     try:
+                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{t_topic}")
                         # Telethon send_message with file=m effectively copies it
                         await client.send_message(
                             tid,
@@ -1339,10 +1340,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             try:
                 # Telethon: Fetch message if direct sending ID fails
                 try:
+                    logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{t_topic}")
                     await userbot.send_message(tid_ref, file=types.InputMessageID(smid), reply_to=t_topic)
                 except:
                     # Fallback forward
-                    await userbot.forward_messages(tid_ref, smid, sid)
+                    await userbot.forward_messages(tid_ref, smid, sid, reply_to=t_topic)
                 
                 with db_conn() as conn:
                     c = conn.cursor()
