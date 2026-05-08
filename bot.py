@@ -623,7 +623,8 @@ def setup_automation_handlers(client: TelegramClient):
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            if str(abs(int(m.chat_id))) == str(abs(int(sid))):
+            # FIX: Ensure strict integer comparison for IDs
+            if int(current_chat_id) == int(sid):
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = getattr(m, "reply_to_top_id", None)
@@ -645,11 +646,11 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # 2) Live Forward / Mirror
                 if is_live:
-                    target_topic_anchor = t_topic
-                    
-                    # Mirroring Logic
-                    if is_mir:
-                        try:
+                    try:
+                        target_topic_anchor = t_topic
+                        
+                        # Handle Mirror Mode (creating topics on the fly)
+                        if is_mir:
                             source_topic_id = (
                                 getattr(m, "reply_to_top_id", None)
                                 or getattr(m, "top_msg_id", None)
@@ -659,12 +660,8 @@ def setup_automation_handlers(client: TelegramClient):
                             if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
 
-                            logger.warning(
-                                f"MIRROR DEBUG | MSG:{m.id} | TOPIC:{source_topic_id} | FORUM:{getattr(m, 'forum_topic', False)}"
-                            )
-
                             if source_topic_id:
-                                src_title = None
+                                src_title = "General"
                                 # 1) Direct metadata
                                 if getattr(m, "reply_to", None):
                                     forum = getattr(m.reply_to, "forum_topic", None)
@@ -672,9 +669,9 @@ def setup_automation_handlers(client: TelegramClient):
                                         src_title = forum.title
                                 
                                 # 2) Fetch fallback
-                                if not src_title:
+                                if src_title == "General":
                                     src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        channel=current_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
                                         if (getattr(st, "id", None) == source_topic_id or 
@@ -682,31 +679,23 @@ def setup_automation_handlers(client: TelegramClient):
                                             src_title = st.title
                                             break
                                 
-                                if src_title:
-                                    logger.warning(f"MIRROR REQUEST | TITLE:{src_title}")
-                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
-                                    if mirrored_id:
-                                        target_topic_anchor = mirrored_id
-                        except Exception as me:
-                            logger.error(f"Mirroring Logic Error: {me}")
+                                # Get/Create Target Topic
+                                mirrored_id = await get_or_create_target_topic(client, tid, src_title)
+                                if mirrored_id:
+                                    target_topic_anchor = mirrored_id
 
-                    try:
-                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
-                        if m.media:
-                            await client.send_file(
-                                entity=tid,
-                                file=m.media,
-                                caption=m.message or "",
-                                reply_to=target_topic_anchor
-                            )
-                        else:
-                            await client.send_message(
-                                entity=tid,
-                                message=m.message or "",
-                                reply_to=target_topic_anchor
-                            )
+                        # PERFORM THE FORWARD
+                        # We use send_message with file=m.media to copy message contents as requested
+                        await client.send_message(
+                            int(tid),
+                            m.message or "",
+                            file=m.media if m.media else None,
+                            reply_to=target_topic_anchor if target_topic_anchor else None
+                        )
+                        logger.info(f"LIVE FORWARD SUCCESS: Pair {pid} | Msg {m.id} -> Chat {tid} | Topic {target_topic_anchor}")
+                        
                     except Exception as e:
-                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
+                        logger.error(f"LIVE FORWARD FAILED: Pair {pid} | Error: {e}")
 
 # -----------------------------
 # Bot Handlers
