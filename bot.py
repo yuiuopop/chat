@@ -48,22 +48,37 @@ DB_PATH = "userbot_v2.db"
 
 @contextmanager
 def db_conn():
-    if DATABASE_URL:
-        import psycopg2
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True
-    else:
-        conn = sqlite3.connect(DB_PATH)
-    
+    global USING_POSTGRES
+    conn = None
     try:
+        if DATABASE_URL:
+            try:
+                import psycopg2
+                conn = psycopg2.connect(DATABASE_URL)
+                conn.autocommit = True
+                USING_POSTGRES = True
+            except (ImportError, Exception) as e:
+                logger.error(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
+                conn = sqlite3.connect(DB_PATH)
+                USING_POSTGRES = False
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            USING_POSTGRES = False
+        
         yield conn
-        if not DATABASE_URL:
+        # Commit for SQLite
+        if not DATABASE_URL or isinstance(conn, sqlite3.Connection):
             conn.commit()
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
-def get_placeholder():
-    return "%s" if DATABASE_URL else "?"
+USING_POSTGRES = False
+
+def get_placeholder(conn=None):
+    if conn and isinstance(conn, sqlite3.Connection):
+        return "?"
+    return "%s" if DATABASE_URL and USING_POSTGRES else "?"
 
 def init_db():
     with db_conn() as conn:
