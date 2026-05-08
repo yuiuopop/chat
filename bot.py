@@ -85,6 +85,7 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
+                    filter_type TEXT DEFAULT 'all',
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -93,11 +94,15 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
             except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
+            except: pass
+            
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
                     source_chat_id BIGINT,
                     source_message_id BIGINT,
+                    thread_id INTEGER,
                     media_type TEXT,
                     caption TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -112,6 +117,8 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN thread_id INTEGER")
             except: pass
         else:
             # SQLite
