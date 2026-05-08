@@ -465,6 +465,14 @@ async def start_userbot():
             sleep_threshold=60 # Handle long floodwaits gracefully
         )
         await userbot.start()
+        
+        # Globally warm up the MTProto peer cache
+        try:
+            async for _ in userbot.get_dialogs(limit=None):
+                pass
+        except Exception as e:
+            logger.error(f"Failed to warm up cache: {e}")
+            
         # Register automation handlers
         await setup_automation_handlers(userbot)
         return True, "Userbot started"
@@ -608,6 +616,10 @@ async def setup_automation_handlers(client: Client):
         for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
+                # Skip service messages
+                if not (m.text or m.media):
+                    continue
+                
                 # Apply filter
                 if filter_type == "media" and not m.media: continue
                 if filter_type == "text" and m.media: continue
@@ -1327,6 +1339,11 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
+            
+            # Skip service messages
+            if not (m.text or m.media):
+                continue
+                
             scanned += 1
             await asyncio.sleep(0.05) # Anti-ban delay
             # Apply filter
