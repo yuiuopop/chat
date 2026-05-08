@@ -471,7 +471,11 @@ async def get_topic_selection_markup(chat_id, prefix):
         
         if not topics:
             markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
+            # Even if no topics found, allow selecting the whole group
+            markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
         else:
+            # Add option to select the entire group as a source
+            markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
             for topic in topics:
                 # Telethon Forum topics: top_message is the anchor/starter message ID
                 topic_anchor_id = getattr(topic, "top_message", None)
@@ -549,8 +553,8 @@ def setup_automation_handlers(client: TelegramClient):
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, s_topic, t_topic in pairs:
             if m.chat_id == sid:
-                # Topic filtering
-                if s_topic:
+                # Topic filtering (0 or None means entire group/chat)
+                if s_topic and str(s_topic) != "0":
                     msg_topic_anchor = None
                     if m.reply_to:
                         msg_topic_anchor = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
@@ -1191,7 +1195,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         sid_resolved = target_chat.id
         
         # Telethon uses iter_messages for history
-        async for m in userbot.iter_messages(sid_resolved):
+        target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
+        async for m in userbot.iter_messages(sid_resolved, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
                 break
@@ -1262,7 +1267,9 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     
     try:
         # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
-        async for m in userbot.iter_messages(sid, limit=limit, reply_to=s_topic if s_topic else None):
+        # Use int(s_topic) if it's a valid thread ID, otherwise None for entire chat
+        target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
+        async for m in userbot.iter_messages(sid, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
