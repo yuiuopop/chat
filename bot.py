@@ -536,6 +536,8 @@ async def get_topic_name(client, chat_id, topic_id):
                 
         return target_title
     except Exception as e:
+        if "CHANNEL_FORUM_MISSING" in str(e) or "CHANNEL_INVALID" in str(e):
+            return None # Expected for non-forum or private chats
         logger.error(f"Error getting topic name: {e}")
         return None
 
@@ -605,6 +607,8 @@ async def get_or_create_target_topic(client, target_chat_id, topic_name):
             return None
             
     except Exception as e:
+        if "CHANNEL_FORUM_MISSING" in str(e) or "CHANNEL_INVALID" in str(e):
+            return None # Expected for non-forum or private chats
         logger.error(f"Error in topic matching: {e}")
         return None
 
@@ -663,7 +667,9 @@ async def setup_automation_handlers(client: Client):
                                     kwargs["reply_to_message_id"] = tgt_id
                         
                         target_chat = await resolve_target_id(c, tid)
-                        await m.copy(target_chat.id, **kwargs)
+                        target_peer = target_chat.username if target_chat.username else target_chat.id
+                        source_peer = m.chat.username if m.chat.username else m.chat.id
+                        await c.copy_message(target_peer, source_peer, m.id, **kwargs)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
                         try:
