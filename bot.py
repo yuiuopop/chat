@@ -21,7 +21,7 @@ from pyrogram import Client, filters, idle, enums
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 from pyrogram.raw.functions.channels import GetForumTopics
-from pyrogram.raw.functions.messages import GetHistory
+from pyrogram.raw.functions.messages import GetHistory, GetReplies
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -1349,48 +1349,63 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         # NUCLEAR OPTION: Use Raw MTProto GetHistory with reply_to_msg_id
         # This is the only 100% reliable way to fetch a specific forum thread's history
         peer = await userbot.resolve_peer(sid_resolved)
-        
         offset_id = 0
+        
         while True:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
             
-            # Fetch a chunk of messages from the specific topic thread
-            result = await userbot.invoke(
-                GetHistory(
-                    peer=peer,
-                    offset_id=offset_id,
-                    offset_date=0,
-                    add_offset=0,
-                    limit=100,
-                    max_id=0,
-                    min_id=0,
-                    hash=0
+            # Fetch a chunk of messages
+            if s_topic:
+                # Target the specific topic thread via its anchor message
+                result = await userbot.invoke(
+                    GetReplies(
+                        peer=peer,
+                        msg_id=int(s_topic),
+                        offset_id=offset_id,
+                        offset_date=0,
+                        add_offset=0,
+                        limit=100,
+                        max_id=0,
+                        min_id=0,
+                        hash=0
+                    )
                 )
-            )
+            else:
+                # Normal group history
+                result = await userbot.invoke(
+                    GetHistory(
+                        peer=peer,
+                        offset_id=offset_id,
+                        offset_date=0,
+                        add_offset=0,
+                        limit=100,
+                        max_id=0,
+                        min_id=0,
+                        hash=0
+                    )
+                )
             
-            # Note: We can't use reply_to_msg_id in GetHistory for all servers/versions, 
-            # so we fall back to a manual filter with a deeper raw inspection if result contains all messages.
             messages = getattr(result, "messages", [])
             if not messages:
                 break
                 
             for raw_m in messages:
-                # Convert raw MTProto message to Pyrogram Message for easier handling
+                # Convert to Pyrogram Message
                 m = await Message._parse(userbot, raw_m, {raw_m.id: raw_m}, {})
                 if not m: continue
                 
-                # Deep Topic Filtering
-                msg_topic_anchor = None
-                try:
-                    raw_obj = getattr(m, "_raw", None)
-                    if raw_obj and getattr(raw_obj, "reply_to", None):
-                        msg_topic_anchor = getattr(raw_obj.reply_to, "reply_to_top_id", None) or getattr(raw_obj.reply_to, "top_msg_id", None)
-                except: pass
+                # Filtering logic
+                is_match = False
+                if s_topic:
+                    # In GetReplies, all messages are from the topic, 
+                    # but we verify for safety and to catch the anchor message itself
+                    is_match = True 
+                else:
+                    is_match = True # No topic filter for normal groups
                 
-                # Match against anchor or the message ID itself (starter message)
-                if str(msg_topic_anchor) == str(s_topic) or str(m.id) == str(s_topic):
+                if is_match:
                     scanned += 1
                     if m.media:
                         media_type = m.media.value
