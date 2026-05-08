@@ -555,7 +555,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title):
         
         # Telethon CreateForumTopic returns updates. Usually the topic is in updates[1]
         # But let's be safer and re-fetch briefly or search in result
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
         res_after = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
             offset_date=0, offset_id=0, offset_topic=0, limit=20
@@ -650,14 +650,19 @@ def setup_automation_handlers(client: TelegramClient):
                     # Mirroring Logic
                     if is_mir:
                         try:
-                            source_topic_id = None
-                            if getattr(m, "reply_to_top_id", None):
-                                source_topic_id = m.reply_to_top_id
-                            elif m.reply_to:
-                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
-                            elif getattr(m, "forum_topic", False):
+                            source_topic_id = (
+                                getattr(m, "reply_to_top_id", None)
+                                or getattr(m, "top_msg_id", None)
+                                or getattr(m, "reply_to_msg_id", None)
+                            )
+                            # Root topic starter message
+                            if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
-                            
+
+                            logger.warning(
+                                f"MIRROR DEBUG | MSG:{m.id} | TOPIC:{source_topic_id} | FORUM:{getattr(m, 'forum_topic', False)}"
+                            )
+
                             if source_topic_id:
                                 src_title = None
                                 # 1) Direct metadata
@@ -678,6 +683,7 @@ def setup_automation_handlers(client: TelegramClient):
                                             break
                                 
                                 if src_title:
+                                    logger.warning(f"MIRROR REQUEST | TITLE:{src_title}")
                                     mirrored_id = await get_or_create_target_topic(client, tid, src_title)
                                     if mirrored_id:
                                         target_topic_anchor = mirrored_id
@@ -1492,16 +1498,19 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # MIRROR MODE LOGIC
                 if is_mir:
                     try:
-                        source_topic_id = None
-                        if getattr(msg, "reply_to_top_id", None):
-                            source_topic_id = msg.reply_to_top_id
-                        elif msg.reply_to:
-                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
-                        elif getattr(msg, "forum_topic", False):
+                        source_topic_id = (
+                            getattr(msg, "reply_to_top_id", None)
+                            or getattr(msg, "top_msg_id", None)
+                            or getattr(msg, "reply_to_msg_id", None)
+                        )
+                        # Root topic starter message
+                        if not source_topic_id and getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-                        
-                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
-                        
+
+                        logger.warning(
+                            f"MIRROR DEBUG | MSG:{msg.id} | TOPIC:{source_topic_id} | FORUM:{getattr(msg, 'forum_topic', False)}"
+                        )
+
                         if source_topic_id:
                             src_title = None
                             # 1) Try direct forum object first (fastest)
@@ -1528,6 +1537,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
                             if src_title:
+                                logger.warning(f"MIRROR REQUEST | TITLE:{src_title}")
                                 mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
                                 logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
                                 if mirrored_id:
