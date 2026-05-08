@@ -260,19 +260,8 @@ def get_pair_stats(pair_id):
         row = c.fetchone()
         return {"total": row[0] or 0, "pending": row[1] or 0}
 
-def normalize_chat_id(chat_id):
-    """Ensures chat IDs consistently use the -100 prefix for supergroups/channels."""
-    if not chat_id: return None
-    cid_str = str(chat_id)
-    if not cid_str.startswith("-") and len(cid_str) >= 9:
-        cid_str = f"-100{cid_str}"
-    elif cid_str.startswith("-") and not cid_str.startswith("-100") and len(cid_str) >= 10:
-        # Handle cases where it's a negative ID but missing the 100 part
-        cid_str = cid_str.replace("-", "-100", 1)
-    return int(cid_str)
-
 # -----------------------------
-# Database Management
+# Global State
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN)
 userbot = None
@@ -566,7 +555,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title):
         
         # Telethon CreateForumTopic returns updates. Usually the topic is in updates[1]
         # But let's be safer and re-fetch briefly or search in result
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         res_after = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
             offset_date=0, offset_id=0, offset_topic=0, limit=20
@@ -628,81 +617,20 @@ async def ensure_userbot():
     return True, "Connected"
 
 def setup_automation_handlers(client: TelegramClient):
-    # REMOVE OLD HANDLERS / PREVENT DUPLICATES
-    if hasattr(client, "_live_handler_added"):
-        return
-    client._live_handler_added = True
-
-    @client.on(events.NewMessage(incoming=True))
+    @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
-        logger.warning(f"🔥 REAL EVENT CHAT ID = {event.chat_id}")
-        
-        logger.warning(
-            f"\n========== NEW EVENT ==========\n"
-            f"CHAT_ID: {event.chat_id}\n"
-            f"MSG_ID: {m.id}\n"
-            f"TEXT: {(m.message or '')[:50]}\n"
-            f"MEDIA: {bool(m.media)}\n"
-            f"REPLY_TO: {getattr(m, 'reply_to_msg_id', None)}\n"
-            f"TOP_REPLY: {getattr(m, 'reply_to_top_id', None)}\n"
-            f"FORUM: {getattr(m, 'forum_topic', False)}\n"
-            f"==============================="
-        )
-        # USE ROBUST PEER MATCHING (Handles forum migration/ID variance)
-        current_chat_id = int(event.chat_id)
-        try:
-            event_input = await event.get_input_chat()
-            real_event_id = getattr(event_input, 'channel_id', getattr(event_input, 'chat_id', current_chat_id))
-        except:
-            real_event_id = current_chat_id
-
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            source_chat_id = int(sid)
-            
-            # Resolve source input for comparison
-            try:
-                source_input = await client.get_input_entity(source_chat_id)
-                real_source_id = getattr(source_input, 'channel_id', getattr(source_input, 'chat_id', source_chat_id))
-            except:
-                real_source_id = source_chat_id
-
-            logger.warning(
-                f"\n------ CHECKING PAIR ------\n"
-                f"PAIR_ID: {pid}\n"
-                f"EVENT_CHAT_RAW: {current_chat_id}\n"
-                f"EVENT_PEER_ID: {real_event_id}\n"
-                f"SOURCE_PEER_ID: {real_source_id}\n"
-                f"---------------------------"
-            )
-
-            # Clean both IDs to their bare numeric form for comparison
-            event_id_str = str(real_event_id)
-            source_id_str = str(real_source_id)
-            clean_event = event_id_str.replace("-100", "").replace("-", "")
-            clean_source = source_id_str.replace("-100", "").replace("-", "")
-
-            matched = clean_event == clean_source
-
-            if matched:
-                logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
+            if str(abs(int(m.chat_id))) == str(abs(int(sid))):
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
-                    msg_topic_anchor = (
-                        getattr(m, "reply_to_top_id", None)
-                        or getattr(m, "top_msg_id", None)
-                    )
-                    # topic starter message
-                    if not msg_topic_anchor and getattr(m, "forum_topic", False):
-                        msg_topic_anchor = m.id
-
-                    logger.warning(
-                        f"TOPIC CHECK | FOUND:{msg_topic_anchor} | EXPECTED:{s_topic}"
-                    )
-
-                    if str(msg_topic_anchor) != str(s_topic):
+                    msg_topic_anchor = getattr(m, "reply_to_top_id", None)
+                    if not msg_topic_anchor and m.reply_to:
+                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
+                    
+                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -717,22 +645,21 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # 2) Live Forward / Mirror
                 if is_live:
-                    try:
-                        target_topic_anchor = t_topic
-                        
-                        # Handle Mirror Mode (creating topics on the fly)
-                        if is_mir:
-                            source_topic_id = (
-                                getattr(m, "reply_to_top_id", None)
-                                or getattr(m, "top_msg_id", None)
-                                or getattr(m, "reply_to_msg_id", None)
-                            )
-                            # Root topic starter message
-                            if not source_topic_id and getattr(m, "forum_topic", False):
+                    target_topic_anchor = t_topic
+                    
+                    # Mirroring Logic
+                    if is_mir:
+                        try:
+                            source_topic_id = None
+                            if getattr(m, "reply_to_top_id", None):
+                                source_topic_id = m.reply_to_top_id
+                            elif m.reply_to:
+                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
+                            elif getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
-
+                            
                             if source_topic_id:
-                                src_title = "General"
+                                src_title = None
                                 # 1) Direct metadata
                                 if getattr(m, "reply_to", None):
                                     forum = getattr(m.reply_to, "forum_topic", None)
@@ -740,9 +667,9 @@ def setup_automation_handlers(client: TelegramClient):
                                         src_title = forum.title
                                 
                                 # 2) Fetch fallback
-                                if src_title == "General":
+                                if not src_title:
                                     src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                        channel=event.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
                                         if (getattr(st, "id", None) == source_topic_id or 
@@ -750,35 +677,30 @@ def setup_automation_handlers(client: TelegramClient):
                                             src_title = st.title
                                             break
                                 
-                                # Get/Create Target Topic
-                                mirrored_id = await get_or_create_target_topic(client, tid, src_title)
-                                if mirrored_id:
-                                    target_topic_anchor = mirrored_id
+                                if src_title:
+                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
+                                    if mirrored_id:
+                                        target_topic_anchor = mirrored_id
+                        except Exception as me:
+                            logger.error(f"Mirroring Logic Error: {me}")
 
-                        # PERFORM THE FORWARD
-                        logger.warning(
-                            f"\n>>>> LIVE SEND START >>>>\n"
-                            f"TARGET_CHAT: {tid}\n"
-                            f"TARGET_TOPIC: {target_topic_anchor}\n"
-                            f"TEXT: {(m.message or '')[:50]}\n"
-                            f"MEDIA: {bool(m.media)}\n"
-                            f"<<<<<<<<<<<<<<<<<<<<<<<<<"
-                        )
-                        await client.send_message(
-                            int(tid),
-                            m.message or "",
-                            file=m.media if m.media else None,
-                            reply_to=target_topic_anchor if target_topic_anchor else None
-                        )
-                        logger.warning(f"✅ LIVE SEND SUCCESS | MSG:{m.id}")
-                        
+                    try:
+                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
+                        if m.media:
+                            await client.send_file(
+                                entity=tid,
+                                file=m.media,
+                                caption=m.message or "",
+                                reply_to=target_topic_anchor
+                            )
+                        else:
+                            await client.send_message(
+                                entity=tid,
+                                message=m.message or "",
+                                reply_to=target_topic_anchor
+                            )
                     except Exception as e:
-                        import traceback
-                        logger.error(
-                            f"\n❌ LIVE SEND FAILED\n"
-                            f"ERROR: {e}\n"
-                            f"TRACE:\n{traceback.format_exc()}"
-                        )
+                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -793,26 +715,6 @@ def cmd_start(message):
         reply_markup=get_dashboard_markup(),
         parse_mode="Markdown"
     )
-
-@bot.message_handler(commands=['debugpairs'])
-def debug_pairs(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    rows = get_target_pairs()
-    if not rows:
-        bot.reply_to(message, "No pairs found.")
-        return
-    text = "🔍 **DEBUG PAIRS**\n\n"
-    for row in rows:
-        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
-        text += (
-            f"📦 **Pair:** `{pid}`\n"
-            f"📤 **Source:** `{sid}`\n"
-            f"📥 **Target:** `{tid}`\n"
-            f"⚡ **Live:** `{is_live}`\n"
-            f"🧵 **S-Topic:** `{s_topic}`\n\n"
-        )
-    bot.reply_to(message, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=["list"])
 def cmd_list(message):
@@ -883,15 +785,7 @@ async def finalize_pair_task(call, uid):
         s_title = getattr(s_chat, 'title', None) or getattr(s_chat, 'first_name', None) or str(sid)
         t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
         
-        # Normalize IDs before saving to DB
-        sid = normalize_chat_id(sid)
-        tid = normalize_chat_id(tid)
-        
         add_target_pair(sid, stid, tid, ttid, s_title, t_title)
-        logger.warning(
-            f"PAIR CREATED | SOURCE:{sid} | TARGET:{tid} | "
-            f"S_TOPIC:{stid} | T_TOPIC:{ttid}"
-        )
         
         success_text = f"✅ **Pair Added!**\n\n"
         success_text += f"Source: `{s_title}`" + (f" (Topic: `{stid}`)" if stid else "") + "\n"
@@ -1598,19 +1492,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # MIRROR MODE LOGIC
                 if is_mir:
                     try:
-                        source_topic_id = (
-                            getattr(msg, "reply_to_top_id", None)
-                            or getattr(msg, "top_msg_id", None)
-                            or getattr(msg, "reply_to_msg_id", None)
-                        )
-                        # Root topic starter message
-                        if not source_topic_id and getattr(msg, "forum_topic", False):
+                        source_topic_id = None
+                        if getattr(msg, "reply_to_top_id", None):
+                            source_topic_id = msg.reply_to_top_id
+                        elif msg.reply_to:
+                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
+                        elif getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-
-                        logger.warning(
-                            f"MIRROR DEBUG | MSG:{msg.id} | TOPIC:{source_topic_id} | FORUM:{getattr(msg, 'forum_topic', False)}"
-                        )
-
+                        
+                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
+                        
                         if source_topic_id:
                             src_title = None
                             # 1) Try direct forum object first (fastest)
@@ -1637,7 +1528,6 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
                             if src_title:
-                                logger.warning(f"MIRROR REQUEST | TITLE:{src_title}")
                                 mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
                                 logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
                                 if mirrored_id:
