@@ -617,15 +617,28 @@ async def ensure_userbot():
     return True, "Connected"
 
 def setup_automation_handlers(client: TelegramClient):
-    @client.on(events.NewMessage)
+    # REMOVE OLD HANDLERS / PREVENT DUPLICATES
+    if hasattr(client, "_live_handler_added"):
+        return
+    client._live_handler_added = True
+
+    @client.on(events.NewMessage(incoming=True))
     async def auto_handler(event):
         m = event.message
-        current_chat_id = m.chat_id
+        # Strip -100 for reliable supergroup matching
+        current_chat_id = int(str(event.chat_id).replace("-100", ""))
+        
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            # FIX: Ensure strict integer comparison for IDs
-            if int(current_chat_id) == int(sid):
+            source_chat_id = int(str(sid).replace("-100", ""))
+            
+            logger.warning(
+                f"EVENT DETECTED | EVENT:{current_chat_id} | SOURCE:{source_chat_id} | MSG:{m.id}"
+            )
+
+            # Strict integer comparison for IDs
+            if current_chat_id == source_chat_id:
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = getattr(m, "reply_to_top_id", None)
@@ -672,7 +685,7 @@ def setup_automation_handlers(client: TelegramClient):
                                 # 2) Fetch fallback
                                 if src_title == "General":
                                     src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                        channel=current_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        channel=event.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
                                         if (getattr(st, "id", None) == source_topic_id or 
@@ -686,7 +699,9 @@ def setup_automation_handlers(client: TelegramClient):
                                     target_topic_anchor = mirrored_id
 
                         # PERFORM THE FORWARD
-                        # We use send_message with file=m.media to copy message contents as requested
+                        logger.warning(
+                            f"FORWARDING | TARGET:{tid} | TOPIC:{target_topic_anchor}"
+                        )
                         await client.send_message(
                             int(tid),
                             m.message or "",
