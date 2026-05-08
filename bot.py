@@ -1338,13 +1338,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
                 break
             try:
-                # Telethon: Fetch message if direct sending ID fails
-                try:
-                    logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{t_topic}")
-                    await userbot.send_message(tid_ref, file=types.InputMessageID(smid), reply_to=t_topic)
-                except:
-                    # Fallback forward
-                    await userbot.forward_messages(tid_ref, smid, sid, reply_to=t_topic)
+                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{t_topic}")
+                msg = await userbot.get_messages(sid, ids=smid)
+                if not msg:
+                    continue
+                await userbot.send_message(
+                    entity=tid_ref,
+                    message=msg.message or "",
+                    file=msg.media,
+                    reply_to=t_topic
+                )
                 
                 with db_conn() as conn:
                     c = conn.cursor()
