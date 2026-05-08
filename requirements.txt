@@ -4,3 +4,4 @@ flask==3.0.3
 python-dotenv==1.0.1
 requests==2.32.3
 psycopg[binary]==3.2.13
+psycopg2-binary
