@@ -373,31 +373,47 @@ async def get_chat_selection_markup(prefix, page=0):
     page_chats = chats[start:end]
     
     for chat in page_chats:
-        chat_type = chat.type
+        # Detect forum/topic-enabled groups properly
+        is_forum = False
         try:
             full_chat = await userbot.get_chat(chat.id)
-            # Use the verified 'forum' attribute suggested by the user
-            is_forum = getattr(full_chat, "forum", False) or getattr(full_chat, "is_forum", False)
-            title = full_chat.title or full_chat.first_name or "Chat"
-        except Exception as e:
-            full_chat = chat
-            is_forum = getattr(chat, "forum", False) or getattr(chat, "is_forum", False)
-            title = chat.title or chat.first_name or "Chat"
+            # Pyrogram forum detection
+            is_forum = bool(
+                getattr(full_chat, "is_forum", False) or
+                getattr(full_chat, "forum", False)
+            )
+        except Exception:
+            pass
 
-        if chat_type == enums.ChatType.PRIVATE:
-            is_bot = chat.username and chat.username.lower().endswith("bot")
-            icon = "🤖" if is_bot else "👤"
-            title = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or chat.username or "User"
-        elif chat_type == enums.ChatType.CHANNEL:
+        # Better visual distinction
+        if chat.type == enums.ChatType.CHANNEL:
             icon = "📢"
+            title = chat.title or "Channel"
+        elif chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+            if is_forum:
+                icon = "🧵"
+                title = f"{chat.title} • TOPIC GROUP"
+            else:
+                icon = "👥"
+                title = chat.title or "Group"
+        elif chat.type == enums.ChatType.PRIVATE:
+            is_bot = getattr(chat, "is_bot", False)
+            if is_bot:
+                icon = "🤖"
+            else:
+                icon = "👤"
+            title = chat.first_name or "Private Chat"
         else:
-            # SUPERGROUP or GROUP
-            icon = "🏛️" if is_forum else "👥"
-            if is_forum: title = f"{title} [Topics]"
-            
-        markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
-            
-        markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
+            icon = "💬"
+            title = "Unknown"
+
+        # SINGLE BUTTON ONLY
+        markup.add(
+            InlineKeyboardButton(
+                f"{icon} {title}",
+                callback_data=f"{prefix}_{chat.id}"
+            )
+        )
     
     nav = []
     if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}_page_{page-1}"))
