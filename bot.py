@@ -1392,30 +1392,33 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 break
                 
             for raw_m in messages:
-                # Convert to Pyrogram Message
-                m = await Message._parse(userbot, raw_m, {raw_m.id: raw_m}, {})
-                if not m: continue
+                if not running_tasks.get(task_key):
+                    break
                 
-                # Filtering logic
-                is_match = False
-                if s_topic:
-                    # In GetReplies, all messages are from the topic, 
-                    # but we verify for safety and to catch the anchor message itself
-                    is_match = True 
-                else:
-                    is_match = True # No topic filter for normal groups
-                
-                if is_match:
-                    scanned += 1
-                    if m.media:
-                        media_type = m.media.value
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            if DATABASE_URL:
-                                c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                            else:
-                                c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                            if c.rowcount > 0: collected += 1
+                scanned += 1
+                try:
+                    # Fetch proper Pyrogram message object via public API
+                    # This is more stable than internal _parse()
+                    m = await userbot.get_messages(sid_resolved, raw_m.id)
+                    if not m or not m.media:
+                        continue
+                    
+                    media_type = m.media.value
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if DATABASE_URL:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, sid_resolved, m.id, media_type, m.caption or "")
+                            )
+                        if c.rowcount > 0: collected += 1
+                except Exception as e:
+                    logger.error(f"TOPIC MESSAGE FETCH ERROR: {e}")
                 
                 offset_id = raw_m.id
 
