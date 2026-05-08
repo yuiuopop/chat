@@ -113,6 +113,10 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_topic_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -494,6 +498,15 @@ async def get_topic_name(client, chat_id, topic_id):
         
     try:
         from pyrogram.raw.functions.channels import GetForumTopics
+        
+        # Ensure peer is cached
+        try:
+            await client.resolve_peer(chat_id)
+        except Exception:
+            # Force cache via dialogs
+            async for dialog in client.get_dialogs(limit=200):
+                if str(dialog.chat.id) == chat_id_str: break
+                
         peer = await client.resolve_peer(chat_id)
         result = await client.invoke(GetForumTopics(
             channel=peer,
@@ -530,6 +543,15 @@ async def get_or_create_target_topic(client, target_chat_id, topic_name):
         
     try:
         from pyrogram.raw.functions.channels import GetForumTopics, CreateForumTopic
+        
+        # Ensure peer is cached
+        try:
+            await client.resolve_peer(target_chat_id)
+        except Exception:
+            # Force cache via dialogs
+            async for dialog in client.get_dialogs(limit=200):
+                if str(dialog.chat.id) == chat_id_str: break
+                
         peer = await client.resolve_peer(target_chat_id)
         
         # Ensure dict exists
@@ -630,6 +652,10 @@ async def setup_automation_handlers(client: Client):
                         await m.copy(tid, **kwargs)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
+                        try:
+                            from userbot_v2 import ADMIN_ID, bot
+                            bot.send_message(ADMIN_ID, f"⚠️ **Live Forwarding Error**\nPair: `{s_title} -> {t_title}`\nError: `{e}`", parse_mode="Markdown")
+                        except: pass
 
 # -----------------------------
 # Bot Handlers
