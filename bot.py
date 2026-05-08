@@ -649,7 +649,9 @@ async def setup_automation_handlers(client: Client):
                                 tgt_id = await get_or_create_target_topic(c, tid, t_name)
                                 if tgt_id:
                                     kwargs["reply_to_message_id"] = tgt_id
-                        await m.copy(tid, **kwargs)
+                        
+                        target_chat = await resolve_target_id(c, tid)
+                        await m.copy(target_chat.id, **kwargs)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
                         try:
@@ -1398,10 +1400,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         sid, tid_ref, s_title = row
     
         try:
+            source_chat = await resolve_target_id(userbot, sid)
+            source_id = source_chat.id
             target_chat = await resolve_target_id(userbot, tid_ref)
             target_id = target_chat.id
         except Exception as e:
-            bot.send_message(admin_chat_id, f"❌ Target Error: {e}")
+            bot.send_message(admin_chat_id, f"❌ Chat Resolution Error: {e}")
             return
 
         with db_conn() as conn:
@@ -1438,12 +1442,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     kwargs["reply_to_message_id"] = target_topic_id
                     
                 try:
-                    sent_msg = await userbot.copy_message(target_id, sid, smid, **kwargs)
+                    sent_msg = await userbot.copy_message(target_id, source_id, smid, **kwargs)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
                     try:
-                        msg = await userbot.get_messages(sid, smid)
+                        msg = await userbot.get_messages(source_id, smid)
                         if msg.empty:
                             logger.error(f"Message {smid} is empty or deleted.")
                         elif msg.media:
