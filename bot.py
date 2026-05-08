@@ -485,13 +485,14 @@ async def get_topic_selection_markup(chat_id, prefix):
             markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
         else:
             for topic in topics:
-                topic_id = getattr(topic, "id", None)
-                topic_title = getattr(topic, "title", f"Topic {topic_id}")
-                if topic_id:
+                # Use top_message ID because that is what messages actually use in reply_to_top_message_id
+                topic_anchor_id = getattr(topic, "top_message", None)
+                topic_title = getattr(topic, "title", f"Topic {topic_anchor_id}")
+                if topic_anchor_id:
                     markup.add(
                         InlineKeyboardButton(
                             f"🧵 {topic_title}",
-                            callback_data=f"{prefix}_{chat_id}_{topic_id}"
+                            callback_data=f"{prefix}_{chat_id}_{topic_anchor_id}"
                         )
                     )
                     
@@ -565,21 +566,22 @@ async def setup_automation_handlers(client: Client):
                 if m.service:
                     continue
 
-                # Topic filtering if applicable using raw MTProto fields
+                # Topic filtering if applicable using anchor message IDs
                 if s_topic:
-                    raw_topic_id = None
-                    try:
-                        # Raw MTProto reply header inspection
-                        if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
-                            raw_reply = m._raw.reply_to
-                            # Forum topic ID is stored in reply_to_top_id internally
-                            raw_topic_id = getattr(raw_reply, "reply_to_top_id", None)
-                    except Exception as e:
-                        logger.error(f"RAW TOPIC ERROR: {e}")
+                    # Anchor detection: Telegram forum messages link back to the topic starter message
+                    msg_topic_anchor = getattr(m, "reply_to_top_message_id", None)
                     
-                    logger.warning(f"RAW LIVE DEBUG | Msg:{m.id} | RAW_TOPIC:{raw_topic_id} | EXPECTED:{s_topic}")
-                    if str(raw_topic_id) != str(s_topic):
+                    # Fallback for raw MTProto objects
+                    if not msg_topic_anchor:
+                        try:
+                            if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
+                                msg_topic_anchor = getattr(m._raw.reply_to, "reply_to_top_id", None)
+                        except: pass
+                    
+                    logger.warning(f"TOPIC FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
+                    if str(msg_topic_anchor) != str(s_topic):
                         continue
+                        
 
                 # 1) Monitor: Save to DB if monitoring is ON
                 if is_mon:
@@ -1340,17 +1342,18 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                     break
                 
-                # Double check thread ID using raw MTProto fields
-                raw_topic_id = None
-                try:
-                    if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
-                        raw_reply = m._raw.reply_to
-                        raw_topic_id = getattr(raw_reply, "reply_to_top_id", None)
-                except:
-                    pass
+                # Double check thread anchor ID
+                msg_topic_anchor = getattr(m, "reply_to_top_message_id", None)
                 
-                logger.warning(f"COLLECTION RAW DEBUG | Msg:{m.id} | RAW_TOPIC:{raw_topic_id}")
-                if str(raw_topic_id) != str(s_topic):
+                # Raw fallback
+                if not msg_topic_anchor:
+                    try:
+                        if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
+                            msg_topic_anchor = getattr(m._raw.reply_to, "reply_to_top_id", None)
+                    except: pass
+                
+                logger.warning(f"COLLECTION FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
+                if str(msg_topic_anchor) != str(s_topic):
                     continue
 
                 scanned += 1
