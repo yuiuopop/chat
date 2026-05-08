@@ -280,12 +280,20 @@ def get_dashboard_markup():
 
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
-        stats = get_pair_stats(pid)
+    with db_conn() as conn:
+        c = conn.cursor()
+        # Single query to get pairs AND pending counts (Optimization)
+        c.execute("""
+            SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type,
+            (SELECT COUNT(*) FROM collected_media WHERE pair_id = target_pairs.id AND released = 0) as pending
+            FROM target_pairs
+        """)
+        pairs = c.fetchall()
+        
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, pending in pairs:
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
-        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({stats['pending']})"
+        btn_text = f"📁 {s_title} ➔ {t_title} {mon_status}{live_status} ({pending})"
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"pair_view_{pid}"))
     
     markup.add(InlineKeyboardButton("➕ Add New Pair", callback_data="pair_add_start"))
