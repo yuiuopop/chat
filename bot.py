@@ -85,9 +85,6 @@ def init_db():
                     target_title TEXT,
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
-                    filter_type TEXT DEFAULT 'all',
-                    source_thread_id BIGINT DEFAULT NULL,
-                    target_thread_id BIGINT DEFAULT NULL,
                     UNIQUE(source_id, target_id)
                 )
             """)
@@ -95,12 +92,6 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_monitoring INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN source_thread_id BIGINT DEFAULT NULL")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN target_thread_id BIGINT DEFAULT NULL")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -142,10 +133,6 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN filter_type TEXT DEFAULT 'all'")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN source_thread_id INTEGER DEFAULT NULL")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN target_thread_id INTEGER DEFAULT NULL")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
@@ -215,14 +202,14 @@ def add_target_pair(sid, tid, s_title, t_title):
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type, source_thread_id, target_thread_id FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pid):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type, source_thread_id, target_thread_id FROM target_pairs WHERE id = {p}", (pid,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, filter_type FROM target_pairs WHERE id = {p}", (pid,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -283,7 +270,7 @@ def get_dashboard_markup():
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, s_thread, t_thread in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -301,20 +288,17 @@ def show_pair_view(chat_id, message_id, pid):
             bot.send_message(chat_id, f"❌ Pair not found (ID: {pid}). It may have been deleted.")
             return
             
-        pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, s_thread, t_thread = row
+        pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type = row
         stats = get_pair_stats(pid)
         
         mon_status = "🟢 Monitoring" if is_mon else "⚪️ Idle"
         live_status = "🟢 Live Forwarding" if is_live else "⚪️ Idle"
         filter_label = filter_type.upper()
         
-        s_thread_label = f" (Topic ID: `{s_thread}`)" if s_thread else ""
-        t_thread_label = f" (Topic ID: `{t_thread}`)" if t_thread else ""
-        
         text = (
             f"📁 **Pair Management**\n\n"
-            f"Source: `{s_title}` (`{sid}`){s_thread_label}\n"
-            f"Target: `{t_title}` (`{tid}`){t_thread_label}\n\n"
+            f"Source: `{s_title}` (`{sid}`)\n"
+            f"Target: `{t_title}` (`{tid}`)\n\n"
             f"📊 Collected: `{stats['total']}`\n"
             f"📥 Pending: `{stats['pending']}`\n\n"
             f"🎯 **Filter:** `{filter_label}`\n"
@@ -337,7 +321,7 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, s_thread, t_thread = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
@@ -431,8 +415,7 @@ async def get_chat_selection_markup(prefix, category, page=0):
             icon = "📢"
             title = chat.title or "Channel"
         else:
-            is_forum = getattr(chat, "is_forum", False)
-            icon = "🏛️" if is_forum else "👥"
+            icon = "👥"
             title = chat.title or "Group"
             
         markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_id_{chat.id}"))
@@ -501,14 +484,10 @@ async def setup_automation_handlers(client: Client):
     async def auto_handler(c, m):
         # Fetch active pairs
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, s_thread, t_thread in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
             # We match numeric IDs
             if str(m.chat.id) == str(sid):
-                # Apply Topic/Thread Filter
-                if s_thread and m.message_thread_id != s_thread:
-                    continue
-                
-                # Apply Type Filter
+                # Apply filter
                 if filter_type == "media" and not m.media: continue
                 if filter_type == "text" and m.media: continue
                 
@@ -535,7 +514,7 @@ async def setup_automation_handlers(client: Client):
                 # 2) Live Forward: Copy message to target if live is ON
                 if is_live:
                     try:
-                        await m.copy(tid, message_thread_id=t_thread)
+                        await m.copy(tid)
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
@@ -601,42 +580,6 @@ def cmd_logout(message):
     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="dash_main"))
     bot.send_message(message.chat.id, "⚠️ **Logout Confirmation**\n\nThis will stop the userbot and delete the session from the database. Are you sure?", reply_markup=markup, parse_mode="Markdown")
 
-def finalize_trigger(call, uid):
-    sid = login_data[uid]["source_id"]
-    tid = login_data[uid]["target_id"]
-    s_thread = login_data[uid].get("source_thread_id")
-    t_thread = login_data[uid].get("target_thread_id")
-    
-    bot.edit_message_text("⏳ Resolving pair...", call.message.chat.id, call.message.message_id)
-    
-    async def finalize_pair():
-        try:
-            is_ok, msg = await ensure_userbot()
-            if not is_ok:
-                bot.send_message(call.message.chat.id, f"❌ Error: {msg}")
-                return
-                
-            s_chat = await userbot.get_chat(sid)
-            t_chat = await resolve_target_id(userbot, tid)
-            
-            s_title = s_chat.title or f"{s_chat.first_name or ''} {s_chat.last_name or ''}".strip() or "Source"
-            t_title = t_chat.title or f"{t_chat.first_name or ''} {t_chat.last_name or ''}".strip() or "Target"
-            
-            with db_conn() as conn:
-                c = conn.cursor()
-                p = get_placeholder()
-                if DATABASE_URL:
-                    c.execute(f"INSERT INTO target_pairs (source_id, target_id, source_title, target_title, source_thread_id, target_thread_id) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (sid, tid, s_title, t_title, s_thread, t_thread))
-                else:
-                    c.execute(f"INSERT OR IGNORE INTO target_pairs (source_id, target_id, source_title, target_title, source_thread_id, target_thread_id) VALUES (?, ?, ?, ?, ?, ?)", (sid, tid, s_title, t_title, s_thread, t_thread))
-            
-            bot.edit_message_text(f"✅ **Pair Added Successfully!**\n\nSource: `{s_title}`\nTarget: `{t_title}`", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Pair Finalize Error: {e}")
-            bot.send_message(call.message.chat.id, f"❌ Error adding pair: {e}")
-    
-    asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
-
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     global userbot
@@ -679,26 +622,7 @@ def handle_callbacks(call):
         elif parts[2] == "id":
             sid = int(parts[3])
             login_data[uid] = {"source_id": sid}
-            
-            async def check_src_forum():
-                chat = await userbot.get_chat(sid)
-                if getattr(chat, "is_forum", False):
-                    # Show topic selection
-                    markup = InlineKeyboardMarkup(row_width=1)
-                    markup.add(InlineKeyboardButton("🌟 All Topics (Full Group)", callback_data="sel_src_thread_all"))
-                    async for topic in userbot.get_forum_topics(sid):
-                        markup.add(InlineKeyboardButton(f"🧵 {topic.title}", callback_data=f"sel_src_thread_{topic.id}"))
-                    markup.add(InlineKeyboardButton("🔙 Back", callback_data="pair_add_start"))
-                    bot.edit_message_text(f"🏛️ **Forum Detected: {chat.title}**\nSelect a specific topic to source from, or choose 'All Topics':", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-                else:
-                    bot.edit_message_text("📂 **Step 2: Select Target Type**\nChoose the category of the target chat:", call.message.chat.id, call.message.message_id, reply_markup=get_type_selection_markup("sel_tgt"), parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(check_src_forum(), loop)
-
-    elif data.startswith("sel_src_thread_"):
-        bot.answer_callback_query(call.id)
-        thread_id = data.split("_")[-1]
-        login_data[uid]["source_thread_id"] = None if thread_id == "all" else int(thread_id)
-        bot.edit_message_text("📂 **Step 2: Select Target Type**\nChoose the category of the target chat:", call.message.chat.id, call.message.message_id, reply_markup=get_type_selection_markup("sel_tgt"), parse_mode="Markdown")
+            bot.edit_message_text("📂 **Step 2: Select Target Type**\nChoose the category of the target chat:", call.message.chat.id, call.message.message_id, reply_markup=get_type_selection_markup("sel_tgt"), parse_mode="Markdown")
 
     elif data.startswith("sel_tgt_"):
         bot.answer_callback_query(call.id)
@@ -715,26 +639,33 @@ def handle_callbacks(call):
             asyncio.run_coroutine_threadsafe(show_tgt_list(), loop)
         elif parts[2] == "id":
             tid = int(parts[3])
-            login_data[uid]["target_id"] = tid
+            sid = login_data[uid]["source_id"]
+            bot.edit_message_text("⏳ Resolving pair...", call.message.chat.id, call.message.message_id)
             
-            async def check_tgt_forum():
-                chat = await userbot.get_chat(tid)
-                if getattr(chat, "is_forum", False):
-                    markup = InlineKeyboardMarkup(row_width=1)
-                    markup.add(InlineKeyboardButton("🌟 General / Main Topic", callback_data="sel_tgt_thread_all"))
-                    async for topic in userbot.get_forum_topics(tid):
-                        markup.add(InlineKeyboardButton(f"🧵 {topic.title}", callback_data=f"sel_tgt_thread_{topic.id}"))
-                    markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"sel_src_id_{login_data[uid]['source_id']}"))
-                    bot.edit_message_text(f"🏛️ **Forum Detected: {chat.title}**\nSelect the target topic where media should be sent:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-                else:
-                    finalize_trigger(call, uid)
-            asyncio.run_coroutine_threadsafe(check_tgt_forum(), loop)
-
-    elif data.startswith("sel_tgt_thread_"):
-        bot.answer_callback_query(call.id)
-        thread_id = data.split("_")[-1]
-        login_data[uid]["target_thread_id"] = None if thread_id == "all" else int(thread_id)
-        finalize_trigger(call, uid)
+            async def finalize_pair():
+                try:
+                    is_ok, msg = await ensure_userbot()
+                    if not is_ok:
+                        bot.send_message(call.message.chat.id, f"❌ Error: {msg}")
+                        return
+                        
+                    s_chat = await userbot.get_chat(sid)
+                    t_chat = await resolve_target_id(userbot, tid)
+                    
+                    s_title = s_chat.title or f"{s_chat.first_name or ''} {s_chat.last_name or ''}".strip() or "Source"
+                    t_title = t_chat.title or f"{t_chat.first_name or ''} {t_chat.last_name or ''}".strip() or "Target"
+                    
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"INSERT INTO target_pairs (source_id, target_id, source_title, target_title) VALUES ({p}, {p}, {p}, {p}) ON CONFLICT DO NOTHING", (sid, tid, s_title, t_title))
+                    
+                    bot.edit_message_text(f"✅ **Pair Added Successfully!**\n\nSource: `{s_title}`\nTarget: `{t_title}`", call.message.chat.id, call.message.message_id, reply_markup=pairs_list_markup(), parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"Pair Finalize Error: {e}")
+                    bot.send_message(call.message.chat.id, f"❌ Error adding pair: {e}")
+            
+            asyncio.run_coroutine_threadsafe(finalize_pair(), loop)
 
     elif data.startswith("pair_view_"):
         bot.answer_callback_query(call.id)
@@ -940,9 +871,7 @@ def handle_callbacks(call):
             markup = InlineKeyboardMarkup(row_width=1)
             for chat in page_items:
                 title = chat.title or chat.first_name or str(chat.id)
-                is_forum = getattr(chat, "is_forum", False)
-                icon = "🏛️" if is_forum else "👁"
-                markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"user_acc_view_{chat.id}"))
+                markup.add(InlineKeyboardButton(f"👁 {title}", callback_data=f"user_acc_view_{chat.id}"))
             
             # Nav buttons
             nav = []
@@ -975,8 +904,6 @@ def handle_callbacks(call):
                 info += f"🏷 **Title:** `{title}`\n"
                 info += f"🆔 **ID:** `{chat.id}`\n"
                 info += f"📂 **Type:** `{chat.type.value if hasattr(chat.type, 'value') else chat.type}`\n"
-                if getattr(chat, "is_forum", False):
-                    info += f"🏛️ **Topics Enabled:** `Yes`\n"
                 info += f"💬 **Messages:** `{msg_count}`\n"
                 if hasattr(chat, 'members_count') and chat.members_count:
                     info += f"👥 **Members:** `{chat.members_count}`\n"
@@ -1132,7 +1059,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     
     pair = get_target_pair(pair_id)
     if not pair: return
-    pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type, s_thread, t_thread = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type = pair
     
     collected = 0
     scanned = 0
@@ -1156,10 +1083,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             if end_date and m.date > end_date: continue
             if start_date and m.date < start_date: break # History is newest to oldest
             
-            # Apply thread filter
-            if s_thread and m.message_thread_id != s_thread: continue
-            
-            # Apply type filter
+            # Apply filter
             if filter_type == "media" and not m.media: continue
             if filter_type == "text" and m.media: continue
 
@@ -1295,11 +1219,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT source_id, target_id, source_title, target_thread_id FROM target_pairs WHERE id = {p}", (pair_id,))
+            c.execute(f"SELECT source_id, target_id, source_title FROM target_pairs WHERE id = {p}", (pair_id,))
             row = c.fetchone()
         
         if not row: return
-        sid, tid_ref, s_title, t_thread = row
+        sid, tid_ref, s_title = row
     
         try:
             target_chat = await resolve_target_id(userbot, tid_ref)
@@ -1331,7 +1255,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 success = False
                 sent_msg = None
                 try:
-                    sent_msg = await userbot.copy_message(target_id, sid, smid, message_thread_id=t_thread)
+                    sent_msg = await userbot.copy_message(target_id, sid, smid)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
@@ -1345,16 +1269,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             if path:
                                 try:
                                     if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption, message_thread_id=t_thread)
+                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption)
                                     elif msg.video:
-                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption, message_thread_id=t_thread)
+                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption)
                                     else:
-                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption, message_thread_id=t_thread)
+                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            sent_msg = await userbot.send_message(target_id, msg.text, message_thread_id=t_thread)
+                            sent_msg = await userbot.send_message(target_id, msg.text)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
