@@ -806,9 +806,12 @@ def handle_callbacks(call):
 
     elif data.startswith("sel_src_topic_"):
         bot.answer_callback_query(call.id)
-        parts = data.split("_")
-        sid = int(parts[3])
-        stid = int(parts[4])
+        # Safer parsing for negative IDs with underscores
+        payload = data.replace("sel_src_topic_", "", 1)
+        sid_str, stid_str = payload.rsplit("_", 1)
+        sid = int(sid_str)
+        stid = int(stid_str)
+        
         login_data[uid] = {"source_id": sid, "source_topic_id": stid}
         async def show_tgt():
             markup = await get_chat_selection_markup("sel_tgt", 0)
@@ -854,9 +857,12 @@ def handle_callbacks(call):
 
     elif data.startswith("sel_tgt_topic_"):
         bot.answer_callback_query(call.id)
-        parts = data.split("_")
-        tid = int(parts[3])
-        ttid = int(parts[4])
+        # Safer parsing for negative IDs with underscores
+        payload = data.replace("sel_tgt_topic_", "", 1)
+        tid_str, ttid_str = payload.rsplit("_", 1)
+        tid = int(tid_str)
+        ttid = int(ttid_str)
+        
         login_data[uid]["target_id"] = tid
         login_data[uid]["target_topic_id"] = ttid
         asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
@@ -1336,9 +1342,10 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
             
-            # Topic filtering
+            # Topic filtering with fallback detection
             if s_topic:
-                if getattr(m, "message_thread_id", None) != s_topic:
+                msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
+                if msg_topic != s_topic:
                     continue
 
             scanned += 1
