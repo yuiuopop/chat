@@ -750,6 +750,20 @@ def handle_callbacks(call):
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
         asyncio.run_coroutine_threadsafe(show_src_list(), loop)
 
+    elif data.startswith("sel_src_topic_"):
+        bot.answer_callback_query(call.id)
+        # Safer parsing for negative IDs with underscores
+        payload = data.replace("sel_src_topic_", "", 1)
+        sid_str, stid_str = payload.rsplit("_", 1)
+        sid = int(sid_str)
+        stid = int(stid_str)
+        
+        login_data[uid] = {"source_id": sid, "source_topic_id": stid}
+        async def show_tgt():
+            markup = await get_chat_selection_markup("sel_tgt", 0)
+            bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+
     elif data.startswith("sel_src_"):
         bot.answer_callback_query(call.id)
         parts = data.split("_")
@@ -787,19 +801,17 @@ def handle_callbacks(call):
                     bot.send_message(call.message.chat.id, f"❌ Error: {e}")
             asyncio.run_coroutine_threadsafe(handle_src(), loop)
 
-    elif data.startswith("sel_src_topic_"):
+    elif data.startswith("sel_tgt_topic_"):
         bot.answer_callback_query(call.id)
         # Safer parsing for negative IDs with underscores
-        payload = data.replace("sel_src_topic_", "", 1)
-        sid_str, stid_str = payload.rsplit("_", 1)
-        sid = int(sid_str)
-        stid = int(stid_str)
+        payload = data.replace("sel_tgt_topic_", "", 1)
+        tid_str, ttid_str = payload.rsplit("_", 1)
+        tid = int(tid_str)
+        ttid = int(ttid_str)
         
-        login_data[uid] = {"source_id": sid, "source_topic_id": stid}
-        async def show_tgt():
-            markup = await get_chat_selection_markup("sel_tgt", 0)
-            bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+        login_data[uid]["target_id"] = tid
+        login_data[uid]["target_topic_id"] = ttid
+        asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
 
     elif data.startswith("sel_tgt_"):
         bot.answer_callback_query(call.id)
@@ -837,18 +849,6 @@ def handle_callbacks(call):
                 except Exception as e:
                     bot.send_message(call.message.chat.id, f"❌ Error: {e}")
             asyncio.run_coroutine_threadsafe(handle_tgt(), loop)
-
-    elif data.startswith("sel_tgt_topic_"):
-        bot.answer_callback_query(call.id)
-        # Safer parsing for negative IDs with underscores
-        payload = data.replace("sel_tgt_topic_", "", 1)
-        tid_str, ttid_str = payload.rsplit("_", 1)
-        tid = int(tid_str)
-        ttid = int(ttid_str)
-        
-        login_data[uid]["target_id"] = tid
-        login_data[uid]["target_topic_id"] = ttid
-        asyncio.run_coroutine_threadsafe(finalize_pair_task(call, uid), loop)
 
     elif data.startswith("pair_view_"):
         bot.answer_callback_query(call.id)
