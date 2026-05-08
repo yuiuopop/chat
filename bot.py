@@ -377,17 +377,14 @@ async def get_chat_selection_markup(prefix, page=0):
         # Fetch full chat info for the current page to ensure is_forum etc. are populated
         try:
             full_chat = await userbot.get_chat(chat.id)
-            # Definitive API check for forums
-            is_forum = False
-            if full_chat.type == enums.ChatType.SUPERGROUP:
-                try:
-                    # Attempt to fetch topics; if it fails, it's not a forum
-                    await userbot.get_forum_topics(chat.id, limit=1)
-                    is_forum = True
-                except:
-                    is_forum = getattr(full_chat, "is_forum", False) or getattr(full_chat, "forum", False)
-            
+            # Use direct attribute access with fallbacks
+            is_forum = getattr(full_chat, "is_forum", False) or getattr(chat, "is_forum", False)
             title = full_chat.title or full_chat.first_name or "Chat"
+        except Exception as e:
+            logger.error(f"Chat info fetch error for {chat.id}: {e}")
+            full_chat = chat
+            is_forum = getattr(chat, "is_forum", False)
+            title = chat.title or chat.first_name or "Chat"
         except Exception as e:
             logger.error(f"Chat info fetch error for {chat.id}: {e}")
             full_chat = chat
@@ -401,8 +398,8 @@ async def get_chat_selection_markup(prefix, page=0):
         elif chat_type == enums.ChatType.CHANNEL:
             icon = "📢"
         else:
-            icon = "🏛️" if is_forum else "👥"
-            if is_forum: title = f"{title} [Topics]"
+            icon = "📂" if is_forum else "👥"
+            if is_forum: title = f"TOPIC: {title}"
             
         markup.add(InlineKeyboardButton(f"{icon} {title}", callback_data=f"{prefix}_{chat.id}"))
     
