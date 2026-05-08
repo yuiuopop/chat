@@ -808,6 +808,10 @@ async def finalize_pair_task(call, uid):
         t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
         
         add_target_pair(sid, stid, tid, ttid, s_title, t_title)
+        logger.warning(
+            f"PAIR CREATED | SOURCE:{sid} | TARGET:{tid} | "
+            f"S_TOPIC:{stid} | T_TOPIC:{ttid}"
+        )
         
         success_text = f"✅ **Pair Added!**\n\n"
         success_text += f"Source: `{s_title}`" + (f" (Topic: `{stid}`)" if stid else "") + "\n"
