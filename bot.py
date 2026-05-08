@@ -511,8 +511,12 @@ async def setup_automation_handlers(client: Client):
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, filter_type in pairs:
-            # We match numeric IDs
-            if str(m.chat.id) == str(sid):
+            # Normalize IDs for matching (Handle -100 prefix variations)
+            m_id_norm = str(m.chat.id).replace("-100", "")
+            s_id_norm = str(sid).replace("-100", "")
+            
+            if m_id_norm == s_id_norm:
+                logger.info(f"📩 Live Match! Message in '{s_title}' (Pair {pid}). Filter: {filter_type}")
                 # Apply filter
                 if filter_type == "media" and not m.media: continue
                 if filter_type == "text" and m.media: continue
@@ -520,6 +524,7 @@ async def setup_automation_handlers(client: Client):
                 # 1) Monitor: Save to DB if monitoring is ON
                 if is_mon:
                     if m.media:
+                        m_type = m.media.value
                         m_thread = getattr(m, "message_thread_id", None)
                         with db_conn() as conn:
                             db_c = conn.cursor()
