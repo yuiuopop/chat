@@ -373,17 +373,26 @@ async def get_chat_selection_markup(prefix, page=0):
     page_chats = chats[start:end]
     
     for chat in page_chats:
-        # Detect forum/topic-enabled groups properly
+        # Advanced topic/forum detection
         is_forum = False
         try:
             full_chat = await userbot.get_chat(chat.id)
-            # Pyrogram forum detection
-            is_forum = bool(
-                getattr(full_chat, "is_forum", False) or
-                getattr(full_chat, "forum", False)
-            )
-        except Exception:
-            pass
+            # Multiple fallback checks
+            is_forum = any([
+                getattr(full_chat, "is_forum", False),
+                getattr(full_chat, "forum", False),
+                # Raw telegram attributes string check
+                "topic" in str(full_chat).lower(),
+                # String fallback
+                "is_forum=True" in str(full_chat),
+                # Forum groups usually have linked chat + supergroup
+                (
+                    chat.type == enums.ChatType.SUPERGROUP and
+                    "forum" in str(full_chat).lower()
+                )
+            ])
+        except Exception as e:
+            logger.warning(f"Forum detect failed for {chat.id}: {e}")
 
         # Better visual distinction
         if chat.type == enums.ChatType.CHANNEL:
@@ -392,7 +401,7 @@ async def get_chat_selection_markup(prefix, page=0):
         elif chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
             if is_forum:
                 icon = "🧵"
-                title = f"{chat.title} • TOPIC GROUP"
+                title = f"『 TOPIC 』 {chat.title}"
             else:
                 icon = "👥"
                 title = chat.title or "Group"
