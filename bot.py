@@ -566,17 +566,19 @@ async def setup_automation_handlers(client: Client):
                 if m.service:
                     continue
 
-                # Topic filtering if applicable using anchor message IDs
+                # Topic filtering if applicable using robust RAW extraction
                 if s_topic:
-                    # Anchor detection: Telegram forum messages link back to the topic starter message
-                    msg_topic_anchor = getattr(m, "reply_to_top_message_id", None)
-                    
-                    # Fallback for raw MTProto objects
-                    if not msg_topic_anchor:
-                        try:
-                            if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
-                                msg_topic_anchor = getattr(m._raw.reply_to, "reply_to_top_id", None)
-                        except: pass
+                    msg_topic_anchor = None
+                    try:
+                        raw = getattr(m, "_raw", None)
+                        if raw and getattr(raw, "reply_to", None):
+                            reply = raw.reply_to
+                            # Try multiple possible raw field names for the thread anchor
+                            msg_topic_anchor = getattr(reply, "reply_to_top_id", None)
+                            if not msg_topic_anchor:
+                                msg_topic_anchor = getattr(reply, "top_msg_id", None)
+                    except Exception as e:
+                        logger.error(f"LIVE TOPIC PARSE ERROR: {e}")
                     
                     logger.warning(f"TOPIC FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
                     if str(msg_topic_anchor) != str(s_topic):
@@ -1342,15 +1344,16 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                     break
                 
-                # Double check thread anchor ID
-                msg_topic_anchor = getattr(m, "reply_to_top_message_id", None)
-                
-                # Raw fallback
-                if not msg_topic_anchor:
-                    try:
-                        if hasattr(m, "_raw") and getattr(m._raw, "reply_to", None):
-                            msg_topic_anchor = getattr(m._raw.reply_to, "reply_to_top_id", None)
-                    except: pass
+                # Double check thread anchor ID using robust RAW extraction
+                msg_topic_anchor = None
+                try:
+                    raw = getattr(m, "_raw", None)
+                    if raw and getattr(raw, "reply_to", None):
+                        reply = raw.reply_to
+                        msg_topic_anchor = getattr(reply, "reply_to_top_id", None)
+                        if not msg_topic_anchor:
+                            msg_topic_anchor = getattr(reply, "top_msg_id", None)
+                except: pass
                 
                 logger.warning(f"COLLECTION FILTER | Msg:{m.id} | Anchor:{msg_topic_anchor} | Expected:{s_topic}")
                 if str(msg_topic_anchor) != str(s_topic):
