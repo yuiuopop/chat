@@ -260,8 +260,19 @@ def get_pair_stats(pair_id):
         row = c.fetchone()
         return {"total": row[0] or 0, "pending": row[1] or 0}
 
+def normalize_chat_id(chat_id):
+    """Ensures chat IDs consistently use the -100 prefix for supergroups/channels."""
+    if not chat_id: return None
+    cid_str = str(chat_id)
+    if not cid_str.startswith("-") and len(cid_str) >= 9:
+        cid_str = f"-100{cid_str}"
+    elif cid_str.startswith("-") and not cid_str.startswith("-100") and len(cid_str) >= 10:
+        # Handle cases where it's a negative ID but missing the 100 part
+        cid_str = cid_str.replace("-", "-100", 1)
+    return int(cid_str)
+
 # -----------------------------
-# Global State
+# Database Management
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN)
 userbot = None
@@ -625,6 +636,18 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage(incoming=True))
     async def auto_handler(event):
         m = event.message
+        
+        logger.warning(
+            f"\n========== NEW EVENT ==========\n"
+            f"CHAT_ID: {event.chat_id}\n"
+            f"MSG_ID: {m.id}\n"
+            f"TEXT: {(m.message or '')[:50]}\n"
+            f"MEDIA: {bool(m.media)}\n"
+            f"REPLY_TO: {getattr(m, 'reply_to_msg_id', None)}\n"
+            f"TOP_REPLY: {getattr(m, 'reply_to_top_id', None)}\n"
+            f"FORUM: {getattr(m, 'forum_topic', False)}\n"
+            f"==============================="
+        )
         # Strip -100 for reliable supergroup matching
         current_chat_id = int(str(event.chat_id).replace("-100", ""))
         
@@ -634,11 +657,20 @@ def setup_automation_handlers(client: TelegramClient):
             source_chat_id = int(str(sid).replace("-100", ""))
             
             logger.warning(
-                f"EVENT DETECTED | EVENT:{current_chat_id} | SOURCE:{source_chat_id} | MSG:{m.id}"
+                f"\n------ CHECKING PAIR ------\n"
+                f"PAIR_ID: {pid}\n"
+                f"EVENT_CHAT: {current_chat_id}\n"
+                f"PAIR_SOURCE: {source_chat_id}\n"
+                f"S_TOPIC: {s_topic}\n"
+                f"T_TOPIC: {t_topic}\n"
+                f"IS_LIVE: {is_live}\n"
+                f"IS_MIRROR: {is_mir}\n"
+                f"---------------------------"
             )
 
             # Strict integer comparison for IDs
             if current_chat_id == source_chat_id:
+                logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = (
@@ -650,7 +682,7 @@ def setup_automation_handlers(client: TelegramClient):
                         msg_topic_anchor = m.id
 
                     logger.warning(
-                        f"TOPIC FILTER | MSG:{m.id} | FOUND:{msg_topic_anchor} | NEED:{s_topic}"
+                        f"TOPIC CHECK | FOUND:{msg_topic_anchor} | EXPECTED:{s_topic}"
                     )
 
                     if str(msg_topic_anchor) != str(s_topic):
@@ -668,9 +700,6 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 # 2) Live Forward / Mirror
                 if is_live:
-                    logger.warning(
-                        f"LIVE MATCH SUCCESS | PAIR:{pid} | MSG:{m.id}"
-                    )
                     try:
                         target_topic_anchor = t_topic
                         
@@ -711,7 +740,12 @@ def setup_automation_handlers(client: TelegramClient):
 
                         # PERFORM THE FORWARD
                         logger.warning(
-                            f"FORWARDING | TARGET:{tid} | TOPIC:{target_topic_anchor}"
+                            f"\n>>>> LIVE SEND START >>>>\n"
+                            f"TARGET_CHAT: {tid}\n"
+                            f"TARGET_TOPIC: {target_topic_anchor}\n"
+                            f"TEXT: {(m.message or '')[:50]}\n"
+                            f"MEDIA: {bool(m.media)}\n"
+                            f"<<<<<<<<<<<<<<<<<<<<<<<<<"
                         )
                         await client.send_message(
                             int(tid),
@@ -719,10 +753,15 @@ def setup_automation_handlers(client: TelegramClient):
                             file=m.media if m.media else None,
                             reply_to=target_topic_anchor if target_topic_anchor else None
                         )
-                        logger.info(f"LIVE FORWARD SUCCESS: Pair {pid} | Msg {m.id} -> Chat {tid} | Topic {target_topic_anchor}")
+                        logger.warning(f"✅ LIVE SEND SUCCESS | MSG:{m.id}")
                         
                     except Exception as e:
-                        logger.error(f"LIVE FORWARD FAILED: Pair {pid} | Error: {e}")
+                        import traceback
+                        logger.error(
+                            f"\n❌ LIVE SEND FAILED\n"
+                            f"ERROR: {e}\n"
+                            f"TRACE:\n{traceback.format_exc()}"
+                        )
 
 # -----------------------------
 # Bot Handlers
@@ -806,6 +845,10 @@ async def finalize_pair_task(call, uid):
         
         s_title = getattr(s_chat, 'title', None) or getattr(s_chat, 'first_name', None) or str(sid)
         t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
+        
+        # Normalize IDs before saving to DB
+        sid = normalize_chat_id(sid)
+        tid = normalize_chat_id(tid)
         
         add_target_pair(sid, stid, tid, ttid, s_title, t_title)
         logger.warning(
