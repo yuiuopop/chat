@@ -1336,52 +1336,57 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
-                break
-            
-            # Topic filtering with deep detection
-            if s_topic:
-                msg_topic = None
-                if hasattr(m, "message_thread_id"):
-                    msg_topic = m.message_thread_id
-                elif hasattr(m, "reply_to_top_message_id"):
-                    msg_topic = m.reply_to_top_message_id
-                elif getattr(m, "reply_to_message", None):
-                    msg_topic = getattr(m.reply_to_message, "message_thread_id", None)
+        # Logic: If it's a topic group, we must use search_messages() because get_chat_history() often fails 
+        # to return thread metadata in history scraping mode.
+        if s_topic:
+            async for m in userbot.search_messages(chat_id=sid_resolved, limit=limit):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                    break
                 
-                if not msg_topic:
-                    try:
-                        if hasattr(m, "_raw"):
-                            msg_topic = getattr(m._raw, "reply_to_top_id", None)
-                    except: pass
-                
-                logger.info(f"COLLECTION TOPIC DEBUG | Msg:{m.id} | Detected:{msg_topic} | Expected:{s_topic}")
+                # Double check thread ID (Search API is much better at providing this)
+                msg_topic = getattr(m, "message_thread_id", None) or getattr(m, "reply_to_top_message_id", None)
                 if str(msg_topic) != str(s_topic):
                     continue
 
-            scanned += 1
-            await asyncio.sleep(0.05) # Anti-ban delay
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    if DATABASE_URL:
-                        c.execute(
-                            "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
-                        )
-                    else:
-                        c.execute(
-                            "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, sid_resolved, m.id, media_type, m.caption or "")
-                        )
-                    if c.rowcount > 0: collected += 1
-            if scanned % 100 == 0:
-                try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`\n\n🚀 *Downloading metadata...*", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                except: pass
+                scanned += 1
+                await asyncio.sleep(0.05)
+                if m.media:
+                    media_type = m.media.value
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if DATABASE_URL:
+                            c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                        else:
+                            c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                        if c.rowcount > 0: collected += 1
+                
+                if scanned % 50 == 0:
+                    try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                    except: pass
+        else:
+            # Normal group - standard history scan is faster
+            async for m in userbot.get_chat_history(sid_resolved, limit=limit):
+                if not running_tasks.get(task_key):
+                    bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
+                    break
+                
+                scanned += 1
+                await asyncio.sleep(0.05)
+                if m.media:
+                    media_type = m.media.value
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if DATABASE_URL:
+                            c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                        else:
+                            c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                        if c.rowcount > 0: collected += 1
+                
+                if scanned % 50 == 0:
+                    try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                    except: pass
+
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
