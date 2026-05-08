@@ -678,12 +678,13 @@ def setup_automation_handlers(client: TelegramClient):
                 f"---------------------------"
             )
 
-            # Robust matching: Direct match OR suffix match (handling -100 variants)
-            matched = (
-                int(real_event_id) == int(real_source_id)
-                or str(real_event_id).endswith(str(real_source_id).replace("-100", ""))
-                or str(real_source_id).endswith(str(real_event_id).replace("-100", ""))
-            )
+            # Clean both IDs to their bare numeric form for comparison
+            event_id_str = str(real_event_id)
+            source_id_str = str(real_source_id)
+            clean_event = event_id_str.replace("-100", "").replace("-", "")
+            clean_source = source_id_str.replace("-100", "").replace("-", "")
+
+            matched = clean_event == clean_source
 
             if matched:
                 logger.warning(f"✅ SOURCE MATCHED | PAIR:{pid}")
