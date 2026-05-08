@@ -413,6 +413,9 @@ async def get_chat_selection_markup(prefix, page=0):
                 )
             ])
         except Exception as e:
+            # inaccessible/dead chat
+            if "CHANNEL_PRIVATE" in str(e):
+                continue
             logger.warning(f"Forum detect failed for {chat.id}: {e}")
 
         # Better visual distinction
