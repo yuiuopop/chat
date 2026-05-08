@@ -543,45 +543,48 @@ async def setup_automation_handlers(client: Client):
                             else:
                                 db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, thread_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?)", (pid, sid, m.id, m_thread, 'text', m.text))
 
-                # 2) Live Forward: Copy message to target if live is ON
-                if is_live:
-                    try:
-                        # Topic Handling
-                        target_thread = None
-                        m_thread = getattr(m, "message_thread_id", None)
-                        if m_thread:
-                            cache_key = (tid, sid, m_thread)
-                            if cache_key in topic_cache:
-                                target_thread = topic_cache[cache_key]
-                            else:
-                                try:
-                                    t_chat = await resolve_target_id(userbot, str(tid))
-                                    if getattr(t_chat, "is_forum", False):
-                                        # Match source topic name to target
-                                        src_topics = await userbot.get_forum_topics(sid)
-                                        src_topic = next((t for t in src_topics if t.id == m_thread), None)
-                                        if src_topic:
-                                            t_topics = await userbot.get_forum_topics(t_chat.id)
-                                            match = next((t for t in t_topics if t.title == src_topic.title), None)
-                                            if match:
-                                                target_thread = match.id
-                                            else:
-                                                # Create matching topic in target
-                                                try:
-                                                    new_t = await userbot.create_forum_topic(t_chat.id, src_topic.title)
-                                                    target_thread = new_t.id
-                                                    logger.info(f"✨ Created new topic '{src_topic.title}' in target {tid}")
-                                                except Exception as te:
-                                                    logger.error(f"❌ Failed to create topic in target: {te}")
-                                            
-                                            if target_thread:
-                                                topic_cache[cache_key] = target_thread
-                                except Exception as fe:
-                                    logger.error(f"Topic Resolution Error for Pair {pid}: {fe}")
-                        
-                        await m.copy(tid, message_thread_id=target_thread)
-                    except Exception as e:
-                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
+                        # 2) Live Forward: Copy message to target if live is ON
+                        if is_live:
+                            try:
+                                # Topic Handling
+                                target_thread = None
+                                m_thread = getattr(m, "message_thread_id", None)
+                                if m_thread:
+                                    cache_key = (tid, sid, m_thread)
+                                    if cache_key in topic_cache:
+                                        target_thread = topic_cache[cache_key]
+                                    else:
+                                        try:
+                                            t_chat = await resolve_target_id(userbot, str(tid))
+                                            if getattr(t_chat, "is_forum", False):
+                                                # Match source topic name to target
+                                                src_topics = await userbot.get_forum_topics(sid)
+                                                src_topic = next((t for t in src_topics if t.id == m_thread), None)
+                                                if src_topic:
+                                                    t_topics = await userbot.get_forum_topics(t_chat.id)
+                                                    match = next((t for t in t_topics if t.title == src_topic.title), None)
+                                                    if match:
+                                                        target_thread = match.id
+                                                    else:
+                                                        # Create matching topic in target
+                                                        try:
+                                                            new_t = await userbot.create_forum_topic(t_chat.id, src_topic.title)
+                                                            target_thread = new_t.id
+                                                            logger.info(f"✨ Created new topic '{src_topic.title}' in target {tid}")
+                                                        except Exception as te:
+                                                            logger.error(f"❌ Failed to create topic in target: {te}")
+                                                    
+                                                    if target_thread:
+                                                        topic_cache[cache_key] = target_thread
+                                        except Exception as fe:
+                                            logger.error(f"Topic Resolution Error for Pair {pid}: {fe}")
+                                
+                                # Compatibility Fix: Only pass message_thread_id if it's NOT None
+                                kwargs = {}
+                                if target_thread: kwargs["message_thread_id"] = target_thread
+                                await m.copy(tid, **kwargs)
+                            except Exception as e:
+                                logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -1404,7 +1407,9 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 success = False
                 sent_msg = None
                 try:
-                    sent_msg = await userbot.copy_message(target_id, sid, smid, message_thread_id=target_thread)
+                    kwargs = {}
+                    if target_thread: kwargs["message_thread_id"] = target_thread
+                    sent_msg = await userbot.copy_message(target_id, sid, smid, **kwargs)
                     success = True
                 except Exception as e:
                     # If copy fails (e.g. restricted content), try download/upload
@@ -1417,17 +1422,22 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             path = await msg.download()
                             if path:
                                 try:
+                                    kwargs = {"caption": msg.caption}
+                                    if target_thread: kwargs["message_thread_id"] = target_thread
+                                    
                                     if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_id, path, caption=msg.caption, message_thread_id=target_thread)
+                                        sent_msg = await userbot.send_photo(target_id, path, **kwargs)
                                     elif msg.video:
-                                        sent_msg = await userbot.send_video(target_id, path, caption=msg.caption, message_thread_id=target_thread)
+                                        sent_msg = await userbot.send_video(target_id, path, **kwargs)
                                     else:
-                                        sent_msg = await userbot.send_document(target_id, path, caption=msg.caption, message_thread_id=target_thread)
+                                        sent_msg = await userbot.send_document(target_id, path, **kwargs)
                                     success = True
                                 finally:
                                     if os.path.exists(path): os.remove(path)
                         elif msg.text:
-                            sent_msg = await userbot.send_message(target_id, msg.text, message_thread_id=target_thread)
+                            kwargs = {}
+                            if target_thread: kwargs["message_thread_id"] = target_thread
+                            sent_msg = await userbot.send_message(target_id, msg.text, **kwargs)
                             success = True
                     except Exception as e2:
                         logger.error(f"Deep copy failed for {smid}: {e2}")
