@@ -1471,25 +1471,36 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     continue
 
                 # MIRROR MODE LOGIC
-                if is_mir and msg.reply_to:
+                if is_mir:
                     try:
-                        source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
-                        if not source_topic_id: source_topic_id = msg.id
-
-                        src_topics = await userbot(functions.channels.GetForumTopicsRequest(
-                            channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                        ))
+                        source_topic_id = None
+                        if getattr(msg, "reply_to_top_id", None):
+                            source_topic_id = msg.reply_to_top_id
+                        elif msg.reply_to:
+                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
+                        elif getattr(msg, "forum_topic", False):
+                            source_topic_id = msg.id
                         
-                        src_title = None
-                        for st in src_topics.topics:
-                            if st.top_message == source_topic_id:
-                                src_title = st.title
-                                break
+                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
                         
-                        if src_title:
-                            mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
-                            if mirrored_id:
-                                target_topic_anchor = mirrored_id
+                        if source_topic_id:
+                            src_topics = await userbot(functions.channels.GetForumTopicsRequest(
+                                channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                            ))
+                            
+                            src_title = None
+                            for st in src_topics.topics:
+                                if st.top_message == source_topic_id:
+                                    src_title = st.title
+                                    break
+                            
+                            logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
+                            
+                            if src_title:
+                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
+                                logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
+                                if mirrored_id:
+                                    target_topic_anchor = mirrored_id
                     except Exception as me:
                         logger.error(f"Release Mirror Error: {me}")
 
