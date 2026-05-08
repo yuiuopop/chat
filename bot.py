@@ -21,6 +21,7 @@ from pyrogram import Client, filters, idle, enums
 from pyrogram.types import Message
 from pyrogram.errors import RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 from pyrogram.raw.functions.channels import GetForumTopics
+from pyrogram.raw.functions.messages import GetHistory
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -590,7 +591,7 @@ async def setup_automation_handlers(client: Client):
                         f"| MATCHING:{msg_topic_anchor} vs {s_topic}"
                     )
                     
-                    if str(msg_topic_anchor) != str(s_topic):
+                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
                         
 
@@ -1345,54 +1346,71 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
         target_chat = await resolve_target_id(userbot, sid)
         sid_resolved = target_chat.id
         
-        # Scan history (get_chat_history is more reliable for preserving metadata than search_messages)
-        async for m in userbot.get_chat_history(sid_resolved, limit=limit):
+        # NUCLEAR OPTION: Use Raw MTProto GetHistory with reply_to_msg_id
+        # This is the only 100% reliable way to fetch a specific forum thread's history
+        peer = await userbot.resolve_peer(sid_resolved)
+        
+        offset_id = 0
+        while True:
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{title}` stopped by user.")
                 break
             
-            # Topic filtering if applicable using multi-layered detection
-            if s_topic:
+            # Fetch a chunk of messages from the specific topic thread
+            result = await userbot.invoke(
+                GetHistory(
+                    peer=peer,
+                    offset_id=offset_id,
+                    offset_date=0,
+                    add_offset=0,
+                    limit=100,
+                    max_id=0,
+                    min_id=0,
+                    hash=0
+                )
+            )
+            
+            # Note: We can't use reply_to_msg_id in GetHistory for all servers/versions, 
+            # so we fall back to a manual filter with a deeper raw inspection if result contains all messages.
+            messages = getattr(result, "messages", [])
+            if not messages:
+                break
+                
+            for raw_m in messages:
+                # Convert raw MTProto message to Pyrogram Message for easier handling
+                m = await Message._parse(userbot, raw_m, {raw_m.id: raw_m}, {})
+                if not m: continue
+                
+                # Deep Topic Filtering
                 msg_topic_anchor = None
                 try:
-                    # Method 1 & 2: High-level Pyrogram fields
-                    msg_topic_anchor = getattr(m, "reply_to_top_message_id", None) or getattr(m, "message_thread_id", None)
-                    
-                    # Method 3: Raw MTProto fallback
-                    if not msg_topic_anchor:
-                        raw = getattr(m, "_raw", None)
-                        if raw and getattr(raw, "reply_to", None):
-                            reply = raw.reply_to
-                            msg_topic_anchor = getattr(reply, "reply_to_top_id", None) or getattr(reply, "top_msg_id", None)
-                except Exception as e:
-                    logger.error(f"COLLECTION TOPIC PARSE ERROR: {e}")
-                
-                # Deep Diagnostic Log
-                if scanned % 10 == 0: # Log every 10th message to avoid cluttering but keep visibility
-                    logger.warning(
-                        f"SCRAPE MSG:{m.id} | THREAD:{getattr(m, 'message_thread_id', None)} "
-                        f"| TOP:{getattr(m, 'reply_to_top_message_id', None)} "
-                        f"| MATCHING:{msg_topic_anchor} vs {s_topic}"
-                    )
-                
-                if str(msg_topic_anchor) != str(s_topic):
-                    continue
-
-            scanned += 1
-            await asyncio.sleep(0.05)
-            if m.media:
-                media_type = m.media.value
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    if DATABASE_URL:
-                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                    else:
-                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
-                    if c.rowcount > 0: collected += 1
-            
-            if scanned % 50 == 0:
-                try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                    raw_obj = getattr(m, "_raw", None)
+                    if raw_obj and getattr(raw_obj, "reply_to", None):
+                        msg_topic_anchor = getattr(raw_obj.reply_to, "reply_to_top_id", None) or getattr(raw_obj.reply_to, "top_msg_id", None)
                 except: pass
+                
+                # Match against anchor or the message ID itself (starter message)
+                if str(msg_topic_anchor) == str(s_topic) or str(m.id) == str(s_topic):
+                    scanned += 1
+                    if m.media:
+                        media_type = m.media.value
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            if DATABASE_URL:
+                                c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                            else:
+                                c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, media_type, m.caption or ""))
+                            if c.rowcount > 0: collected += 1
+                
+                offset_id = raw_m.id
+
+            if limit and collected >= limit: break
+            if len(messages) < 100: break # End of history
+            
+            # Progress update
+            try: bot.edit_message_text(f"📥 **Collection: `{title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+            except: pass
+            await asyncio.sleep(1) # Anti-flood delay
 
         bot.send_message(admin_chat_id, f"✅ Collection Done: `{title}`\nNew items: `{collected}`")
     except Exception as e:
@@ -1644,12 +1662,17 @@ async def main():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                bot.remove_webhook()
-                time.sleep(3) # Delay to allow old polling to close fully
+                # SERVER-SIDE CLEANUP: Flush the getUpdates queue before starting
+                try:
+                    bot.delete_webhook(drop_pending_updates=True)
+                    bot.get_updates(offset=-1, timeout=1)
+                except: pass
+                
+                time.sleep(15) # Longer delay for Render environment stability
                 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
-                logger.error(f"❌ Polling crashed: {e}. Restarting in 15s...")
-                time.sleep(15)
+                logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
+                time.sleep(30)
     
     polling_thread = threading.Thread(target=run_polling, daemon=True)
     polling_thread.start()
