@@ -612,6 +612,26 @@ async def get_or_create_target_topic(client, target_chat_id, topic_name):
         logger.error(f"Error in topic matching: {e}")
         return None
 
+def send_via_bot(chat_id, text=None, file_path=None, media_type=None, caption=None, thread_id=None):
+    """Sends content to a chat via the Admin Bot (Telebot) to bypass Userbot peer issues."""
+    try:
+        # Bot API uses message_thread_id for topics
+        kwargs = {"message_thread_id": thread_id} if thread_id else {}
+        if file_path:
+            with open(file_path, 'rb') as f:
+                if media_type == 'photo':
+                    return bot.send_photo(chat_id, f, caption=caption, **kwargs)
+                elif media_type == 'video':
+                    return bot.send_video(chat_id, f, caption=caption, **kwargs)
+                else:
+                    # Support for documents/audio/etc.
+                    return bot.send_document(chat_id, f, caption=caption, **kwargs)
+        elif text:
+            return bot.send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        logger.error(f"send_via_bot error: {e}")
+    return None
+
 async def setup_automation_handlers(client: Client):
     @client.on_message()
     async def auto_handler(c, m):
@@ -669,7 +689,23 @@ async def setup_automation_handlers(client: Client):
                         target_chat = await resolve_target_id(c, tid)
                         target_peer = target_chat.username if target_chat.username else target_chat.id
                         source_peer = m.chat.username if m.chat.username else m.chat.id
-                        await c.copy_message(target_peer, source_peer, m.id, **kwargs)
+                        
+                        try:
+                            await c.copy_message(target_peer, source_peer, m.id, **kwargs)
+                        except Exception as copy_err:
+                            logger.info(f"Direct copy failed ({copy_err}), trying Hybrid Bot fallback...")
+                            # Hybrid Fallback: Bot delivers the content
+                            topic_id = kwargs.get("reply_to_message_id")
+                            if m.media:
+                                path = await m.download()
+                                try:
+                                    m_type = 'photo' if m.photo else ('video' if m.video else 'document')
+                                    await asyncio.to_thread(send_via_bot, tid, file_path=path, media_type=m_type, caption=m.caption, thread_id=topic_id)
+                                finally:
+                                    if os.path.exists(path): os.remove(path)
+                            elif m.text:
+                                await asyncio.to_thread(send_via_bot, tid, text=m.text, thread_id=topic_id)
+                                
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
                         try:
@@ -1494,30 +1530,28 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     sent_msg = await userbot.copy_message(target_peer, source_peer, smid, **kwargs)
                     success = True
                 except Exception as e:
-                    # If copy fails (e.g. restricted content), try download/upload
+                    # Hybrid Fallback: Use Bot to deliver
                     try:
                         msg = await userbot.get_messages(source_peer, smid)
                         if msg.empty:
                             logger.error(f"Message {smid} is empty or deleted.")
-                        elif msg.media:
-                            # Try to download
-                            path = await msg.download()
-                            if path:
-                                try:
-                                    if msg.photo:
-                                        sent_msg = await userbot.send_photo(target_peer, path, caption=msg.caption, **kwargs)
-                                    elif msg.video:
-                                        sent_msg = await userbot.send_video(target_peer, path, caption=msg.caption, **kwargs)
-                                    else:
-                                        sent_msg = await userbot.send_document(target_peer, path, caption=msg.caption, **kwargs)
-                                    success = True
-                                finally:
-                                    if os.path.exists(path): os.remove(path)
-                        elif msg.text:
-                            sent_msg = await userbot.send_message(target_peer, msg.text, **kwargs)
-                            success = True
+                        else:
+                            topic_id = kwargs.get("reply_to_message_id")
+                            if msg.media:
+                                # Try to download
+                                path = await msg.download()
+                                if path:
+                                    try:
+                                        m_type = 'photo' if msg.photo else ('video' if msg.video else 'document')
+                                        await asyncio.to_thread(send_via_bot, tid_ref, file_path=path, media_type=m_type, caption=msg.caption, thread_id=topic_id)
+                                        success = True
+                                    finally:
+                                        if os.path.exists(path): os.remove(path)
+                            elif msg.text:
+                                await asyncio.to_thread(send_via_bot, tid_ref, text=msg.text, thread_id=topic_id)
+                                success = True
                     except Exception as e2:
-                        logger.error(f"Deep copy failed for {smid}: {e2}")
+                        logger.error(f"Hybrid Release Fallback failed for {smid}: {e2}")
                         bot.send_message(admin_chat_id, f"⚠️ **Failed to send item**\nID: `{smid}`\nError: `{e2}`", parse_mode="Markdown")
                 
                 if success:
