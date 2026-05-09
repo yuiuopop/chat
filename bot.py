@@ -923,7 +923,7 @@ async def forward_to_log_targets(client, message, source_msg_id):
     if not targets: return
     
     for row in targets:
-        _, t_id, t_type, t_name = row
+        _, t_id, t_type, t_name, _ = row
         # Run vaulting in background tasks so we don't block the main thread
         asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
 
