@@ -1628,7 +1628,20 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
         sent = 0
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}")                # MIRROR MODE LOGIC
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
+        
+        for row_id, smid in items:
+            if not running_tasks.get(task_key):
+                bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
+                break
+            try:
+                target_topic_anchor = t_topic
+                msg = await userbot.get_messages(sid, ids=smid)
+                if not msg:
+                    continue
+
+                # MIRROR MODE LOGIC
                 if is_mir:
                     try:
                         # 1. Detect Source Topic
