@@ -929,20 +929,22 @@ async def forward_to_log_targets(client, message, source_msg_id):
         asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
 
 async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
-    """Heavy-duty helper to re-send and index media with forced entity resolution"""
+    """Refined robust helper to re-send and index media with global lookup fallback"""
     try:
         log_chat_id = int(log_chat_id)
-        # Force entity resolution using Peer wrappers
+        
+        # --- Robust Peer Resolution ---
         try:
-            # Try resolving as a User first (most Log Bots are users)
-            target = await client.get_input_entity(types.PeerUser(log_chat_id))
-        except:
+            # First, try the fast local cache lookup
+            target = await client.get_input_entity(log_chat_id)
+        except (ValueError, errors.rpcerrorlist.PeerIdInvalidError, Exception):
+            logger.info(f"🔍 Peer not in cache. Force-fetching entity for {log_chat_id}...")
+            # Fallback: Force the Userbot to look up the bot globally
             try:
-                # Try as a Channel/Group
-                target = await client.get_input_entity(types.PeerChannel(log_chat_id))
-            except:
-                # Final fallback to standard resolution
                 target = await client.get_entity(log_chat_id)
+            except Exception as e:
+                logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
+                return
 
         # Re-send natively
         vaulted = await client.send_message(
@@ -954,7 +956,6 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
         if vaulted and vaulted.media:
             try:
                 inner_media = vaulted.media
-                # Deep dive into media objects for packing
                 if hasattr(vaulted.media, 'photo'):
                     inner_media = vaulted.media.photo
                 elif hasattr(vaulted.media, 'document'):
@@ -962,11 +963,11 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
                 
                 fid = pack_bot_file_id(inner_media)
                 save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                logger.info(f"📤 VAULT SUCCESS: [Target: {t_name}] [Source ID: {source_msg_id}]")
+                logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} logged with ID {fid}")
             except Exception as ex:
-                logger.error(f"❌ VAULT INDEX ERROR: Failed to pack: {ex} | Media: {type(vaulted.media).__name__}")
+                logger.error(f"❌ VAULT INDEX ERROR: {ex}")
     except Exception as e:
-        logger.error(f"❌ VAULT SEND ERROR: Failed to re-send media to {t_name}: {e}")
+        logger.error(f"❌ VAULT SEND ERROR: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
