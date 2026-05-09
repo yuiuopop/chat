@@ -128,6 +128,17 @@ def init_db():
                 c.execute("ALTER TABLE target_pairs DROP CONSTRAINT IF EXISTS target_pairs_source_id_target_id_key")
                 c.execute("ALTER TABLE target_pairs ADD CONSTRAINT unique_pair_topics UNIQUE (source_id, source_topic_id, target_id, target_topic_id)")
             except: pass
+            
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS topic_mappings (
+                    id SERIAL PRIMARY KEY,
+                    source_chat_id BIGINT,
+                    source_topic_id BIGINT,
+                    target_chat_id BIGINT,
+                    target_topic_id BIGINT,
+                    UNIQUE(source_chat_id, source_topic_id, target_chat_id)
+                )
+            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
@@ -176,6 +187,17 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
             except: pass
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS topic_mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id BIGINT,
+                    source_topic_id BIGINT,
+                    target_chat_id BIGINT,
+                    target_topic_id BIGINT,
+                    UNIQUE(source_chat_id, source_topic_id, target_chat_id)
+                )
+            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -238,6 +260,42 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
             )
+
+def save_topic_mapping(s_chat, s_topic, t_chat, t_topic):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                """
+                INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT(source_chat_id, source_topic_id, target_chat_id) 
+                DO UPDATE SET target_topic_id = EXCLUDED.target_topic_id
+                """,
+                (s_chat, s_topic, t_chat, t_topic)
+            )
+        else:
+            c.execute(
+                """
+                INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_chat_id, source_topic_id, target_chat_id) 
+                DO UPDATE SET target_topic_id = excluded.target_topic_id
+                """,
+                (s_chat, s_topic, t_chat, t_topic)
+            )
+
+def get_topic_mapping(s_chat, s_topic, t_chat):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(
+            f"SELECT target_topic_id FROM topic_mappings WHERE source_chat_id = {p} AND source_topic_id = {p} AND target_chat_id = {p}",
+            (s_chat, s_topic, t_chat)
+        )
+        row = c.fetchone()
+        return row[0] if row else None
 
 def get_target_pairs():
     with db_conn() as conn:
@@ -513,21 +571,30 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
-async def get_or_create_target_topic(client, target_chat_id, topic_title):
+async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
     """
     Search for a topic by title in target chat. If not found, create it.
-    Uses topic_cache to avoid API spam.
+    Uses database mapping first, then topic_cache.
     """
     if not topic_title: return None
     
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
     
-    # 1) Check Cache
-    if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
-        return topic_cache[t_chat_id][title_key]
+    # 1) Check Database Mapping (Most Reliable)
+    if source_chat_id and source_topic_id:
+        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
+        if existing_mapping:
+            return existing_mapping
     
-    # 2) Fetch Topics from Telegram
+    # 2) Check Cache
+    if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
+        res = topic_cache[t_chat_id][title_key]
+        if source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+        return res
+    
+    # 3) Fetch Topics from Telegram
     try:
         result = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
@@ -544,17 +611,18 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title):
             topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
             
         if title_key in topic_cache[t_chat_id]:
-            return topic_cache[t_chat_id][title_key]
+            res = topic_cache[t_chat_id][title_key]
+            if source_chat_id and source_topic_id:
+                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+            return res
             
-        # 3) Create if not found
+        # 4) Create if not found
         logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
             title=topic_title
         ))
         
-        # Telethon CreateForumTopic returns updates. Usually the topic is in updates[1]
-        # But let's be safer and re-fetch briefly or search in result
         await asyncio.sleep(1)
         res_after = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
@@ -563,7 +631,11 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title):
         for t in res_after.topics:
             topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
             
-        return topic_cache[t_chat_id].get(title_key)
+        final_id = topic_cache[t_chat_id].get(title_key)
+        if final_id and source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
+            
+        return final_id
         
     except Exception as e:
         logger.error(f"Mirroring Error (get_or_create): {e}")
@@ -678,7 +750,7 @@ def setup_automation_handlers(client: TelegramClient):
                                             break
                                 
                                 if src_title:
-                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
+                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                                     if mirrored_id:
                                         target_topic_anchor = mirrored_id
                         except Exception as me:
@@ -1528,7 +1600,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                             logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
                             if src_title:
-                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
+                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                                 logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
                                 if mirrored_id:
                                     target_topic_anchor = mirrored_id
