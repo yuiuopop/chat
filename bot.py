@@ -930,16 +930,28 @@ async def forward_to_log_targets(client, message, source_msg_id):
 async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
     """Helper to re-send to vault natively and save the permanent File ID"""
     try:
+        # Resolve the entity first to avoid "Could not find input entity"
+        try:
+            target = await client.get_input_entity(int(log_chat_id))
+        except:
+            # Fallback for usernames or cached names
+            target = await client.get_entity(int(log_chat_id))
+
         # Re-send natively (no forward) to avoid "Forwarded from" tags
         vaulted = await client.send_message(
-            int(log_chat_id), 
+            target, 
             file=message.media, 
             message=message.message or ""
         )
             
         if vaulted and vaulted.media:
             try:
-                fid = pack_bot_file_id(vaulted.media)
+                # Target the inner media object for packing
+                inner_media = vaulted.media
+                if hasattr(vaulted.media, 'photo'): inner_media = vaulted.media.photo
+                elif hasattr(vaulted.media, 'document'): inner_media = vaulted.media.document
+                
+                fid = pack_bot_file_id(inner_media)
                 save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
                 logger.info(f"VAULT: Message {source_msg_id} re-sent to {t_name}")
             except Exception as ex:
