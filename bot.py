@@ -192,12 +192,17 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id SERIAL PRIMARY KEY,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     log_target_id BIGINT,
                     file_id TEXT,
                     media_type TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -283,12 +288,17 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     log_target_id BIGINT,
                     file_id TEXT,
                     media_type TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
+            except: pass
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
@@ -431,19 +441,19 @@ def remove_log_target(row_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_targets WHERE id = {p}", (row_id,))
 
-def save_media_log(source_msg_id, log_target_id, file_id, media_type):
+def save_media_log(source_chat_id, source_message_id, log_target_id, file_id, media_type):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s)",
-                (source_msg_id, log_target_id, file_id, media_type)
+                "INSERT INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s, %s) ON CONFLICT(source_chat_id, source_message_id, log_target_id) DO NOTHING",
+                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
             )
         else:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?)",
-                (source_msg_id, log_target_id, file_id, media_type)
+                "INSERT OR IGNORE INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?, ?)",
+                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
             )
 
 def get_media_logs(limit=100, media_type=None):
@@ -480,7 +490,7 @@ def get_vaulted_media_for_source(source_id, log_target_id=None):
         query = f"""
             SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption
             FROM media_logs m
-            JOIN collected_media c ON m.source_message_id = c.source_message_id
+            JOIN collected_media c ON m.source_message_id = c.source_message_id AND m.source_chat_id = c.source_chat_id
             WHERE c.source_chat_id = {p}
         """
         params = [source_id]
@@ -498,10 +508,9 @@ def get_log_bot_stats(log_target_id):
         c = conn.cursor()
         p = get_placeholder()
         query = f"""
-            SELECT p.source_id, p.source_title, COUNT(m.id) as item_count
+            SELECT DISTINCT p.source_id, p.source_title, COUNT(DISTINCT m.id) as item_count
             FROM media_logs m
-            JOIN collected_media c ON m.source_message_id = c.source_message_id
-            JOIN target_pairs p ON c.source_chat_id = p.source_id
+            JOIN target_pairs p ON m.source_chat_id = p.source_id
             WHERE m.log_target_id = {p}
             GROUP BY p.source_id, p.source_title
             ORDER BY item_count DESC
@@ -917,7 +926,7 @@ async def ensure_userbot():
     
     return True, "Connected"
 
-async def forward_to_log_targets(client, message, source_msg_id):
+async def forward_to_log_targets(client, message, source_chat_id, source_msg_id):
     if not message or not message.media: return
     targets = get_log_targets()
     if not targets: return
@@ -925,9 +934,9 @@ async def forward_to_log_targets(client, message, source_msg_id):
     for row in targets:
         _, t_id, t_type, t_name, _ = row
         # Run vaulting in background tasks so we don't block the main thread
-        asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
+        asyncio.create_task(vault_media(client, message, source_chat_id, t_id, source_msg_id, t_name))
 
-async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
+async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
         # Try native forward first (efficient)
@@ -940,7 +949,7 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
         if vaulted and vaulted.media:
             try:
                 fid = pack_bot_file_id(vaulted.media)
-                save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
+                save_media_log(source_chat_id, source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
                 logger.info(f"VAULT: Message {source_msg_id} saved to {t_name}")
             except Exception as ex:
                 logger.error(f"VAULT ERROR: Failed to pack file_id: {ex}")
@@ -991,7 +1000,7 @@ def setup_automation_handlers(client: TelegramClient):
                             )
                     
                     # Instantly send to log targets
-                    await forward_to_log_targets(client, m, m.id)
+                    await forward_to_log_targets(client, m, sid, m.id)
 
                 if not is_live: continue
 
@@ -2309,7 +2318,7 @@ def setup_log_bot(token):
             with db_conn() as conn:
                 c = conn.cursor()
                 # Ensure we only fetch files vaulted in THIS specific bot's chat
-                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND log_target_id = %s LIMIT 1", (smid, bot_id))
+                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND source_chat_id = %s AND log_target_id = %s LIMIT 1", (smid, message.chat.id, bot_id))
                 res = c.fetchone()
             
             if res:
