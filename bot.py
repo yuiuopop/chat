@@ -2168,12 +2168,21 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
 async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
     try:
+        # --- ID CORRECTION LOGIC ---
+        raw_id = str(target_id).strip()
+        if not raw_id.startswith("-"):
+            # If it's a positive number, it's likely a group ID missing the prefix
+            target_chat_id = int(f"-100{raw_id}")
+        else:
+            target_chat_id = int(raw_id)
+        # ---------------------------
+
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
-            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found.")
+            sender_bot.send_message(admin_chat_id, f"❌ No media found for source `{source_id}`.")
             return
             
-        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction into `{target_id}`...")
+        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction into Group: `{target_chat_id}`...")
         
         sent = 0
         failed = 0
@@ -2184,16 +2193,16 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                 # Create the topic in the new group if it existed in the old one
                 if topic_title:
                     try:
-                        dest_topic_id = await get_or_create_target_topic(userbot, int(target_id), topic_title)
+                        dest_topic_id = await get_or_create_target_topic(userbot, target_chat_id, topic_title)
                     except: pass
 
                 m_type_lower = (m_type or "").lower()
                 if "photo" in m_type_lower:
-                    sender_bot.send_photo(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
+                    sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 elif "video" in m_type_lower:
-                    sender_bot.send_video(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
+                    sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 else:
-                    sender_bot.send_document(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
+                    sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 
                 sent += 1
                 await asyncio.sleep(2.5) # Protection from rate limits
