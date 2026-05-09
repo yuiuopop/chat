@@ -757,12 +757,11 @@ def setup_automation_handlers(client: TelegramClient):
                 # --- IMPROVED TOPIC DETECTION ---
                 msg_topic_anchor = None
                 if m.reply_to:
-                    # Logic: if reply_to_top_id exists, that's the topic. 
-                    # If not, the reply_to_msg_id IS the topic header.
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-                
-                # Check if message is actually the topic header itself
-                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                    msg_topic_anchor = (
+                        getattr(m.reply_to, "reply_to_top_id", None)
+                        or getattr(m.reply_to, "reply_to_msg_id", None)
+                    )
+                elif getattr(m, "forum_topic", False):
                     msg_topic_anchor = m.id
 
                 # Filter: If the pair is set to a specific topic, skip messages not in it
@@ -782,6 +781,7 @@ def setup_automation_handlers(client: TelegramClient):
                             db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.message or ""))
                 
                 # 2) Live Forward / Mirror
+                source_topic_id = None
                 if is_live:
                     target_topic_anchor = t_topic
                     
@@ -792,16 +792,14 @@ def setup_automation_handlers(client: TelegramClient):
                             if source_topic_id:
                                 # Look for title if we don't have it to create in target
                                 src_title = None
-                                forum = getattr(m.reply_to, "forum_topic", None) if m.reply_to else None
-                                if forum: src_title = getattr(forum, "title", None)
                                 
-                                if not src_title:
-                                    # Fallback: Fetch topic title from Telegram
-                                    src_topics = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                                    for st in src_topics.topics:
-                                        if source_topic_id in [st.id, st.top_message]:
-                                            src_title = st.title
-                                            break
+                                # Fetch topic title from Telegram (only reliable source)
+                                src_topics = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                                for st in src_topics.topics:
+                                    if str(st.top_message) == str(source_topic_id):
+                                        src_title = st.title
+                                        source_topic_id = st.top_message # Normalize
+                                        break
                                 
                                 if src_title:
                                     target_topic_anchor = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
@@ -809,39 +807,66 @@ def setup_automation_handlers(client: TelegramClient):
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
-                        # Resolve mapping for replies within a topic
+                        # Resolve reply structure inside the target topic
                         reply_to_val = None
-                        if getattr(m, "reply_to_msg_id", None):
-                            # Try to find if the message being replied to was already mirrored
-                            reply_to_val = get_message_mapping(sid, m.reply_to_msg_id, tid)
-                        
-                        # THE FIX: Construct a proper Topic Reply Header
-                        reply_header = None
-                        if reply_to_val:
-                            # If it's a reply to a mirrored message within a topic
-                            reply_header = types.InputReplyToMessage(
-                                reply_to_msg_id=int(reply_to_val),
-                                top_msg_id=int(target_topic_anchor) if target_topic_anchor else None
+                        if m.reply_to:
+                            source_reply_id = (
+                                getattr(m.reply_to, "reply_to_top_id", None)
+                                or getattr(m.reply_to, "reply_to_msg_id", None)
                             )
-                        elif target_topic_anchor:
-                            # If it's a new post in the topic
-                            reply_header = types.InputReplyToMessage(
-                                reply_to_msg_id=int(target_topic_anchor)
+                            if source_reply_id:
+                                reply_to_val = get_message_mapping(
+                                    sid,
+                                    source_reply_id,
+                                    tid
+                                )
+                        
+                        sent_msg = None
+                        if reply_to_val:
+                            # 1. Direct Reply within the topic
+                            if m.media:
+                                sent_msg = await client.send_file(
+                                    entity=tid,
+                                    file=m.media,
+                                    caption=m.message or "",
+                                    reply_to=int(reply_to_val)
+                                )
+                            else:
+                                sent_msg = await client.send_message(
+                                    entity=tid,
+                                    message=m.message or "",
+                                    reply_to=int(reply_to_val)
+                                )
+                        else:
+                            # 2. Topic Header / Thread Anchor
+                            anchor = int(target_topic_anchor) if target_topic_anchor else None
+                            
+                            logger.warning(
+                                f"FORWARD DEBUG | "
+                                f"source_topic={source_topic_id} | "
+                                f"target_topic={target_topic_anchor} | "
+                                f"reply_map={reply_to_val}"
                             )
 
-                        # Send with the reply_to object
-                        sent_msg = await client.send_message(
-                            entity=tid,
-                            message=m.message or "",
-                            file=m.media if m.media else None,
-                            reply_to=reply_header 
-                        )
+                            if m.media:
+                                sent_msg = await client.send_file(
+                                    entity=tid,
+                                    file=m.media,
+                                    caption=m.message or "",
+                                    reply_to=anchor
+                                )
+                            else:
+                                sent_msg = await client.send_message(
+                                    entity=tid,
+                                    message=m.message or "",
+                                    reply_to=anchor
+                                )
                         
                         if sent_msg:
                             save_message_mapping(sid, m.id, tid, sent_msg.id)
                             
                     except Exception as e:
-                        logger.error(f"Live Forward Send Error: {e}")
+                        logger.error(f"Live Forward Error: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -1631,7 +1656,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 if is_mir:
                     s_top = None
                     if msg.reply_to:
-                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or msg.reply_to.reply_to_msg_id
+                        s_top = (
+                            getattr(msg.reply_to, "reply_to_top_id", None)
+                            or getattr(msg.reply_to, "reply_to_msg_id", None)
+                        )
+                    elif getattr(msg, "forum_topic", False):
+                        s_top = msg.id
                     
                     if s_top:
                         # Priority check database mapping
@@ -1641,27 +1671,46 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
                 # Resolve reply mapping
                 reply_to_val = None
-                if getattr(msg, "reply_to_msg_id", None):
-                    reply_to_val = get_message_mapping(sid_ref, msg.reply_to_msg_id, tid_ref)
+                if msg.reply_to:
+                    source_reply_id = (
+                        getattr(msg.reply_to, "reply_to_top_id", None)
+                        or getattr(msg.reply_to, "reply_to_msg_id", None)
+                    )
+                    if source_reply_id:
+                        reply_to_val = get_message_mapping(sid_ref, source_reply_id, tid_ref)
 
-                # Construct Topic Header
-                final_reply_header = None
+                sent_msg = None
                 if reply_to_val:
-                    final_reply_header = types.InputReplyToMessage(
-                        reply_to_msg_id=int(reply_to_val),
-                        top_msg_id=int(target_topic_anchor) if target_topic_anchor else None
-                    )
-                elif target_topic_anchor:
-                    final_reply_header = types.InputReplyToMessage(
-                        reply_to_msg_id=int(target_topic_anchor)
-                    )
-
-                sent_msg = await userbot.send_message(
-                    entity=target_chat,
-                    message=msg.message or "",
-                    file=msg.media,
-                    reply_to=final_reply_header
-                )
+                    # 1. Direct Reply within the topic
+                    if msg.media:
+                        sent_msg = await userbot.send_file(
+                            entity=target_chat,
+                            file=msg.media,
+                            caption=msg.message or "",
+                            reply_to=int(reply_to_val)
+                        )
+                    else:
+                        sent_msg = await userbot.send_message(
+                            entity=target_chat,
+                            message=msg.message or "",
+                            reply_to=int(reply_to_val)
+                        )
+                else:
+                    # 2. Topic Header / Thread Anchor
+                    anchor = int(target_topic_anchor) if target_topic_anchor else None
+                    if msg.media:
+                        sent_msg = await userbot.send_file(
+                            entity=target_chat,
+                            file=msg.media,
+                            caption=msg.message or "",
+                            reply_to=anchor
+                        )
+                    else:
+                        sent_msg = await userbot.send_message(
+                            entity=target_chat,
+                            message=msg.message or "",
+                            reply_to=anchor
+                        )
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
