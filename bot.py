@@ -747,32 +747,35 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
+        # Log for debugging - you can remove this later
         print(f"Incoming msg from {m.chat_id} | ReplyTo: {m.reply_to}")
-        # Fetch active pairs
+        
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             if str(abs(int(m.chat_id))) == str(abs(int(sid))):
-                # Topic filtering (0 or None means entire group/chat)
+                
+                # --- IMPROVED TOPIC DETECTION ---
+                msg_topic_anchor = None
+                if m.reply_to:
+                    # Logic: if reply_to_top_id exists, that's the topic. 
+                    # If not, the reply_to_msg_id IS the topic header.
+                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+                
+                # Check if message is actually the topic header itself
+                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                    msg_topic_anchor = m.id
+
+                # Filter: If the pair is set to a specific topic, skip messages not in it
                 if s_topic not in [None, 0, "0"]:
-                    # IMPROVED DETECTION
-                    msg_topic_anchor = None
-                    if m.reply_to:
-                        # If direct post in topic, msg_id is the Topic ID
-                        # If reply to someone else, top_id is the Topic ID
-                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-
-                    # Check if message is actually the topic header itself
-                    if not msg_topic_anchor and getattr(m, 'forum_topic', False):
-                        msg_topic_anchor = m.id
-
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
-                # 1) Monitor
+                # 1) Monitor logic
                 if is_mon and m.media:
                     m_type = type(m.media).__name__
                     with db_conn() as conn:
                         db_c = conn.cursor()
+                        p = get_placeholder()
                         if DATABASE_URL:
                             db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.message or ""))
                         else:
@@ -782,97 +785,59 @@ def setup_automation_handlers(client: TelegramClient):
                 if is_live:
                     target_topic_anchor = t_topic
                     
-                    # Mirroring Logic
                     if is_mir:
                         try:
-                            # 1. Detect Source Topic
-                            source_topic_id = None
-                            source_topic_title = None
-                            
-                            # A) Check Action (Topic Creation/Edit)
-                            if getattr(m, "action", None):
-                                if isinstance(m.action, (types.MessageActionTopicCreate, types.MessageActionTopicEdit)):
-                                    source_topic_id = m.id
-                                    source_topic_title = getattr(m.action, "title", None)
-
-                            # B) Check Reply Metadata (Most Common)
-                            if not source_topic_id and getattr(m, "reply_to", None):
-                                forum = getattr(m.reply_to, "forum_topic", None)
-                                if forum:
-                                    source_topic_title = getattr(forum, "title", None)
-                                
-                                # Canonical anchor search
-                                source_topic_id = (
-                                    getattr(m, "reply_to_top_id", None)
-                                    or getattr(m.reply_to, "reply_to_top_id", None)
-                                    or getattr(m.reply_to, "reply_to_msg_id", None)
-                                )
-
-                            # C) Check Forum Flag
-                            if not source_topic_id and getattr(m, "forum_topic", False):
-                                source_topic_id = m.id
-                            
+                            # Dynamic Topic Mirroring
+                            source_topic_id = msg_topic_anchor
                             if source_topic_id:
-                                # 2. Check Database Mapping FIRST (Efficiency)
-                                mapped_target = get_topic_mapping(sid, source_topic_id, tid)
-                                if mapped_target:
-                                    target_topic_anchor = mapped_target
-                                else:
-                                    # 3. Canonical Normalization & Resolution
-                                    src_title = source_topic_title
-                                    if not src_title:
-                                        src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                            channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                        ))
-                                        matched_topic = None
-                                        for st in src_topics.topics:
-                                            if source_topic_id in [st.id, st.top_message]:
-                                                matched_topic = st
-                                                break
-                                        if matched_topic:
-                                            src_title = matched_topic.title
-                                            source_topic_id = matched_topic.top_message # Normalize to top_message
-                                    
-                                    if src_title:
-                                        target_topic_anchor = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
+                                # Look for title if we don't have it to create in target
+                                src_title = None
+                                forum = getattr(m.reply_to, "forum_topic", None) if m.reply_to else None
+                                if forum: src_title = getattr(forum, "title", None)
+                                
+                                if not src_title:
+                                    # Fallback: Fetch topic title from Telegram
+                                    src_topics = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                                    for st in src_topics.topics:
+                                        if source_topic_id in [st.id, st.top_message]:
+                                            src_title = st.title
+                                            break
+                                
+                                if src_title:
+                                    target_topic_anchor = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                         except Exception as me:
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
-                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
-                        
-                        # 3. Reply Mirroring
-                        # Resolve target: prioritize mapped message reply, then topic anchor
+                        # Resolve reply structure inside the target topic
                         reply_to_val = None
                         if getattr(m, "reply_to_msg_id", None):
+                            # Try to find if the message being replied to was already mirrored
                             reply_to_val = get_message_mapping(sid, m.reply_to_msg_id, tid)
                         
-                        # Stabilized Anchor: use the specific reply if found, else the topic header
-                        final_anchor = reply_to_val if reply_to_val else target_topic_anchor
-                        if final_anchor:
-                            final_anchor = int(final_anchor)
-
-                        sent_msg = None
+                        # THE CRITICAL FIX: If it's a specific reply, use it. 
+                        # Otherwise, use the topic header (target_topic_anchor).
+                        final_reply_id = reply_to_val if reply_to_val else target_topic_anchor
+                        
                         if m.media:
                             sent_msg = await client.send_file(
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                reply_to=final_anchor
+                                reply_to=int(final_reply_id) if final_reply_id else None
                             )
                         else:
                             sent_msg = await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                reply_to=final_anchor
+                                reply_to=int(final_reply_id) if final_reply_id else None
                             )
                         
-                        # 4. Save Message Mapping
                         if sent_msg:
                             save_message_mapping(sid, m.id, tid, sent_msg.id)
                             
                     except Exception as e:
-                        logger.error(f"Live Forward Error for Pair {pid}: {e}")
+                        logger.error(f"Live Forward Error: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -1624,14 +1589,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             row = c.fetchone()
         
         if not row: return
-        sid, tid_ref, s_title, is_mir, s_topic, t_topic = row
+        sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic = row
     
         try:
-            # Pre-resolve peers to avoid PeerIdInvalid during tasks
-            source_chat = await resolve_target_id(userbot, sid)
+            # Pre-resolve entities to warm up Telethon cache and ensure access
+            source_chat = await resolve_target_id(userbot, sid_ref)
             target_chat = await resolve_target_id(userbot, tid_ref)
-            target_id = target_chat.id
-            sid = source_chat.id # Use the resolved int ID
         except Exception as e:
             bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of both chats.")
             return
@@ -1652,103 +1615,65 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
         
         for row_id, smid in items:
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
-                break
+            if not running_tasks.get(task_key): break
+            
             try:
+                msg = await userbot.get_messages(sid_ref, ids=smid)
+                if not msg: continue
+
                 target_topic_anchor = t_topic
-                msg = await userbot.get_messages(sid, ids=smid)
-                if not msg:
-                    continue
-
-                # MIRROR MODE LOGIC
-                if is_mir:
-                    try:
-                        # 1. Detect Source Topic
-                        source_topic_id = None
-                        source_topic_title = None
-                        
-                        # A) Check Action
-                        if getattr(msg, "action", None):
-                            if isinstance(msg.action, (types.MessageActionTopicCreate, types.MessageActionTopicEdit)):
-                                source_topic_id = msg.id
-                                source_topic_title = getattr(msg.action, "title", None)
-
-                        # B) Check Reply Metadata
-                        if not source_topic_id and getattr(msg, "reply_to", None):
-                            forum = getattr(msg.reply_to, "forum_topic", None)
-                            if forum:
-                                source_topic_title = getattr(forum, "title", None)
-                            source_topic_id = (
-                                getattr(msg, "reply_to_top_id", None)
-                                or getattr(msg.reply_to, "reply_to_top_id", None)
-                                or getattr(msg.reply_to, "reply_to_msg_id", None)
-                            )
-                        
-                        # C) Check Forum Flag
-                        if not source_topic_id and getattr(msg, "forum_topic", False):
-                            source_topic_id = msg.id
-                        
-                        if source_topic_id:
-                            # 2. Check Database Mapping FIRST
-                            mapped_target = get_topic_mapping(sid, source_topic_id, tid_ref)
-                            if mapped_target:
-                                target_topic_anchor = mapped_target
-                            else:
-                                # 3. Canonical Normalization & Resolution
-                                src_title = source_topic_title
-                                if not src_title:
-                                    src_topics = await userbot(functions.channels.GetForumTopicsRequest(
-                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                    ))
-                                    matched_topic = None
-                                    for st in src_topics.topics:
-                                        if source_topic_id in [st.id, st.top_message]:
-                                            matched_topic = st
-                                            break
-                                    if matched_topic:
-                                        src_title = matched_topic.title
-                                        source_topic_id = matched_topic.top_message # Normalize
-                                
-                                if src_title:
-                                    target_topic_anchor = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
-                    except Exception as me:
-                        logger.error(f"Release Mirror Error: {me}")
-
-                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
                 
-                # 3. Reply Mirroring
+                # Handle Mirroring ID detection for release
+                if is_mir:
+                    s_top = None
+                    if msg.reply_to:
+                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or msg.reply_to.reply_to_msg_id
+                    
+                    if s_top:
+                        # Priority check database mapping
+                        mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
+                        if mapped:
+                            target_topic_anchor = mapped
+
+                # Resolve reply mapping
                 reply_to_val = None
                 if getattr(msg, "reply_to_msg_id", None):
-                    reply_to_val = get_message_mapping(sid, msg.reply_to_msg_id, tid_ref)
+                    reply_to_val = get_message_mapping(sid_ref, msg.reply_to_msg_id, tid_ref)
 
-                # Stabilized Anchor
-                final_anchor = reply_to_val if reply_to_val else target_topic_anchor
-                if final_anchor:
-                    final_anchor = int(final_anchor)
+                # THE CRITICAL FIX: If it's a specific reply, use it. 
+                # Otherwise, use the topic header (target_topic_anchor).
+                final_reply_id = reply_to_val if reply_to_val else target_topic_anchor
 
-                sent_msg = await userbot.send_message(
-                    entity=tid_ref,
-                    message=msg.message or "",
-                    file=msg.media,
-                    reply_to=final_anchor
-                )
+                sent_msg = None
+                if msg.media:
+                    sent_msg = await userbot.send_file(
+                        entity=target_chat,
+                        file=msg.media,
+                        caption=msg.message or "",
+                        reply_to=int(final_reply_id) if final_reply_id else None
+                    )
+                else:
+                    sent_msg = await userbot.send_message(
+                        entity=target_chat,
+                        message=msg.message or "",
+                        reply_to=int(final_reply_id) if final_reply_id else None
+                    )
                 
-                # 4. Save Message Mapping
                 if sent_msg:
-                    save_message_mapping(sid, msg.id, tid_ref, sent_msg.id)
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                
                 sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
-                logger.error(f"Release error for item {smid}: {e}")
-                
+                logger.error(f"Release error: {e}")
+
         bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items.")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
