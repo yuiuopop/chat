@@ -933,20 +933,29 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
     try:
         log_chat_id = int(log_chat_id)
         
-        # --- Robust Peer Resolution ---
+        # --- 1. Robust Peer Resolution ---
+        target = None
         try:
-            # First, try the fast local cache lookup
+            # Attempt fast resolution
             target = await client.get_input_entity(log_chat_id)
         except (ValueError, errors.rpcerrorlist.PeerIdInvalidError, Exception):
-            logger.info(f"🔍 Peer not in cache. Force-fetching entity for {log_chat_id}...")
-            # Fallback: Force the Userbot to look up the bot globally
+            logger.info(f"🔍 Peer {log_chat_id} not in cache. Fetching dialogs to warm up...")
             try:
-                target = await client.get_entity(log_chat_id)
+                # Force the userbot to 'see' the bot by checking recent chats
+                async for dialog in client.iter_dialogs(limit=100):
+                    if dialog.id == log_chat_id:
+                        target = dialog.input_entity
+                        break
+                
+                # If still not found, try the heavy lookup
+                if not target:
+                    target = await client.get_entity(log_chat_id)
             except Exception as e:
                 logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
                 return
 
-        # Re-send natively
+        # --- 2. Send Natively ---
+        # We use the 'target' resolved above
         vaulted = await client.send_message(
             target, 
             file=message.media, 
@@ -955,15 +964,23 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
             
         if vaulted and vaulted.media:
             try:
+                # --- 3. Robust Media Packing (Fixes 'location' error) ---
+                # We must target the parent Photo or Document object, not the PhotoSize array
                 inner_media = vaulted.media
-                if hasattr(vaulted.media, 'photo'):
-                    inner_media = vaulted.media.photo
-                elif hasattr(vaulted.media, 'document'):
-                    inner_media = vaulted.media.document
                 
-                fid = pack_bot_file_id(inner_media)
-                save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} logged with ID {fid}")
+                if isinstance(vaulted.media, types.MessageMediaPhoto):
+                    inner_media = vaulted.media.photo  # This is the 'Photo' object pack_bot_file_id wants
+                elif isinstance(vaulted.media, types.MessageMediaDocument):
+                    inner_media = vaulted.media.document # This is the 'Document' object
+                
+                # Double check we aren't trying to pack a list or a PhotoSize
+                if hasattr(inner_media, 'sizes') or hasattr(inner_media, 'id'):
+                    fid = pack_bot_file_id(inner_media)
+                    save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
+                    logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} logged with ID {fid}")
+                else:
+                    logger.warning(f"⚠️ Media type {type(inner_media)} might not be packable.")
+                    
             except Exception as ex:
                 logger.error(f"❌ VAULT INDEX ERROR: {ex}")
     except Exception as e:
