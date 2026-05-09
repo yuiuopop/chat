@@ -700,9 +700,12 @@ def setup_automation_handlers(client: TelegramClient):
                 if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = getattr(m, "reply_to_top_id", None)
                     if not msg_topic_anchor and m.reply_to:
-                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
+                        msg_topic_anchor = (
+                            getattr(m.reply_to, "reply_to_top_id", None) 
+                            or getattr(m.reply_to, "reply_to_msg_id", None)
+                        )
                     
-                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
+                    if str(msg_topic_anchor) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -722,20 +725,25 @@ def setup_automation_handlers(client: TelegramClient):
                     # Mirroring Logic
                     if is_mir:
                         try:
-                            source_topic_id = getattr(m, "reply_to_top_id", None)
-
-                            # Starter message of forum topic
-                            if not source_topic_id and getattr(m, "forum_topic", False):
+                            source_topic_id = None
+                            # Normal topic messages
+                            if getattr(m, "reply_to_top_id", None):
+                                source_topic_id = m.reply_to_top_id
+                            # Replies inside topic
+                            elif getattr(m, "reply_to", None):
+                                source_topic_id = (
+                                    getattr(m.reply_to, "reply_to_top_id", None)
+                                    or getattr(m.reply_to, "reply_to_msg_id", None)
+                                )
+                            # Topic starter message
+                            elif getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
-
-                            # Absolute fallback
-                            if not source_topic_id and getattr(m, "reply_to", None):
-                                source_topic_id = getattr(m.reply_to, "reply_to_top_id", None)
 
                             logger.warning(
                                 f"SOURCE TOPIC DETECT | "
                                 f"MSG:{m.id} | "
-                                f"TOPIC:{source_topic_id}"
+                                f"TOPIC:{source_topic_id} | "
+                                f"FORUM:{getattr(m, 'forum_topic', False)}"
                             )
                             
                             if source_topic_id:
@@ -775,13 +783,13 @@ def setup_automation_handlers(client: TelegramClient):
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                reply_to=target_topic_anchor
+                                comment_to=target_topic_anchor
                             )
                         else:
                             await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                reply_to=target_topic_anchor
+                                comment_to=target_topic_anchor
                             )
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
@@ -1576,20 +1584,25 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # MIRROR MODE LOGIC
                 if is_mir:
                     try:
-                        source_topic_id = getattr(msg, "reply_to_top_id", None)
-
-                        # Starter message of forum topic
-                        if not source_topic_id and getattr(msg, "forum_topic", False):
+                        source_topic_id = None
+                        # Normal topic messages
+                        if getattr(msg, "reply_to_top_id", None):
+                            source_topic_id = msg.reply_to_top_id
+                        # Replies inside topic
+                        elif getattr(msg, "reply_to", None):
+                            source_topic_id = (
+                                getattr(msg.reply_to, "reply_to_top_id", None)
+                                or getattr(msg.reply_to, "reply_to_msg_id", None)
+                            )
+                        # Topic starter message
+                        elif getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-
-                        # Absolute fallback
-                        if not source_topic_id and getattr(msg, "reply_to", None):
-                            source_topic_id = getattr(msg.reply_to, "reply_to_top_id", None)
 
                         logger.warning(
                             f"SOURCE TOPIC DETECT | "
                             f"MSG:{msg.id} | "
-                            f"TOPIC:{source_topic_id}"
+                            f"TOPIC:{source_topic_id} | "
+                            f"FORUM:{getattr(msg, 'forum_topic', False)}"
                         )
                         
                         if source_topic_id:
@@ -1628,7 +1641,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    reply_to=target_topic_anchor
+                    comment_to=target_topic_anchor
                 )
                 
                 with db_conn() as conn:
