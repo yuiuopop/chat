@@ -929,33 +929,30 @@ async def forward_to_log_targets(client, message, source_msg_id):
         asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
 
 async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
-    """Refined robust helper to re-send and index media with global lookup fallback"""
+    """Aggressive resolution helper to re-send and index media"""
     try:
         log_chat_id = int(log_chat_id)
-        
-        # --- 1. Robust Peer Resolution ---
         target = None
+
+        # 1. PEER RESOLUTION (The 3-Step Strategy)
         try:
-            # Attempt fast resolution
             target = await client.get_input_entity(log_chat_id)
         except (ValueError, errors.rpcerrorlist.PeerIdInvalidError, Exception):
-            logger.info(f"🔍 Peer {log_chat_id} not in cache. Fetching dialogs to warm up...")
+            logger.info(f"🔍 Peer {log_chat_id} not in cache. Attempting manual fetch...")
             try:
-                # Force the userbot to 'see' the bot by checking recent chats
-                async for dialog in client.iter_dialogs(limit=100):
-                    if dialog.id == log_chat_id:
-                        target = dialog.input_entity
-                        break
-                
-                # If still not found, try the heavy lookup
-                if not target:
-                    target = await client.get_entity(log_chat_id)
+                # Force refresh of internal entity database
+                await client(functions.messages.GetDialogsRequest(
+                    offset_date=None, offset_id=0, 
+                    offset_peer=types.InputPeerEmpty(), 
+                    limit=100, hash=0
+                ))
+                # Final attempt: direct server lookup
+                target = await client.get_entity(log_chat_id)
             except Exception as e:
                 logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
                 return
 
-        # --- 2. Send Natively ---
-        # We use the 'target' resolved above
+        # 2. SEND NATIVELY
         vaulted = await client.send_message(
             target, 
             file=message.media, 
@@ -964,27 +961,30 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
             
         if vaulted and vaulted.media:
             try:
-                # --- 3. Robust Media Packing (Fixes 'location' error) ---
-                # We must target the parent Photo or Document object, not the PhotoSize array
-                inner_media = vaulted.media
+                # 3. ROBUST MEDIA PACKING (Fixes 'PhotoSize' error)
+                # Ensure we are passing the PARENT object (Photo/Document), not a size list
+                inner_media = None
                 
                 if isinstance(vaulted.media, types.MessageMediaPhoto):
-                    inner_media = vaulted.media.photo  # This is the 'Photo' object pack_bot_file_id wants
+                    inner_media = vaulted.media.photo  # The 'Photo' object
                 elif isinstance(vaulted.media, types.MessageMediaDocument):
-                    inner_media = vaulted.media.document # This is the 'Document' object
-                
-                # Double check we aren't trying to pack a list or a PhotoSize
-                if hasattr(inner_media, 'sizes') or hasattr(inner_media, 'id'):
+                    inner_media = vaulted.media.document # The 'Document' object
+                elif hasattr(vaulted.media, 'photo'):
+                    inner_media = vaulted.media.photo
+                elif hasattr(vaulted.media, 'document'):
+                    inner_media = vaulted.media.document
+
+                if inner_media and not isinstance(inner_media, list):
                     fid = pack_bot_file_id(inner_media)
                     save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                    logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} logged with ID {fid}")
+                    logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} -> {t_name}")
                 else:
-                    logger.warning(f"⚠️ Media type {type(inner_media)} might not be packable.")
+                    logger.error(f"❌ VAULT INDEX ERROR: inner_media is invalid or list: {type(inner_media)}")
                     
             except Exception as ex:
-                logger.error(f"❌ VAULT INDEX ERROR: {ex}")
+                logger.error(f"❌ VAULT INDEX CRASH: {ex}")
     except Exception as e:
-        logger.error(f"❌ VAULT SEND ERROR: {e}")
+        logger.error(f"❌ VAULT SEND CRASH: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
