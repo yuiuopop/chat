@@ -179,11 +179,13 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS log_targets (
                     id SERIAL PRIMARY KEY,
-                    target_id BIGINT,
+                    target_id BIGINT UNIQUE,
                     target_type TEXT,
                     target_name TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE log_targets ADD CONSTRAINT unique_log_target UNIQUE (target_id)")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id SERIAL PRIMARY KEY,
@@ -265,11 +267,13 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS log_targets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_id BIGINT,
+                    target_id BIGINT UNIQUE,
                     target_type TEXT,
                     target_name TEXT
                 )
             """)
+            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_log_target_unique ON log_targets(target_id)")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,20 +410,20 @@ def add_log_target(target_id, target_type, target_name):
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (%s, %s, %s)",
+                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (%s, %s, %s) ON CONFLICT(target_id) DO NOTHING",
                 (target_id, target_type, target_name)
             )
         else:
             c.execute(
-                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO log_targets (target_id, target_type, target_name) VALUES (?, ?, ?)",
                 (target_id, target_type, target_name)
             )
 
-def remove_log_target(target_id):
+def remove_log_target(row_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"DELETE FROM log_targets WHERE target_id = {p}", (target_id,))
+        c.execute(f"DELETE FROM log_targets WHERE id = {p}", (row_id,))
 
 def save_media_log(source_msg_id, log_target_id, file_id, media_type):
     with db_conn() as conn:
@@ -520,14 +524,17 @@ def get_dashboard_markup():
     return markup
 
 def log_targets_list_markup():
-    markup = InlineKeyboardMarkup(row_width=1)
+    markup = InlineKeyboardMarkup()
     targets = get_log_targets()
     for row in targets:
-        btn_text = f"📝 {row[3]} ({row[2]})"
-        markup.add(InlineKeyboardButton(btn_text, callback_data=f"log_remove_{row[1]}"))
-    markup.add(InlineKeyboardButton("➕ Add Log Target", callback_data="log_add_start"))
-    markup.add(InlineKeyboardButton("📥 Extract Media IDs", callback_data="log_extract_start"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+        # row: id, target_id, target_type, target_name
+        markup.row(
+            InlineKeyboardButton(f"📝 {row[3]}", callback_data="log_ignore"),
+            InlineKeyboardButton("🗑️ Remove", callback_data=f"log_remove_{row[0]}")
+        )
+    markup.row(InlineKeyboardButton("➕ Add Log Target", callback_data="log_add_start"))
+    markup.row(InlineKeyboardButton("📥 Extract Media IDs", callback_data="log_extract_start"))
+    markup.row(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
 def pairs_list_markup():
@@ -1145,9 +1152,13 @@ def handle_callbacks(call):
 
     elif data.startswith("log_remove_"):
         bot.answer_callback_query(call.id)
-        tid_str = data.split("log_remove_")[-1]
-        remove_log_target(tid_str)
+        row_id = int(data.split("_")[-1])
+        remove_log_target(row_id)
         bot.edit_message_text("📝 **Log Targets**\nManage destinations for collected media:", call.message.chat.id, call.message.message_id, reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+
+    elif data == "log_ignore":
+        bot.answer_callback_query(call.id)
+        return
 
     elif data == "log_extract_start":
         bot.answer_callback_query(call.id)
@@ -1571,6 +1582,7 @@ def handle_state_inputs(message):
                     t_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or str(target)
                     add_log_target(chat.id, t_type, t_name)
                     bot.send_message(message.chat.id, f"✅ Log Target added: `{t_name}` ({t_type})", parse_mode="Markdown")
+                    await asyncio.sleep(1) # Small delay to ensure DB sync and user visibility
                     bot.send_message(message.chat.id, "📝 **Log Targets**", reply_markup=log_targets_list_markup(), parse_mode="Markdown")
                 except Exception as e:
                     bot.send_message(message.chat.id, f"❌ Failed to verify target: {e}")
