@@ -928,24 +928,31 @@ async def ensure_userbot():
     return True, "Connected"
 
 async def forward_to_log_targets(client, message, source_chat_id, source_msg_id):
+    """Sends collected content to all registered log bots/channels."""
     if not message: return
     targets = get_log_targets()
     if not targets: return
     
     for row in targets:
-        _, t_id, t_type, t_name, _ = row
-        # Run vaulting in background tasks so we don't block the main thread
-        asyncio.create_task(vault_media(client, message, source_chat_id, t_id, source_msg_id, t_name))
+        # row: id, target_id, target_type, target_name, bot_token
+        t_id = row[1]
+        t_name = row[3]
+        # Run vaulting in background tasks
+        asyncio.create_task(vault_media(client, message, int(source_chat_id), int(t_id), int(source_msg_id), t_name))
 
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
-        # Try native forward first (efficient)
+        # We use send_message to ensure we get a fresh file_id accessible by the bot
         try:
-            vaulted = await message.forward_to(int(log_chat_id))
+            vaulted = await client.send_message(
+                entity=int(log_chat_id),
+                file=message.media if message.media else None,
+                message=message.message or ""
+            )
         except:
-            # Fallback to re-sending if forward is restricted
-            vaulted = await client.send_message(int(log_chat_id), file=message.media if message.media else None, message=message.message or "")
+            # Fallback to forward if send fails
+            vaulted = await message.forward_to(int(log_chat_id))
             
         if vaulted:
             try:
@@ -956,7 +963,7 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
                     m_type = type(vaulted.media).__name__
                 
                 save_media_log(source_chat_id, source_msg_id, log_chat_id, fid, m_type)
-                logger.info(f"VAULT: Message {source_msg_id} saved to {t_name}")
+                logger.info(f"✅ VAULT: Message {source_msg_id} saved to {t_name}")
                 
                 # Notify Admin via the Log Bot (if available) or Main Bot
                 notif_text = f"📦 **Vaulted from {t_name}**\n🆔 ID: `{source_msg_id}`\n📂 Type: `{m_type}`"
@@ -1044,34 +1051,23 @@ def setup_automation_handlers(client: TelegramClient):
             dest_topic_id = default_t_topic
             first_msg = messages[0]
             
-            if is_mir:
-                source_top = None
-                if first_msg.reply_to:
-                    source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                
+            # 1. Resolve Topic Mapping
+            if is_mir and first_msg.reply_to:
+                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
                 if source_top:
-                    src_title = None
-                    forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
-                    if forum: src_title = getattr(forum, "title", None)
-                    
-                    if not src_title:
-                        try:
-                            res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                            for t in res.topics:
-                                if source_top in [t.id, t.top_message]:
-                                    src_title = t.title
-                                    break
-                        except: pass
-                    
-                    if src_title:
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
+                    forum = getattr(first_msg.reply_to, "forum_topic", None)
+                    src_title = getattr(forum, "title", "Mirrored Thread") if forum else "Thread"
+                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
 
-            # Resolve Reply Mapping
+            # 2. Resolve Reply Hierarchy
             reply_to_mapped = None
             if getattr(first_msg, "reply_to_msg_id", None):
                 reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
 
-            final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
+            # 3. CONSTRUCT REPLY LOGIC
+            # If reply_to_mapped exists, we reply to that specific message.
+            # If it DOES NOT exist, we reply to the dest_topic_id (this places it in the topic).
+            final_reply_id = int(reply_to_mapped) if reply_to_mapped else (int(dest_topic_id) if dest_topic_id else None)
 
             # --- CAPTION SUPPORT ---
             # Search all messages in the grouping to find the one with the text
@@ -1081,36 +1077,21 @@ def setup_automation_handlers(client: TelegramClient):
                     album_text = msg.message
                     break
 
-            # --- SEND WITH RETRY LOGIC ---
-            retries = 3
-            while retries > 0:
+            # 4. Send Content
+            for _ in range(3):
                 try:
-                    if len(messages) > 1:
-                        # Send as Album
-                        sent_messages = await client.send_message(
-                            entity=tid,
-                            message=album_text,
-                            file=messages, 
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
-                        if sent_messages and isinstance(sent_messages, list):
-                            save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
-                    else:
-                        # Send as Single
-                        sent_msg = await client.send_message(
-                            entity=tid,
-                            message=first_msg.message or "",
-                            file=first_msg.media if first_msg.media else None,
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
-                        if sent_msg:
-                            save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                    
-                    break # Success, exit retry loop
-                    
+                    sent = await client.send_message(
+                        entity=int(tid), 
+                        message=album_text, 
+                        file=messages if len(messages) > 1 else messages[0].media,
+                        reply_to=final_reply_id
+                    )
+                    if sent:
+                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                    break
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
-                    retries -= 1
-                    logger.warning(f"Telegram Busy. Retrying in 4s... ({retries} left)")
+                    await asyncio.sleep(4)
                     await asyncio.sleep(4)
                 except Exception as inner_e:
                     logger.error(f"Failed to send mirrored content: {inner_e}")
