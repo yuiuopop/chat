@@ -954,11 +954,11 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
                 
                 fid = pack_bot_file_id(inner_media)
                 save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                logger.info(f"📥 [VAULT SUCCESS] Message {source_msg_id} indexed for Log Bot: {t_name}")
+                logger.info(f"📤 VAULT SUCCESS: [Target: {t_name}] [Source Msg ID: {source_msg_id}]")
             except Exception as ex:
-                logger.error(f"❌ [VAULT ERROR] Failed to pack file_id: {ex}")
+                logger.error(f"❌ VAULT INDEX ERROR: Failed to pack file_id: {ex}")
     except Exception as e:
-        logger.error(f"❌ [VAULT ERROR] Global Vault Failure for {t_name}: {e}")
+        logger.error(f"❌ VAULT SEND ERROR: Failed to re-send media to {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -993,6 +993,8 @@ def setup_automation_handlers(client: TelegramClient):
                 # --- LOGGING & COLLECTION LOGIC (is_mon) ---
                 if is_mon and m.media:
                     m_type = type(m.media).__name__
+                    logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
+                    
                     with db_conn() as conn:
                         c = conn.cursor()
                         if DATABASE_URL:
@@ -1090,7 +1092,7 @@ def setup_automation_handlers(client: TelegramClient):
                         )
                         if sent_msg:
                             save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                            logger.info(f"📤 [MIRROR SUCCESS] Media sent to Target: {tid} (Topic: {final_reply_target})")
+                            logger.info(f"🚀 MIRROR SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
                     
                     break # Success, exit retry loop
                     
