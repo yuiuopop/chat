@@ -943,16 +943,19 @@ async def forward_to_log_targets(client, message, source_chat_id, source_msg_id)
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
+        # CRITICAL FIX: Ensure the Userbot "knows" the log bot entity
+        target_peer = await client.get_input_entity(int(log_chat_id))
+        
         # We use send_message to ensure we get a fresh file_id accessible by the bot
         try:
             vaulted = await client.send_message(
-                entity=int(log_chat_id),
+                entity=target_peer,
                 file=message.media if message.media else None,
                 message=message.message or ""
             )
         except:
             # Fallback to forward if send fails
-            vaulted = await message.forward_to(int(log_chat_id))
+            vaulted = await message.forward_to(target_peer)
             
         if vaulted:
             try:
@@ -962,7 +965,7 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
                     fid = pack_bot_file_id(vaulted.media)
                     m_type = type(vaulted.media).__name__
                 
-                save_media_log(source_chat_id, source_msg_id, log_chat_id, fid, m_type)
+                save_media_log(int(source_chat_id), int(source_msg_id), int(log_chat_id), fid, m_type)
                 logger.info(f"✅ VAULT: Message {source_msg_id} saved to {t_name}")
                 
                 # Notify Admin via the Log Bot (if available) or Main Bot
@@ -2275,6 +2278,11 @@ log_bot_states = {} # { bot_id: { user_id: { source_id: 123 } } }
 
 def setup_log_bot(token):
     if not token: return
+    
+    # Check if bot already exists in fleet to prevent 409 Conflict
+    for b in bot_fleet.values():
+        if b.token == token:
+            return
     
     log_bot = telebot.TeleBot(token)
     try:
