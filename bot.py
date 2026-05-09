@@ -989,27 +989,30 @@ def setup_automation_handlers(client: TelegramClient):
                 if s_topic and str(s_topic) not in ["None", "0", ""]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
-
-                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
-                if is_mon and m.media:
+                
+                # --- LOGGING & COLLECTION LOGIC ---
+                if m.media:
                     m_type = type(m.media).__name__
                     logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
                     
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if DATABASE_URL:
-                            c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                        else:
-                            c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                    
-                    # Instantly send to log targets
-                    await forward_to_log_targets(client, m, m.id)
+                    if is_mon:
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            if DATABASE_URL:
+                                c.execute(
+                                    "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                    (pid, sid, m.id, m_type, m.message or "")
+                                )
+                            else:
+                                c.execute(
+                                    "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                    (pid, sid, m.id, m_type, m.message or "")
+                                )
+                        
+                        # Instantly send to log targets
+                        await forward_to_log_targets(client, m, m.id)
+                    else:
+                        logger.info(f"ℹ️ SKIPPING VAULT: Monitoring (is_mon) is OFF for pair {s_title}")
 
                 if not is_live: continue
 
