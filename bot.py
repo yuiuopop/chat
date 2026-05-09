@@ -31,6 +31,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
+LOG_CHAT_ID = os.getenv("LOG_CHAT_ID", "")
 
 if not BOT_TOKEN:
     print("WARNING: Missing BOT_TOKEN in .env. Admin features will be limited until set.")
@@ -164,6 +165,8 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
+                    vault_msg_id BIGINT,
+                    vault_chat_id BIGINT,
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
@@ -173,6 +176,10 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_msg_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_chat_id BIGINT")
             except: pass
         else:
             # SQLite
@@ -232,6 +239,8 @@ def init_db():
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
+                    vault_msg_id BIGINT,
+                    vault_chat_id BIGINT,
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
@@ -241,6 +250,10 @@ def init_db():
             try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_msg_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_chat_id BIGINT")
             except: pass
     logger.info("DB initialized")
 
@@ -747,6 +760,54 @@ async def ensure_userbot():
             return False, f"Connection failed: {e}"
     
     return True, "Connected"
+    
+async def vault_and_collect(client, message, pair_id, log_chat_id):
+    """Forwards message to your log system and saves metadata with vaulting info"""
+    try:
+        # 1. Forward to your Log Chat (if set)
+        v_msg_id = None
+        v_chat_id = None
+        if log_chat_id:
+            try:
+                # Forwarding preserves original quality and metadata
+                vaulted_msg = await message.forward_to(log_chat_id)
+                v_msg_id = vaulted_msg.id
+                v_chat_id = log_chat_id
+            except Exception as ve:
+                logger.error(f"Forwarding to vault failed: {ve}")
+
+        # 2. Save to DB
+        m_type = type(message.media).__name__ if message.media else "Text"
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            if DATABASE_URL and USING_POSTGRES:
+                c.execute(f"""
+                    INSERT INTO collected_media 
+                    (pair_id, source_chat_id, source_message_id, media_type, caption, vault_msg_id, vault_chat_id) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(source_chat_id, source_message_id) DO UPDATE SET 
+                        vault_msg_id = EXCLUDED.vault_msg_id,
+                        vault_chat_id = EXCLUDED.vault_chat_id
+                """, (
+                    pair_id, message.chat_id, message.id, 
+                    m_type, message.message or "", 
+                    v_msg_id, v_chat_id
+                ))
+            else:
+                c.execute(f"""
+                    INSERT OR REPLACE INTO collected_media 
+                    (pair_id, source_chat_id, source_message_id, media_type, caption, vault_msg_id, vault_chat_id) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    pair_id, message.chat_id, message.id, 
+                    m_type, message.message or "", 
+                    v_msg_id, v_chat_id
+                ))
+        return v_msg_id
+    except Exception as e:
+        logger.error(f"Vaulting/Collection failed: {e}")
+        return None
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -770,10 +831,14 @@ def setup_automation_handlers(client: TelegramClient):
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
 
-                # Specific topic filtering
                 if s_topic not in [None, 0, "0", 0]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
+
+                # 1) Monitor / Vault Logic
+                if is_mon and m.media:
+                    # We use a separate task for vaulting to avoid blocking the forwarder
+                    asyncio.create_task(vault_and_collect(client, m, pid, LOG_CHAT_ID))
 
                 if not is_live: continue
 
@@ -926,6 +991,45 @@ def cmd_list(message):
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=['get_media'])
+def cmd_get_media(message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    # Usage: /get_media [row_id]
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "Usage: `/get_media [id]`")
+            return
+            
+        row_id = int(args[1])
+        
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT vault_chat_id, vault_msg_id FROM collected_media WHERE id = {p}", (row_id,))
+            res = c.fetchone()
+            
+        if res and res[0] and res[1]:
+            v_chat, v_msg = res
+            async def send_back():
+                try:
+                    # Userbot fetches it from YOUR vault, not the source!
+                    media = await userbot.get_messages(int(v_chat), ids=int(v_msg))
+                    if media:
+                        await userbot.send_message(ADMIN_ID, media)
+                    else:
+                        bot.send_message(ADMIN_ID, "❌ Media not found in vault. It might have been deleted.")
+                except Exception as e:
+                    bot.send_message(ADMIN_ID, f"❌ Failed to retrieve from vault: {e}")
+            
+            asyncio.run_coroutine_threadsafe(send_back(), loop)
+            bot.send_message(message.chat.id, f"📥 Fetching media ID `{row_id}` from vault...", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "❌ Media not found in DB or vault info missing.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
