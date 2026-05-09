@@ -757,7 +757,7 @@ def setup_automation_handlers(client: TelegramClient):
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             
-            # Match Chat IDs (Normalizing strings)
+            # Normalize ID matching
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
 
@@ -770,7 +770,7 @@ def setup_automation_handlers(client: TelegramClient):
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
 
-                # Filter by topic if configured
+                # Specific topic filtering
                 if s_topic not in [None, 0, "0", 0]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
@@ -781,13 +781,15 @@ def setup_automation_handlers(client: TelegramClient):
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        await asyncio.sleep(2.5) # Time for all parts to arrive
+                        # Wait for all parts (10 items need a bit more time)
+                        await asyncio.sleep(3.5) 
                         
                         messages = album_cache.pop(m.grouped_id, [])
                         if messages:
                             await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
                     else:
-                        album_cache[m.grouped_id].append(m)
+                        if m.grouped_id in album_cache:
+                            album_cache[m.grouped_id].append(m)
                 else:
                     await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
 
@@ -797,7 +799,6 @@ def setup_automation_handlers(client: TelegramClient):
             dest_topic_id = default_t_topic
             first_msg = messages[0]
             
-            # 1. Resolve Topic Mapping
             if is_mir:
                 source_top = None
                 if first_msg.reply_to:
@@ -820,48 +821,58 @@ def setup_automation_handlers(client: TelegramClient):
                     if src_title:
                         dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
 
-            # 2. Resolve Reply Mapping
+            # Resolve Reply Mapping
             reply_to_mapped = None
             if getattr(first_msg, "reply_to_msg_id", None):
                 reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
 
             final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
 
-            # 3. CAPTION LOGIC: Find the message in the group that has the text
-            album_caption = ""
+            # --- CAPTION SUPPORT ---
+            # Search all messages in the grouping to find the one with the text
+            album_text = ""
             for msg in messages:
                 if msg.message:
-                    album_caption = msg.message
+                    album_text = msg.message
                     break
 
-            # 4. Send Content
-            if len(messages) > 1:
-                # Send as ALBUM
+            # --- SEND WITH RETRY LOGIC ---
+            retries = 3
+            while retries > 0:
                 try:
-                    sent_messages = await client.send_message(
-                        entity=tid,
-                        message=album_caption, # Apply the found caption here
-                        file=messages, 
-                        reply_to=int(final_reply_target) if final_reply_target else None
-                    )
-                    if sent_messages and isinstance(sent_messages, list):
-                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                    if len(messages) > 1:
+                        # Send as Album
+                        sent_messages = await client.send_message(
+                            entity=tid,
+                            message=album_text,
+                            file=messages, 
+                            reply_to=int(final_reply_target) if final_reply_target else None
+                        )
+                        if sent_messages and isinstance(sent_messages, list):
+                            save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                    else:
+                        # Send as Single
+                        sent_msg = await client.send_message(
+                            entity=tid,
+                            message=first_msg.message or "",
+                            file=first_msg.media if first_msg.media else None,
+                            reply_to=int(final_reply_target) if final_reply_target else None
+                        )
+                        if sent_msg:
+                            save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
+                    
+                    break # Success, exit retry loop
+                    
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
-                    await asyncio.sleep(5)
-                    await client.send_message(entity=tid, message=album_caption, file=messages, reply_to=int(final_reply_target) if final_reply_target else None)
-            else:
-                # Send as SINGLE
-                sent_msg = await client.send_message(
-                    entity=tid,
-                    message=first_msg.message or "",
-                    file=first_msg.media if first_msg.media else None,
-                    reply_to=int(final_reply_target) if final_reply_target else None
-                )
-                if sent_msg:
-                    save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
+                    retries -= 1
+                    logger.warning(f"Telegram Busy. Retrying in 4s... ({retries} left)")
+                    await asyncio.sleep(4)
+                except Exception as inner_e:
+                    logger.error(f"Failed to send mirrored content: {inner_e}")
+                    break
 
         except Exception as e:
-            logger.error(f"Mirror Send Error: {e}")
+            logger.error(f"Global Mirror Send Error: {e}")
 
 # -----------------------------
 # Bot Handlers
