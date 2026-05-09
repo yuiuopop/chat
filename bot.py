@@ -472,20 +472,41 @@ def get_vault_sources():
         c.execute(query)
         return c.fetchall()
 
-def get_vaulted_media_for_source(source_id):
+def get_vaulted_media_for_source(source_id, log_target_id=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        # Ensure we get unique file_ids per source message 
+        
         query = f"""
             SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption
             FROM media_logs m
             JOIN collected_media c ON m.source_message_id = c.source_message_id
             WHERE c.source_chat_id = {p}
-            GROUP BY m.source_message_id
-            ORDER BY m.source_message_id ASC
         """
-        c.execute(query, (source_id,))
+        params = [source_id]
+        if log_target_id:
+            query += f" AND m.log_target_id = {p}"
+            params.append(log_target_id)
+            
+        query += " GROUP BY m.source_message_id ORDER BY m.source_message_id ASC"
+        
+        c.execute(query, tuple(params))
+        return c.fetchall()
+
+def get_log_bot_stats(log_target_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        query = f"""
+            SELECT p.source_id, p.source_title, COUNT(m.id) as item_count
+            FROM media_logs m
+            JOIN collected_media c ON m.source_message_id = c.source_message_id
+            JOIN target_pairs p ON c.source_chat_id = p.source_id
+            WHERE m.log_target_id = {p}
+            GROUP BY p.source_id, p.source_title
+            ORDER BY item_count DESC
+        """
+        c.execute(query, (log_target_id,))
         return c.fetchall()
 
 def get_target_pairs():
@@ -1259,7 +1280,7 @@ def handle_callbacks(call):
             # Start background task
             login_data.pop(uid, None)
             bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(run_vault_release(call.message.chat.id, sid, tid), loop)
+            asyncio.run_coroutine_threadsafe(run_vault_release(bot, call.message.chat.id, sid, tid), loop)
 
     elif data == "log_targets_main":
         bot.answer_callback_query(call.id)
@@ -2085,14 +2106,14 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_vault_release(admin_chat_id, source_id, target_id):
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
     try:
-        items = get_vaulted_media_for_source(source_id)
+        items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
-            bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
+            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
             return
             
-        bot.send_message(admin_chat_id, f"📦 Starting release of `{len(items)}` vaulted items...")
+        sender_bot.send_message(admin_chat_id, f"📦 Starting release of `{len(items)}` vaulted items...")
         
         sent = 0
         failed = 0
@@ -2103,11 +2124,11 @@ async def run_vault_release(admin_chat_id, source_id, target_id):
                 cap = caption or ""
                 
                 if "photo" in m_type_lower:
-                    bot.send_photo(target_id, file_id, caption=cap)
+                    sender_bot.send_photo(target_id, file_id, caption=cap)
                 elif "video" in m_type_lower:
-                    bot.send_video(target_id, file_id, caption=cap)
+                    sender_bot.send_video(target_id, file_id, caption=cap)
                 else:
-                    bot.send_document(target_id, file_id, caption=cap)
+                    sender_bot.send_document(target_id, file_id, caption=cap)
                     
                 sent += 1
             except Exception as item_err:
@@ -2117,11 +2138,11 @@ async def run_vault_release(admin_chat_id, source_id, target_id):
             # Rate limit protection (Telegram Bot API allows ~20 msgs/minute to a single chat)
             await asyncio.sleep(3)
             
-        bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"Global Vault Release Error: {e}")
-        bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
+        sender_bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
 
 # -----------------------------
 # Watchdog
@@ -2240,15 +2261,41 @@ signal.signal(signal.SIGINT, shutdown_handler)
 # -----------------------------
 # Secondary Log Bot Fleet Manager
 # -----------------------------
+log_bot_states = {} # { bot_id: { user_id: { source_id: 123 } } }
+
 def setup_log_bot(token):
     if not token: return
     
     log_bot = telebot.TeleBot(token)
-    
+    try:
+        bot_info = log_bot.get_me()
+        bot_id = bot_info.id
+    except: return
+
     @log_bot.message_handler(commands=['start'])
     def log_cmd_start(message):
         if message.from_user.id != ADMIN_ID: return
-        log_bot.reply_to(message, "🤖 **Secondary Main Bot (Vault Manager) Online**\n\nI am listening for vault commands.\nUse `/extract [id]` to pull media from my vault.", parse_mode="Markdown")
+        
+        stats = get_log_bot_stats(bot_id)
+        text = "🤖 **Secondary Main Bot (Vault Manager) Online**\n\n"
+        text += "📊 **Vault Storage Stats:**\n"
+        
+        total = 0
+        if not stats:
+            text += "_No media vaulted yet._\n"
+        else:
+            for sid, title, count in stats:
+                text += f"📁 `{title}` — `{count}` items\n"
+                total += count
+            
+        text += f"\n📦 **Total Vaulted:** `{total}` items\n\n"
+        text += "Use `/extract [id]` to pull specific media, or use the button below to release logs to a new target."
+        
+        markup = InlineKeyboardMarkup()
+        if stats:
+            markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
+            
+        log_bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
         
     @log_bot.message_handler(commands=['extract'])
     def log_cmd_extract(message):
@@ -2262,8 +2309,7 @@ def setup_log_bot(token):
             with db_conn() as conn:
                 c = conn.cursor()
                 # Ensure we only fetch files vaulted in THIS specific bot's chat
-                bot_info = log_bot.get_me()
-                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND log_target_id = %s LIMIT 1", (smid, bot_info.id))
+                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND log_target_id = %s LIMIT 1", (smid, bot_id))
                 res = c.fetchone()
             
             if res:
@@ -2283,6 +2329,67 @@ def setup_log_bot(token):
                 log_bot.reply_to(message, "❌ No record found in my vault for this ID.")
         except Exception as e:
             log_bot.reply_to(message, f"❌ Extraction Error: {e}")
+
+    @log_bot.callback_query_handler(func=lambda call: True)
+    def log_handle_callbacks(call):
+        uid = call.from_user.id
+        if uid != ADMIN_ID: return
+        data = call.data
+        
+        if bot_id not in log_bot_states: log_bot_states[bot_id] = {}
+        if uid not in log_bot_states[bot_id]: log_bot_states[bot_id][uid] = {}
+        
+        if data == "log_send_main":
+            log_bot.answer_callback_query(call.id)
+            stats = get_log_bot_stats(bot_id)
+            markup = InlineKeyboardMarkup(row_width=1)
+            for sid, title, count in stats:
+                markup.add(InlineKeyboardButton(f"📁 {title} ({count})", callback_data=f"log_send_src_{sid}"))
+            markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_dash"))
+            log_bot.edit_message_text("📤 **Select Source Group**\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            
+        elif data == "log_dash":
+            log_bot.answer_callback_query(call.id)
+            # Re-generate start dashboard
+            stats = get_log_bot_stats(bot_id)
+            text = "🤖 **Secondary Main Bot (Vault Manager) Online**\n\n📊 **Vault Storage Stats:**\n"
+            total = 0
+            for sid, title, count in stats:
+                text += f"📁 `{title}` — `{count}` items\n"
+                total += count
+            text += f"\n📦 **Total Vaulted:** `{total}` items\n"
+            markup = InlineKeyboardMarkup()
+            if stats: markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
+            log_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        elif data.startswith("log_send_src_"):
+            log_bot.answer_callback_query(call.id)
+            sid = int(data.split("_")[-1])
+            log_bot_states[bot_id][uid]["source_id"] = sid
+            
+            async def show_tgt():
+                markup = await get_chat_selection_markup("log_send_tgt", 0)
+                log_bot.edit_message_text("🎯 **Select Target Chat**\nChoose where to release this media:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+
+        elif data.startswith("log_send_tgt_"):
+            log_bot.answer_callback_query(call.id)
+            parts = data.split("_")
+            if parts[3] == "page":
+                page = int(parts[4])
+                async def update_tgt():
+                    markup = await get_chat_selection_markup("log_send_tgt", page)
+                    if markup: log_bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                asyncio.run_coroutine_threadsafe(update_tgt(), loop)
+            else:
+                tid = int(parts[3])
+                sid = log_bot_states[bot_id][uid].get("source_id")
+                if not sid:
+                    log_bot.send_message(call.message.chat.id, "❌ Error: Source group not selected. Please start over.")
+                    return
+                
+                log_bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nTarget: `{tid}`\nThis bot is now broadcasting its vaulted media...", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id), loop)
 
     def run_polling():
         while True:
@@ -2333,7 +2440,10 @@ async def main():
             logger.info("📡 Warming up peer cache...")
             async for _ in userbot.iter_dialogs(limit=50): pass
             logger.info("✅ Peer cache warmed")
-    except Exception as e: logger.error(f"Userbot error: {e}")
+    except Exception as e: 
+        logger.error(f"Userbot startup error: {e}")
+        if "AuthKeyDuplicatedError" in str(e):
+            logger.critical("🚨 CRITICAL: Duplicate session detected. Please log out from other devices or delete session from DB.")
 
     # Start telebot polling with AUTO-RESTART
     def run_polling():
@@ -2357,11 +2467,15 @@ async def main():
     logger.info("✨ Admin bot monitor started")
     
     if userbot:
-        await userbot.run_until_disconnected()
+        try:
+            await userbot.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Userbot disconnected with error: {e}")
+            if "AuthKeyDuplicatedError" in str(e):
+                logger.critical("🚨 CRITICAL: Duplicate session detected. Stopping Userbot loop.")
     else:
         while True:
             await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     loop.run_until_complete(main())
-    
