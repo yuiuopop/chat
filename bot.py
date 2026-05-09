@@ -36,11 +36,31 @@ PORT = int(os.getenv("PORT", "8080"))
 if not BOT_TOKEN:
     print("WARNING: Missing BOT_TOKEN in .env. Admin features will be limited until set.")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# --- Logger Setup ---
+logger = logging.getLogger("UserbotV2")
+logger.setLevel(logging.INFO)
+
+# Create console handler with a specific format
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("userbot_v2")
+ch.setFormatter(formatter)
+
+# Prevent duplicate handlers if script is re-run
+if not logger.handlers:
+    logger.addHandler(ch)
+
+def log_action(action_name, status, details=""):
+    """Standardized format for tracking bot events in hosting logs"""
+    msg = f"[{action_name.upper()}] {status} - {details}"
+    logger.info(msg)
+
+# Alias old logger calls to the new one if needed
+logging.getLogger().handlers = [] # Clear default handler
+# --- End Logger Setup ---
 
 # Topic Mirroring Cache
 # {target_chat_id: {topic_title.lower(): top_message_id}}
@@ -941,16 +961,20 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         if not isinstance(messages, list): messages = [messages]
         log_chat_id = int(log_chat_id)
         
+        log_action("vault", "STARTING", f"Target: {t_name} ({log_chat_id})")
+        
         # 1. Resolve Target
         try:
             target = await client.get_input_entity(log_chat_id)
-        except:
+            log_action("vault", "PEER_RESOLVED", f"Bot {t_name} found in cache.")
+        except Exception:
+            log_action("vault", "CACHE_MISS", f"Bot {log_chat_id} not in cache. Resolving...")
             await client(functions.messages.GetDialogsRequest(
                 offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=20, hash=0
             ))
             target = await client.get_entity(log_chat_id)
 
-        # 2. Get Source Topic Title
+        # 2. Get Source Topic Title (Detection logic unchanged)
         source_topic_title = None
         first_msg = messages[0]
         if first_msg.reply_to:
@@ -964,8 +988,10 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
             except: pass
 
         # 3. Send to Log Bot
+        log_action("vault", "UPLOADING", f"Sending {len(messages)} items...")
         album_text = next((m.message for m in messages if m.message), "")
         vaulted_result = await client.send_message(target, file=messages, message=album_text)
+        log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
         # 4. Indexing (The 'PhotoSize' fix)
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
@@ -1003,31 +1029,25 @@ def setup_automation_handlers(client: TelegramClient):
             msg_id_str = str(m.chat_id).replace("-100", "")
 
             if source_id_str == msg_id_str:
+                log_action("pair_match", "MATCH FOUND", f"Pair: {s_title} -> {t_title}")
+                
                 # --- ROBUST TOPIC DETECTION ---
                 msg_topic_anchor = None
                 if m.reply_to:
-                    # In Forums, reply_to_top_id is the Topic ID. 
-                    # If it's a direct reply to the topic head, reply_to_msg_id is the Topic ID.
                     msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
                 
-                # Fallback for topic creation messages
                 if not msg_topic_anchor and getattr(m, 'is_topic', False):
                     msg_topic_anchor = m.id
 
-                # Specific topic filtering (Only apply if user explicitly set a topic ID)
+                # Specific topic filtering
                 if s_topic and str(s_topic) not in ["None", "0", ""]:
                     if str(msg_topic_anchor) != str(s_topic):
+                        log_action("filter", "TOPIC MISMATCH", f"Expected {s_topic}, got {msg_topic_anchor}. Skipping.")
                         continue
                 
-                # --- LOGGING & COLLECTION LOGIC ---
-                if m.media:
-                    m_type = type(m.media).__name__
-                    logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
-                    
                 # --- MEDIA COLLECTION & HUB DELEGATION ---
                 if m.media:
-                    m_type = type(m.media).__name__
-                    logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
+                    log_action("traffic", "MEDIA DETECTED", f"Source: {s_title} | ID: {m.id} | Type: {type(m.media).__name__}")
                     
                     # --- ALBUM / SINGLE MESSAGE LOGIC ---
                     if m.grouped_id:
@@ -2190,26 +2210,35 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
         for smid, file_id, m_type, caption, topic_title in items:
             try:
                 dest_topic_id = None
-                # Create the topic in the new group if it existed in the old one
                 if topic_title:
                     try:
                         dest_topic_id = await get_or_create_target_topic(userbot, target_chat_id, topic_title)
                     except: pass
 
-                m_type_lower = (m_type or "").lower()
-                if "photo" in m_type_lower:
+                m_type_l = (m_type or "").lower()
+                if "photo" in m_type_l:
                     sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
-                elif "video" in m_type_lower:
+                elif "video" in m_type_l:
                     sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 else:
                     sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 
                 sent += 1
-                await asyncio.sleep(2.5) # Protection from rate limits
-            except Exception as item_err:
-                logger.error(f"Extraction error: {item_err}")
+                await asyncio.sleep(4.0) # Increased sleep to prevent 429
                 
-        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Complete**\nSent: `{sent}` items.")
+            except telebot.apihelper.ApiTelegramException as e:
+                if e.error_code == 429:
+                    retry_after = e.result_json.get('parameters', {}).get('retry_after', 30)
+                    logger.warning(f"🕒 Rate limited! Sleeping for {retry_after}s...")
+                    await asyncio.sleep(retry_after + 5)
+                elif "wrong file identifier" in str(e):
+                    logger.error(f"❌ Skipping bad File ID: {file_id[:15]}... (likely old corrupted data)")
+                else:
+                    logger.error(f"⚠️ Extraction error: {e}")
+            except Exception as e:
+                logger.error(f"⚠️ Unexpected error: {e}")
+                
+        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Done**\nSent: `{sent}` items.")
     except Exception as e:
         logger.error(f"Global Extraction Error: {e}")
 
@@ -2298,14 +2327,7 @@ from flask import Flask, request
 app = Flask(__name__)
 @app.route("/")
 def health():
-    # Auto-detect URL from the first request
-    if not get_setting("detected_url"):
-        # We assume https because Render/Railway use it
-        protocol = "https" if request.is_secure or "https" in request.url_root else "http"
-        detected = f"{protocol}://{request.host}"
-        set_setting("detected_url", detected)
-        logger.info(f"KEEP_ALIVE: Auto-detected and SAVED public URL: {detected}")
-    
+    log_action("keep_alive", "PULSE", f"Ping received from {request.remote_addr}")
     return "Userbot v2 Running", 200
 
 def run_web():
