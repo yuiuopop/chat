@@ -961,16 +961,19 @@ def setup_automation_handlers(client: TelegramClient):
             msg_id_str = str(m.chat_id).replace("-100", "")
 
             if source_id_str == msg_id_str:
-                # --- TOPIC DETECTION ---
+                # --- ROBUST TOPIC DETECTION ---
                 msg_topic_anchor = None
                 if m.reply_to:
+                    # In Forums, reply_to_top_id is the Topic ID. 
+                    # If it's a direct reply to the topic head, reply_to_msg_id is the Topic ID.
                     msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
                 
-                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                # Fallback for topic creation messages
+                if not msg_topic_anchor and getattr(m, 'is_topic', False):
                     msg_topic_anchor = m.id
 
-                # Specific topic filtering
-                if s_topic not in [None, 0, "0", 0]:
+                # Specific topic filtering (Only apply if user explicitly set a topic ID)
+                if s_topic and str(s_topic) not in ["None", "0", ""]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
