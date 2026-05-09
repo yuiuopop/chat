@@ -2240,47 +2240,6 @@ signal.signal(signal.SIGINT, shutdown_handler)
 # -----------------------------
 # Secondary Log Bot Fleet Manager
 # -----------------------------
-def get_log_bot_dashboard(log_bot):
-    try:
-        with db_conn() as conn:
-            c = conn.cursor()
-            bot_info = log_bot.get_me()
-            
-            # Total items in this bot's vault
-            p = get_placeholder()
-            c.execute(f"SELECT COUNT(*) FROM media_logs WHERE log_target_id = {p}", (bot_info.id,))
-            total = c.fetchone()[0] or 0
-            
-            # Breakdown by source group
-            query = f"""
-                SELECT COALESCE(p.source_title, 'Unknown Source'), COUNT(m.id) 
-                FROM media_logs m
-                JOIN collected_media c ON m.source_message_id = c.source_message_id
-                LEFT JOIN target_pairs p ON c.source_chat_id = p.source_id
-                WHERE m.log_target_id = {p}
-                GROUP BY p.source_title
-                ORDER BY COUNT(m.id) DESC
-            """
-            c.execute(query, (bot_info.id,))
-            breakdown = c.fetchall()
-            
-        text = f"🤖 **Secondary Main Bot (Vault Manager)**\n"
-        text += f"Status: `🟢 ACTIVE`\n"
-        text += f"Total Stored: `{total}` items\n\n"
-        
-        if breakdown:
-            text += "📁 **Storage Breakdown:**\n"
-            for title, count in breakdown:
-                text += f"• {title}: `{count}`\n"
-        else:
-            text += "_No vaulted content found yet._\n"
-            
-        text += "\n💡 Use `/extract [id]` to pull media from my vault."
-        return text, total > 0
-    except Exception as e:
-        logger.error(f"Dashboard Build Error: {e}")
-        return "❌ Error loading dashboard.", False
-
 def setup_log_bot(token):
     if not token: return
     
@@ -2289,11 +2248,7 @@ def setup_log_bot(token):
     @log_bot.message_handler(commands=['start'])
     def log_cmd_start(message):
         if message.from_user.id != ADMIN_ID: return
-        text, has_content = get_log_bot_dashboard(log_bot)
-        markup = InlineKeyboardMarkup()
-        if has_content:
-            markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
-        log_bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+        log_bot.reply_to(message, "🤖 **Secondary Main Bot (Vault Manager) Online**\n\nI am listening for vault commands.\nUse `/extract [id]` to pull media from my vault.", parse_mode="Markdown")
         
     @log_bot.message_handler(commands=['extract'])
     def log_cmd_extract(message):
@@ -2328,109 +2283,6 @@ def setup_log_bot(token):
                 log_bot.reply_to(message, "❌ No record found in my vault for this ID.")
         except Exception as e:
             log_bot.reply_to(message, f"❌ Extraction Error: {e}")
-
-    @log_bot.callback_query_handler(func=lambda call: call.from_user.id == ADMIN_ID)
-    def log_callback_handler(call):
-        data = call.data
-        if data == "log_send_main":
-            # List source groups
-            with db_conn() as conn:
-                c = conn.cursor()
-                bot_info = log_bot.get_me()
-                p = get_placeholder()
-                query = f"""
-                    SELECT DISTINCT c.source_chat_id, COALESCE(p.source_title, 'Unknown Source')
-                    FROM media_logs m
-                    JOIN collected_media c ON m.source_message_id = c.source_message_id
-                    LEFT JOIN target_pairs p ON c.source_chat_id = p.source_id
-                    WHERE m.log_target_id = {p}
-                """
-                c.execute(query, (bot_info.id,))
-                sources = c.fetchall()
-            
-            if not sources:
-                log_bot.answer_callback_query(call.id, "No vaulted sources found.")
-                return
-                
-            markup = InlineKeyboardMarkup(row_width=1)
-            for sid, title in sources:
-                markup.add(InlineKeyboardButton(f"📁 {title}", callback_data=f"log_send_src_{sid}"))
-            markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_back_start"))
-            
-            log_bot.edit_message_text("🚀 **Select Source Group**\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-        elif data == "log_back_start":
-            text, has_content = get_log_bot_dashboard(log_bot)
-            markup = InlineKeyboardMarkup()
-            if has_content:
-                markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
-            log_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            
-        elif data.startswith("log_send_src_"):
-            sid = data.replace("log_send_src_", "")
-            # We use a unique state format including the bot token (first 8 chars) to avoid collisions
-            token_brief = token[:8]
-            admin_states[call.from_user.id] = f"lb_tgt_{token_brief}_{sid}"
-            log_bot.send_message(call.message.chat.id, "🎯 **Set Target Chat**\nPlease send the Target ID or Username (e.g. `@my_group` or `-100...`) where I should send the content.")
-            log_bot.answer_callback_query(call.id)
-
-    @log_bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and str(admin_states.get(m.from_user.id, "")).startswith(f"lb_tgt_{token[:8]}_"))
-    def handle_log_bot_target(message):
-        state = admin_states.get(message.from_user.id)
-        prefix = f"lb_tgt_{token[:8]}_"
-        source_id = state.replace(prefix, "")
-        target_chat = message.text.strip()
-        admin_states.pop(message.from_user.id, None)
-        
-        asyncio.run_coroutine_threadsafe(run_log_bot_release(log_bot, message.chat.id, source_id, target_chat), loop)
-
-async def run_log_bot_release(log_bot, admin_chat_id, source_id, target_chat):
-    try:
-        log_bot.send_message(admin_chat_id, "⏳ **Preparing Release...**\nFetching vaulted items from my storage.", parse_mode="Markdown")
-        
-        with db_conn() as conn:
-            c = conn.cursor()
-            bot_info = log_bot.get_me()
-            p = get_placeholder()
-            query = f"""
-                SELECT m.file_id, m.media_type, c.caption
-                FROM media_logs m
-                JOIN collected_media c ON m.source_message_id = c.source_message_id
-                WHERE m.log_target_id = {p} AND c.source_chat_id = {p}
-                ORDER BY m.source_message_id ASC
-            """
-            c.execute(query, (bot_info.id, int(source_id)))
-            items = c.fetchall()
-            
-        if not items:
-            log_bot.send_message(admin_chat_id, "❌ No vaulted items found for this source.")
-            return
-            
-        log_bot.send_message(admin_chat_id, f"🚀 **Releasing {len(items)} items...**\nSending to `{target_chat}`.", parse_mode="Markdown")
-        
-        sent = 0
-        failed = 0
-        for file_id, m_type, caption in items:
-            try:
-                m_type = (m_type or "document").lower()
-                cap = caption or ""
-                if "photo" in m_type:
-                    log_bot.send_photo(target_chat, file_id, caption=cap)
-                elif "video" in m_type:
-                    log_bot.send_video(target_chat, file_id, caption=cap)
-                else:
-                    log_bot.send_document(target_chat, file_id, caption=cap)
-                sent += 1
-            except Exception as e:
-                logger.error(f"Log Bot Release Item Error: {e}")
-                failed += 1
-            await asyncio.sleep(2.5) # Anti-flood protection
-            
-        log_bot.send_message(admin_chat_id, f"✅ **Release Complete!**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`", parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.error(f"Log Bot Release Global Error: {e}")
-        log_bot.send_message(admin_chat_id, f"❌ Release Failed: {e}")
 
     def run_polling():
         while True:
@@ -2512,3 +2364,4 @@ async def main():
 
 if __name__ == "__main__":
     loop.run_until_complete(main())
+    
