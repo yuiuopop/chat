@@ -935,94 +935,57 @@ async def forward_to_log_targets(client, messages, source_msg_id):
         asyncio.create_task(vault_media(client, messages, t_id, source_msg_id, t_name))
 
 async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
-    """Sends single messages or albums natively to Log Bots and saves Topic Structure"""
+    """Sends albums/singles to Log Bot and saves Topic titles for extraction"""
     try:
-        if not isinstance(messages, list):
-            messages = [messages]
-            
+        if not messages: return
+        if not isinstance(messages, list): messages = [messages]
         log_chat_id = int(log_chat_id)
-        target = None
-
-        # 1. PEER RESOLUTION (AUTHORITATIVE)
+        
+        # 1. Resolve Target
         try:
             target = await client.get_input_entity(log_chat_id)
-        except (ValueError, errors.rpcerrorlist.PeerIdInvalidError, Exception):
-            logger.info(f"🔍 Peer {log_chat_id} not in cache. Attempting manual fetch...")
-            try:
-                # Force refresh of internal entity database
-                await client(functions.messages.GetDialogsRequest(
-                    offset_date=None, offset_id=0, 
-                    offset_peer=types.InputPeerEmpty(), 
-                    limit=100, hash=0
-                ))
-                # Final attempt: direct server lookup
-                try:
-                    target = await client.get_entity(log_chat_id)
-                except:
-                    # Last resort: Direct User lookup (often works for bots)
-                    target = await client(functions.users.GetFullUserRequest(id=log_chat_id))
-                    target = target.users[0]
-            except Exception as e:
-                logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
-                return
+        except:
+            await client(functions.messages.GetDialogsRequest(
+                offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=20, hash=0
+            ))
+            target = await client.get_entity(log_chat_id)
 
-        # --- 2. DETECT TOPIC TITLE ---
+        # 2. Get Source Topic Title
         source_topic_title = None
         first_msg = messages[0]
         if first_msg.reply_to:
             try:
                 source_top_id = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                if source_top_id:
-                    # Check Cache First
-                    sid = first_msg.chat_id
-                    if sid in topic_cache:
-                        for title, top_id in topic_cache[sid].items():
-                            if top_id == source_top_id:
-                                source_topic_title = title
-                                break
-                    
-                    if not source_topic_title:
-                        # Fetch from API
-                        res = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                        for t in res.topics:
-                            if source_top_id in [t.id, t.top_message]:
-                                source_topic_title = t.title
-                                break
+                res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                for t in res.topics:
+                    if t.id == source_top_id:
+                        source_topic_title = t.title
+                        break
             except: pass
 
-        # --- 3. SEND NATIVELY (Single or Album) ---
+        # 3. Send to Log Bot
         album_text = next((m.message for m in messages if m.message), "")
-        vaulted_result = await client.send_message(
-            target, 
-            file=messages if len(messages) > 1 else messages[0].media, 
-            message=album_text
-        )
+        vaulted_result = await client.send_message(target, file=messages, message=album_text)
             
-        # --- 4. INDEXING WITH TOPIC MEMORY (Fixes PhotoSize error) ---
+        # 4. Indexing (The 'PhotoSize' fix)
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-        
         for i, v_msg in enumerate(vaulted_list):
             try:
                 inner_media = None
-                # Always grab the core Photo/Document object
                 if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner_media = v_msg.media.photo
+                    inner_media = v_msg.media.photo # Correct Parent Object
                 elif isinstance(v_msg.media, types.MessageMediaDocument):
                     inner_media = v_msg.media.document
                 
-                # Check for access_hash before packing (ensures it's not a thumbnail)
                 if inner_media and hasattr(inner_media, 'access_hash'):
                     fid = pack_bot_file_id(inner_media)
-                    # Sync ID to original source message ID
+                    # Associate with original message ID from source
                     real_source_id = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                else:
-                    logger.debug(f"⚠️ Indexing skip for item {i}: Invalid metadata")
-            except Exception as ex:
-                logger.debug(f"⚠️ Indexing skip for item {i}: {ex}")
+            except Exception as e:
+                logger.debug(f"Indexing skip: {e}")
                 
-        logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} -> {t_name} ({source_topic_title or 'General'})")
-
+        logger.info(f"✅ VAULT SUCCESS: Sent to {t_name} (Topic: {source_topic_title or 'General'})")
     except Exception as e:
         logger.error(f"❌ VAULT CRASH: {e}")
 
@@ -2204,15 +2167,13 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         running_tasks.pop(task_key, None)
 
 async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
-    """Aggressive topic-aware release of vaulted content"""
     try:
-        # 1. Fetch vaulted items including the topic_title column
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
-            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
+            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found.")
             return
             
-        sender_bot.send_message(admin_chat_id, f"🚀 **Vault Release: Sending `{len(items)}` items to `{target_id}`...**", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction into `{target_id}`...")
         
         sent = 0
         failed = 0
@@ -2220,40 +2181,28 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
         for smid, file_id, m_type, caption, topic_title in items:
             try:
                 dest_topic_id = None
-                
-                # 2. TOPIC CREATION LOGIC
+                # Create the topic in the new group if it existed in the old one
                 if topic_title:
                     try:
-                        # Use the USERBOT to create/find the topic structure
-                        # passing int(target_id) ensures the Bot API recognizes it
                         dest_topic_id = await get_or_create_target_topic(userbot, int(target_id), topic_title)
-                    except Exception as topic_err:
-                        logger.warning(f"⚠️ Topic creation failed for '{topic_title}': {topic_err}")
+                    except: pass
 
-                # 3. SEND TO SPECIFIC THREAD
                 m_type_lower = (m_type or "").lower()
-                cap = caption or ""
-                
                 if "photo" in m_type_lower:
-                    sender_bot.send_photo(int(target_id), file_id, caption=cap, message_thread_id=dest_topic_id)
+                    sender_bot.send_photo(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
                 elif "video" in m_type_lower:
-                    sender_bot.send_video(int(target_id), file_id, caption=cap, message_thread_id=dest_topic_id)
+                    sender_bot.send_video(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
                 else:
-                    sender_bot.send_document(int(target_id), file_id, caption=cap, message_thread_id=dest_topic_id)
+                    sender_bot.send_document(int(target_id), file_id, caption=caption, message_thread_id=dest_topic_id)
                 
                 sent += 1
+                await asyncio.sleep(2.5) # Protection from rate limits
             except Exception as item_err:
-                logger.error(f"Vault Release item error: {item_err}")
-                failed += 1
-            
-            # Rate limit protection (Bot API is ~20-30 msgs per min)
-            await asyncio.sleep(2.0)
-            
-        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n📤 Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Topic structure has been reconstructed).", parse_mode="Markdown")
-        
+                logger.error(f"Extraction error: {item_err}")
+                
+        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Complete**\nSent: `{sent}` items.")
     except Exception as e:
-        logger.error(f"Global Vault Release Error: {e}")
-        sender_bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
+        logger.error(f"Global Extraction Error: {e}")
 
 # -----------------------------
 # Watchdog
