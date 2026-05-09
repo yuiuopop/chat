@@ -943,28 +943,39 @@ async def forward_to_log_targets(client, message, source_chat_id, source_msg_id)
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
-        # CRITICAL FIX: Ensure the Userbot "knows" the log bot entity
-        target_peer = await client.get_input_entity(int(log_chat_id))
-        
-        # We use send_message to ensure we get a fresh file_id accessible by the bot
+        # RESOLVE ENTITY: Fetch the access hash for the bot
         try:
-            vaulted = await client.send_message(
-                entity=target_peer,
-                file=message.media if message.media else None,
-                message=message.message or ""
-            )
+            target_peer = await client.get_input_entity(int(log_chat_id))
         except:
-            # Fallback to forward if send fails
-            vaulted = await message.forward_to(target_peer)
+            # If not found, try to 'find' the bot by ID directly (forces session lookup)
+            target_peer = await client.get_entity(int(log_chat_id))
+
+        # SEND CONTENT
+        vaulted = await client.send_message(
+            entity=target_peer,
+            file=message.media if message.media else None,
+            message=message.message or ""
+        )
             
         if vaulted:
             try:
                 m_type = "text"
                 fid = "TEXT"
                 if vaulted.media:
-                    fid = pack_bot_file_id(vaulted.media)
                     m_type = type(vaulted.media).__name__
-                
+                    try:
+                        # FIX: Ensure we are packing the root media object, not a sub-size
+                        media_to_pack = vaulted.media
+                        if isinstance(vaulted.media, types.MessageMediaPhoto):
+                            media_to_pack = vaulted.media.photo
+                        elif isinstance(vaulted.media, types.MessageMediaDocument):
+                            media_to_pack = vaulted.media.document
+                        
+                        fid = pack_bot_file_id(media_to_pack)
+                    except Exception as pack_err:
+                        logger.error(f"Packing error: {pack_err}")
+                        fid = "FAILED_TO_PACK"
+                    
                 save_media_log(int(source_chat_id), int(source_msg_id), int(log_chat_id), fid, m_type)
                 logger.info(f"✅ VAULT: Message {source_msg_id} saved to {t_name}")
                 
@@ -982,7 +993,7 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             except Exception as ex:
                 logger.error(f"VAULT ERROR: Failed to pack/save: {ex}")
     except Exception as e:
-        logger.error(f"VAULT ERROR: Failed to log message to {t_name}: {e}")
+        logger.error(f"VAULT ERROR for {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -2413,9 +2424,11 @@ def setup_log_bot(token):
                 asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id), loop)
 
     def run_polling():
+        # Add delay to avoid immediate conflict on Render restarts
+        time.sleep(10)
         while True:
             try:
-                logger.info(f"🚀 Starting Secondary Log Bot polling...")
+                logger.info(f"🚀 Starting Log Bot polling for {bot_id}...")
                 log_bot.delete_webhook(drop_pending_updates=True)
                 log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
