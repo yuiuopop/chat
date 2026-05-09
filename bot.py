@@ -181,10 +181,13 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     target_id BIGINT UNIQUE,
                     target_type TEXT,
-                    target_name TEXT
+                    target_name TEXT,
+                    bot_token TEXT
                 )
             """)
             try: c.execute("ALTER TABLE log_targets ADD CONSTRAINT unique_log_target UNIQUE (target_id)")
+            except: pass
+            try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
             except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
@@ -269,9 +272,12 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     target_id BIGINT UNIQUE,
                     target_type TEXT,
-                    target_name TEXT
+                    target_name TEXT,
+                    bot_token TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
+            except: pass
             try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_log_target_unique ON log_targets(target_id)")
             except: pass
             c.execute("""
@@ -401,22 +407,22 @@ def get_message_mapping(s_chat, s_msg, t_chat):
 def get_log_targets():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, target_id, target_type, target_name FROM log_targets")
+        c.execute("SELECT id, target_id, target_type, target_name, bot_token FROM log_targets")
         return c.fetchall()
 
-def add_log_target(target_id, target_type, target_name):
+def add_log_target(target_id, target_type, target_name, bot_token=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (%s, %s, %s) ON CONFLICT(target_id) DO NOTHING",
-                (target_id, target_type, target_name)
+                "INSERT INTO log_targets (target_id, target_type, target_name, bot_token) VALUES (%s, %s, %s, %s) ON CONFLICT(target_id) DO UPDATE SET bot_token = EXCLUDED.bot_token",
+                (target_id, target_type, target_name, bot_token)
             )
         else:
             c.execute(
-                "INSERT OR IGNORE INTO log_targets (target_id, target_type, target_name) VALUES (?, ?, ?)",
-                (target_id, target_type, target_name)
+                "INSERT INTO log_targets (target_id, target_type, target_name, bot_token) VALUES (?, ?, ?, ?) ON CONFLICT(target_id) DO UPDATE SET bot_token = excluded.bot_token",
+                (target_id, target_type, target_name, bot_token)
             )
 
 def remove_log_target(row_id):
@@ -1262,7 +1268,7 @@ def handle_callbacks(call):
     elif data == "log_add_start":
         bot.answer_callback_query(call.id)
         admin_states[uid] = "awaiting_log_target"
-        bot.send_message(call.message.chat.id, "📝 **Add Log Target**\nPlease send the Target ID or Username (e.g. `@my_log_bot` or `-100123456789`).")
+        bot.send_message(call.message.chat.id, "📝 **Add Log Bot**\nPlease send the **Bot Token** of your Log Bot (from @BotFather).")
 
     elif data.startswith("log_remove_"):
         bot.answer_callback_query(call.id)
@@ -1719,24 +1725,28 @@ def handle_state_inputs(message):
     
     # --- Logging System ---
     if state == "awaiting_log_target":
-        target = text
+        token = text
         admin_states.pop(uid, None)
+        bot.send_message(message.chat.id, "⏳ Verifying Log Bot Token...")
+        
+        # Verify the token using TeleBot
         try:
-            bot.send_message(message.chat.id, "⏳ Verifying Log Target...")
-            async def verify_log_tgt():
-                try:
-                    chat = await userbot.get_entity(target)
-                    t_type = type(chat).__name__.lower()
-                    t_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or str(target)
-                    add_log_target(chat.id, t_type, t_name)
-                    bot.send_message(message.chat.id, f"✅ Log Target added: `{t_name}` ({t_type})", parse_mode="Markdown")
-                    await asyncio.sleep(1) # Small delay to ensure DB sync and user visibility
-                    bot.send_message(message.chat.id, "📝 **Log Targets**", reply_markup=log_targets_list_markup(), parse_mode="Markdown")
-                except Exception as e:
-                    bot.send_message(message.chat.id, f"❌ Failed to verify target: {e}")
-            asyncio.run_coroutine_threadsafe(verify_log_tgt(), loop)
+            temp_bot = telebot.TeleBot(token)
+            bot_info = temp_bot.get_me()
+            t_id = bot_info.id
+            t_name = bot_info.username
+            t_type = "bot"
+            
+            # Save to DB
+            add_log_target(t_id, t_type, t_name, token)
+            
+            # Start the bot dynamically
+            setup_log_bot(token)
+            
+            bot.send_message(message.chat.id, f"✅ Log Bot added and started: `@{t_name}`", parse_mode="Markdown")
+            bot.send_message(message.chat.id, "📝 **Log Targets**", reply_markup=log_targets_list_markup(), parse_mode="Markdown")
         except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Error: {e}")
+            bot.send_message(message.chat.id, f"❌ Failed to verify Bot Token: {e}")
             
     # --- Login Flow ---
     elif state == "awaiting_api_id":
@@ -2228,6 +2238,65 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 # -----------------------------
+# Secondary Log Bot Fleet Manager
+# -----------------------------
+def setup_log_bot(token):
+    if not token: return
+    
+    log_bot = telebot.TeleBot(token)
+    
+    @log_bot.message_handler(commands=['start'])
+    def log_cmd_start(message):
+        if message.from_user.id != ADMIN_ID: return
+        log_bot.reply_to(message, "🤖 **Secondary Main Bot (Vault Manager) Online**\n\nI am listening for vault commands.\nUse `/extract [id]` to pull media from my vault.", parse_mode="Markdown")
+        
+    @log_bot.message_handler(commands=['extract'])
+    def log_cmd_extract(message):
+        if message.from_user.id != ADMIN_ID: return
+        try:
+            args = message.text.split()
+            if len(args) < 2: 
+                return log_bot.reply_to(message, "💡 **Usage:** `/extract [message_id]`\n\nFind the ID in your collected logs.", parse_mode="Markdown")
+            
+            smid = args[1]
+            with db_conn() as conn:
+                c = conn.cursor()
+                # Ensure we only fetch files vaulted in THIS specific bot's chat
+                bot_info = log_bot.get_me()
+                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND log_target_id = %s LIMIT 1", (smid, bot_info.id))
+                res = c.fetchone()
+            
+            if res:
+                file_id, m_type = res
+                m_type = m_type.lower()
+                
+                log_bot.send_chat_action(message.chat.id, 'upload_document')
+                caption = f"✅ **Extracted from My Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
+                
+                if "photo" in m_type:
+                    log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+                elif "video" in m_type:
+                    log_bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+                else:
+                    log_bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+            else:
+                log_bot.reply_to(message, "❌ No record found in my vault for this ID.")
+        except Exception as e:
+            log_bot.reply_to(message, f"❌ Extraction Error: {e}")
+
+    def run_polling():
+        while True:
+            try:
+                logger.info(f"🚀 Starting Secondary Log Bot polling...")
+                log_bot.delete_webhook(drop_pending_updates=True)
+                log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+            except Exception as e:
+                logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
+                time.sleep(30)
+                
+    threading.Thread(target=run_polling, daemon=True).start()
+
+# -----------------------------
 # Main Loop
 # -----------------------------
 async def main():
@@ -2242,6 +2311,15 @@ async def main():
     if not DATABASE_URL:
         logger.warning("⚠️ WARNING: You are using SQLite. Your data (pairs, media) will be DELETED every time Render restarts!")
         logger.warning("Please set a DATABASE_URL (PostgreSQL) for permanent storage.")
+
+    # Boot all saved Log Bots
+    try:
+        targets = get_log_targets()
+        for row in targets:
+            if len(row) > 4 and row[4]: # bot_token
+                setup_log_bot(row[4])
+    except Exception as e:
+        logger.error(f"Error booting log bots: {e}")
 
     asyncio.create_task(userbot_watchdog())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
