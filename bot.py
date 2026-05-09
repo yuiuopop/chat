@@ -722,13 +722,21 @@ def setup_automation_handlers(client: TelegramClient):
                     # Mirroring Logic
                     if is_mir:
                         try:
-                            source_topic_id = None
-                            if getattr(m, "reply_to_top_id", None):
-                                source_topic_id = m.reply_to_top_id
-                            elif m.reply_to:
-                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
-                            elif getattr(m, "forum_topic", False):
+                            source_topic_id = getattr(m, "reply_to_top_id", None)
+
+                            # Starter message of forum topic
+                            if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
+
+                            # Absolute fallback
+                            if not source_topic_id and getattr(m, "reply_to", None):
+                                source_topic_id = getattr(m.reply_to, "reply_to_top_id", None)
+
+                            logger.warning(
+                                f"SOURCE TOPIC DETECT | "
+                                f"MSG:{m.id} | "
+                                f"TOPIC:{source_topic_id}"
+                            )
                             
                             if source_topic_id:
                                 src_title = None
@@ -744,8 +752,7 @@ def setup_automation_handlers(client: TelegramClient):
                                         channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
-                                        if (getattr(st, "id", None) == source_topic_id or 
-                                            getattr(st, "top_message", None) == source_topic_id):
+                                        if getattr(st, "top_message", None) == source_topic_id:
                                             src_title = st.title
                                             break
                                 
@@ -757,7 +764,12 @@ def setup_automation_handlers(client: TelegramClient):
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
-                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
+                        logger.warning(
+                            f"SEND DEBUG | "
+                            f"TARGET:{tid} | "
+                            f"REPLY_TO:{target_topic_anchor} | "
+                            f"TEXT:{m.message[:30] if m.message else 'MEDIA'}"
+                        )
                         if m.media:
                             await client.send_file(
                                 entity=tid,
@@ -1564,15 +1576,21 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # MIRROR MODE LOGIC
                 if is_mir:
                     try:
-                        source_topic_id = None
-                        if getattr(msg, "reply_to_top_id", None):
-                            source_topic_id = msg.reply_to_top_id
-                        elif msg.reply_to:
-                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
-                        elif getattr(msg, "forum_topic", False):
+                        source_topic_id = getattr(msg, "reply_to_top_id", None)
+
+                        # Starter message of forum topic
+                        if not source_topic_id and getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-                        
-                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
+
+                        # Absolute fallback
+                        if not source_topic_id and getattr(msg, "reply_to", None):
+                            source_topic_id = getattr(msg.reply_to, "reply_to_top_id", None)
+
+                        logger.warning(
+                            f"SOURCE TOPIC DETECT | "
+                            f"MSG:{msg.id} | "
+                            f"TOPIC:{source_topic_id}"
+                        )
                         
                         if source_topic_id:
                             src_title = None
@@ -1588,16 +1606,9 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                     channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                 ))
                                 for st in src_topics.topics:
-                                    logger.warning(
-                                        f"TOPIC CHECK | ID:{getattr(st,'id',None)} | "
-                                        f"TOP:{getattr(st,'top_message',None)} | TITLE:{getattr(st,'title',None)}"
-                                    )
-                                    if (getattr(st, "id", None) == source_topic_id or 
-                                        getattr(st, "top_message", None) == source_topic_id):
+                                    if getattr(st, "top_message", None) == source_topic_id:
                                         src_title = st.title
                                         break
-                            
-                            logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
                             if src_title:
                                 mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
@@ -1607,7 +1618,12 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                     except Exception as me:
                         logger.error(f"Release Mirror Error: {me}")
 
-                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
+                logger.warning(
+                    f"SEND DEBUG | "
+                    f"TARGET:{tid_ref} | "
+                    f"REPLY_TO:{target_topic_anchor} | "
+                    f"TEXT:{msg.message[:30] if msg.message else 'MEDIA'}"
+                )
                 await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
