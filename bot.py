@@ -980,7 +980,7 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         for i, v_msg in enumerate(vaulted_list):
             try:
                 # Robust Media Packing
-                inner_media = v_msg.media
+                inner_media = None
                 if isinstance(v_msg.media, types.MessageMediaPhoto):
                     inner_media = v_msg.media.photo
                 elif isinstance(v_msg.media, types.MessageMediaDocument):
@@ -992,10 +992,11 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
 
                 if inner_media and not isinstance(inner_media, list):
                     fid = pack_bot_file_id(inner_media)
-                    # Use the original source_msg_id + index for albums to keep them unique
-                    save_media_log(source_msg_id + i, log_chat_id, fid, type(v_msg.media).__name__)
-            except:
-                continue
+                    # Use the actual source message ID for precise mapping
+                    real_source_id = messages[i].id if i < len(messages) else source_msg_id
+                    save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__)
+            except Exception as e:
+                logger.error(f"⚠️ Indexing skipped for item {i}: {e}")
                 
         logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} sent to {t_name}")
 
@@ -1037,56 +1038,59 @@ def setup_automation_handlers(client: TelegramClient):
                     m_type = type(m.media).__name__
                     logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
                     
-                    if is_mon:
-                        # Instant vault for single media
-                        await forward_to_log_targets(client, [m], m.id)
-                        
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            if DATABASE_URL:
-                                c.execute(
-                                    "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                    (pid, sid, m.id, m_type, m.message or "")
-                                )
-                            else:
-                                c.execute(
-                                    "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                    (pid, sid, m.id, m_type, m.message or "")
-                                )
+                # --- MEDIA COLLECTION & HUB DELEGATION ---
+                if m.media:
+                    m_type = type(m.media).__name__
+                    logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
+                    
+                    # --- ALBUM / SINGLE MESSAGE LOGIC ---
+                    if m.grouped_id:
+                        if m.grouped_id not in album_cache:
+                            album_cache[m.grouped_id] = [m]
+                            # Wait for all parts
+                            await asyncio.sleep(4.0) 
+                            
+                            messages = album_cache.pop(m.grouped_id, [])
+                            if messages:
+                                await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, is_mon, pid)
+                        else:
+                            if m.grouped_id in album_cache:
+                                album_cache[m.grouped_id].append(m)
                     else:
-                        logger.info(f"ℹ️ SKIPPING VAULT: Monitoring (is_mon) is OFF for pair {s_title}")
+                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid)
+                
+                # Exit the pair loop as we've handled this message
+                break
 
-                if not is_live: continue
-
-                # --- ALBUM / SINGLE MESSAGE LOGIC ---
-                if m.grouped_id:
-                    if m.grouped_id not in album_cache:
-                        album_cache[m.grouped_id] = [m]
-                        # Wait for all parts (10 items need a bit more time)
-                        await asyncio.sleep(3.5) 
-                        
-                        messages = album_cache.pop(m.grouped_id, [])
-                        if messages:
-                            await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, is_mon)
-                    else:
-                        if m.grouped_id in album_cache:
-                            album_cache[m.grouped_id].append(m)
-                else:
-                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon)
-
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, is_mon=True):
-        """Helper to send single or multiple messages (albums) with caption support"""
+    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, is_mon, pair_id):
+        """Unified Hub to send single or multiple messages (albums) and vault them"""
         try:
             if not messages: return
             first_msg = messages[0]
 
-            # --- LOG BOT SYNC ---
-            # Trigger the vault here for all media (single or album)
+            # --- DB COLLECTION ---
             if is_mon:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for m in messages:
+                        m_type = type(m.media).__name__ if m.media else "Text"
+                        if DATABASE_URL:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pair_id, sid, m.id, m_type, m.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, sid, m.id, m_type, m.message or "")
+                            )
+                
+                # Trigger the Log Bot Vaulting
                 await forward_to_log_targets(client, messages, first_msg.id)
 
-            # If mirroring is disabled, stop here
-            if not tid: return
+            # --- MIRRORING (LIVE FORWARD) ---
+            if not tid or not is_mir:
+                return # Stop here if mirroring is disabled or no target set
             
             dest_topic_id = default_t_topic
             
