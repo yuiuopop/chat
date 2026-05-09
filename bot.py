@@ -722,12 +722,28 @@ def setup_automation_handlers(client: TelegramClient):
                     if is_mir:
                         try:
                             source_topic_id = None
-                            if getattr(m, "reply_to_top_id", None):
-                                source_topic_id = m.reply_to_top_id
-                            elif m.reply_to:
-                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
-                            elif getattr(m, "forum_topic", False):
+                            source_topic_title = None
+                            # 1. Native topic detection
+                            if getattr(m, "reply_to", None):
+                                # Telegram forum object
+                                forum = getattr(m.reply_to, "forum_topic", None)
+                                if forum:
+                                    source_topic_title = getattr(forum, "title", None)
+                                # Main anchor ids
+                                source_topic_id = (
+                                    getattr(m, "reply_to_top_id", None)
+                                    or getattr(m.reply_to, "reply_to_top_id", None)
+                                    or getattr(m.reply_to, "reply_to_msg_id", None)
+                                )
+                            # 2. Topic starter message
+                            if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
+                                
+                            logger.warning(
+                                f"SOURCE TOPIC | MSG:{m.id} | "
+                                f"TOPIC_ID:{source_topic_id} | "
+                                f"TITLE:{source_topic_title}"
+                            )
                             
                             if source_topic_id:
                                 src_title = None
@@ -743,10 +759,23 @@ def setup_automation_handlers(client: TelegramClient):
                                         channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
-                                        if (getattr(st, "id", None) == source_topic_id or 
-                                            getattr(st, "top_message", None) == source_topic_id):
+                                        logger.warning(
+                                            f"TOPIC SCAN | "
+                                            f"ID:{getattr(st,'id',None)} | "
+                                            f"TOP:{getattr(st,'top_message',None)} | "
+                                            f"TITLE:{getattr(st,'title',None)}"
+                                        )
+                                        # Match ALL possible anchor styles
+                                        if source_topic_id in [
+                                            getattr(st, "id", None),
+                                            getattr(st, "top_message", None),
+                                        ]:
                                             src_title = st.title
                                             break
+                                            
+                                # fallback from forum object
+                                if not src_title and source_topic_title:
+                                    src_title = source_topic_title
                                 
                                 if src_title:
                                     mirrored_id = await get_or_create_target_topic(client, tid, src_title)
@@ -1568,14 +1597,28 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 if is_mir:
                     try:
                         source_topic_id = None
-                        if getattr(msg, "reply_to_top_id", None):
-                            source_topic_id = msg.reply_to_top_id
-                        elif msg.reply_to:
-                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
-                        elif getattr(msg, "forum_topic", False):
+                        source_topic_title = None
+                        # 1. Native topic detection
+                        if getattr(msg, "reply_to", None):
+                            # Telegram forum object
+                            forum = getattr(msg.reply_to, "forum_topic", None)
+                            if forum:
+                                source_topic_title = getattr(forum, "title", None)
+                            # Main anchor ids
+                            source_topic_id = (
+                                getattr(msg, "reply_to_top_id", None)
+                                or getattr(msg.reply_to, "reply_to_top_id", None)
+                                or getattr(msg.reply_to, "reply_to_msg_id", None)
+                            )
+                        # 2. Topic starter message
+                        if not source_topic_id and getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-                        
-                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
+                            
+                        logger.warning(
+                            f"SOURCE TOPIC | MSG:{msg.id} | "
+                            f"TOPIC_ID:{source_topic_id} | "
+                            f"TITLE:{source_topic_title}"
+                        )
                         
                         if source_topic_id:
                             src_title = None
@@ -1592,14 +1635,23 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                 ))
                                 for st in src_topics.topics:
                                     logger.warning(
-                                        f"TOPIC CHECK | ID:{getattr(st,'id',None)} | "
-                                        f"TOP:{getattr(st,'top_message',None)} | TITLE:{getattr(st,'title',None)}"
+                                        f"TOPIC SCAN | "
+                                        f"ID:{getattr(st,'id',None)} | "
+                                        f"TOP:{getattr(st,'top_message',None)} | "
+                                        f"TITLE:{getattr(st,'title',None)}"
                                     )
-                                    if (getattr(st, "id", None) == source_topic_id or 
-                                        getattr(st, "top_message", None) == source_topic_id):
+                                    # Match ALL possible anchor styles
+                                    if source_topic_id in [
+                                        getattr(st, "id", None),
+                                        getattr(st, "top_message", None),
+                                    ]:
                                         src_title = st.title
                                         break
-                            
+                                        
+                            # fallback from forum object
+                            if not src_title and source_topic_title:
+                                src_title = source_topic_title
+                                
                             logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
                             
                             if src_title:
