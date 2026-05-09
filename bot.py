@@ -757,7 +757,7 @@ def setup_automation_handlers(client: TelegramClient):
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             
-            # Normalize ID check
+            # Match Chat IDs (Normalizing strings)
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
 
@@ -766,80 +766,89 @@ def setup_automation_handlers(client: TelegramClient):
                 msg_topic_anchor = None
                 if m.reply_to:
                     msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+                
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
 
+                # Filter by topic if configured
                 if s_topic not in [None, 0, "0", 0]:
-                    if str(msg_topic_anchor) != str(s_topic): continue
+                    if str(msg_topic_anchor) != str(s_topic):
+                        continue
 
                 if not is_live: continue
 
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
-                    # It's part of an album
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        # Wait 2 seconds to ensure all parts of the album arrive
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2.5) # Time for all parts to arrive
                         
-                        # Process the full album
                         messages = album_cache.pop(m.grouped_id, [])
                         if messages:
                             await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
                     else:
-                        # Add this message to the existing collection
-                        if m.grouped_id in album_cache:
-                            album_cache[m.grouped_id].append(m)
+                        album_cache[m.grouped_id].append(m)
                 else:
-                    # It's a single message
                     await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
 
     async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Helper to send single or multiple messages (albums)"""
+        """Helper to send single or multiple messages (albums) with caption support"""
         try:
-            # 1. Resolve Topic Mapping if Mirroring is ON
             dest_topic_id = default_t_topic
             first_msg = messages[0]
             
+            # 1. Resolve Topic Mapping
             if is_mir:
                 source_top = None
                 if first_msg.reply_to:
                     source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
                 
                 if source_top:
-                    # Fallback title fetch
                     src_title = None
                     forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
                     if forum: src_title = getattr(forum, "title", None)
                     
                     if not src_title:
-                        res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                        for t in res.topics:
-                            if source_top in [t.id, t.top_message]:
-                                src_title = t.title
-                                break
+                        try:
+                            res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                            for t in res.topics:
+                                if source_top in [t.id, t.top_message]:
+                                    src_title = t.title
+                                    break
+                        except: pass
                     
                     if src_title:
                         dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
 
-            # 2. Resolve Reply mapping (only for the first message of an album)
+            # 2. Resolve Reply Mapping
             reply_to_mapped = None
             if getattr(first_msg, "reply_to_msg_id", None):
                 reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
 
             final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
 
-            # 3. Send Content
+            # 3. CAPTION LOGIC: Find the message in the group that has the text
+            album_caption = ""
+            for msg in messages:
+                if msg.message:
+                    album_caption = msg.message
+                    break
+
+            # 4. Send Content
             if len(messages) > 1:
                 # Send as ALBUM
-                sent_messages = await client.send_message(
-                    entity=tid,
-                    file=messages, 
-                    reply_to=int(final_reply_target) if final_reply_target else None
-                )
-                # Map the first message for reply tracking
-                if sent_messages and isinstance(sent_messages, list):
-                    save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                try:
+                    sent_messages = await client.send_message(
+                        entity=tid,
+                        message=album_caption, # Apply the found caption here
+                        file=messages, 
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
+                    if sent_messages and isinstance(sent_messages, list):
+                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
+                    await asyncio.sleep(5)
+                    await client.send_message(entity=tid, message=album_caption, file=messages, reply_to=int(final_reply_target) if final_reply_target else None)
             else:
                 # Send as SINGLE
                 sent_msg = await client.send_message(
