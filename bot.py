@@ -697,17 +697,11 @@ def setup_automation_handlers(client: TelegramClient):
             if str(abs(int(m.chat_id))) == str(abs(int(sid))):
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
-                    msg_topic_anchor = None
-                    if getattr(m, "reply_to", None):
-                        msg_topic_anchor = (
-                            getattr(m, "reply_to_top_id", None)
-                            or getattr(m.reply_to, "reply_to_top_id", None)
-                            or getattr(m.reply_to, "reply_to_msg_id", None)
-                        )
-                    if not msg_topic_anchor and getattr(m, "forum_topic", False):
-                        msg_topic_anchor = m.id
+                    msg_topic_anchor = getattr(m, "reply_to_top_id", None)
+                    if not msg_topic_anchor and m.reply_to:
+                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
                     
-                    if str(msg_topic_anchor) != str(s_topic):
+                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -764,6 +758,7 @@ def setup_automation_handlers(client: TelegramClient):
                                     src_topics = await client(functions.channels.GetForumTopicsRequest(
                                         channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
+                                    matched_topic = None
                                     for st in src_topics.topics:
                                         logger.warning(
                                             f"TOPIC SCAN | "
@@ -776,8 +771,13 @@ def setup_automation_handlers(client: TelegramClient):
                                             getattr(st, "id", None),
                                             getattr(st, "top_message", None),
                                         ]:
-                                            src_title = st.title
+                                            matched_topic = st
                                             break
+                                            
+                                    if matched_topic:
+                                        src_title = matched_topic.title
+                                        # IMPORTANT: normalize to top_message ONLY for database stability
+                                        source_topic_id = matched_topic.top_message
                                             
                                 # fallback from forum object
                                 if not src_title and source_topic_title:
@@ -1639,6 +1639,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                 src_topics = await userbot(functions.channels.GetForumTopicsRequest(
                                     channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                 ))
+                                matched_topic = None
                                 for st in src_topics.topics:
                                     logger.warning(
                                         f"TOPIC SCAN | "
@@ -1651,8 +1652,13 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                         getattr(st, "id", None),
                                         getattr(st, "top_message", None),
                                     ]:
-                                        src_title = st.title
+                                        matched_topic = st
                                         break
+                                        
+                                if matched_topic:
+                                    src_title = matched_topic.title
+                                    # IMPORTANT: normalize to top_message ONLY for database stability
+                                    source_topic_id = matched_topic.top_message
                                         
                             # fallback from forum object
                             if not src_title and source_topic_title:
