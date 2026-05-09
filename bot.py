@@ -30,7 +30,8 @@ load_dotenv()
 # Config
 # -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+bot_fleet = {} # { bot_id: telebot_instance })
 PORT = int(os.getenv("PORT", "8080"))
 
 if not BOT_TOKEN:
@@ -927,7 +928,7 @@ async def ensure_userbot():
     return True, "Connected"
 
 async def forward_to_log_targets(client, message, source_chat_id, source_msg_id):
-    if not message or not message.media: return
+    if not message: return
     targets = get_log_targets()
     if not targets: return
     
@@ -944,17 +945,34 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             vaulted = await message.forward_to(int(log_chat_id))
         except:
             # Fallback to re-sending if forward is restricted
-            vaulted = await client.send_message(int(log_chat_id), file=message.media, message=message.message or "")
+            vaulted = await client.send_message(int(log_chat_id), file=message.media if message.media else None, message=message.message or "")
             
-        if vaulted and vaulted.media:
+        if vaulted:
             try:
-                fid = pack_bot_file_id(vaulted.media)
-                save_media_log(source_chat_id, source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
+                m_type = "text"
+                fid = "TEXT"
+                if vaulted.media:
+                    fid = pack_bot_file_id(vaulted.media)
+                    m_type = type(vaulted.media).__name__
+                
+                save_media_log(source_chat_id, source_msg_id, log_chat_id, fid, m_type)
                 logger.info(f"VAULT: Message {source_msg_id} saved to {t_name}")
+                
+                # Notify Admin via the Log Bot (if available) or Main Bot
+                notif_text = f"📦 **Vaulted from {t_name}**\n🆔 ID: `{source_msg_id}`\n📂 Type: `{m_type}`"
+                if vaulted.message and len(vaulted.message) < 100:
+                    notif_text += f"\n📝 Content: _{vaulted.message}_"
+                
+                l_bot = bot_fleet.get(int(log_chat_id))
+                if l_bot:
+                    l_bot.send_message(ADMIN_ID, notif_text, parse_mode="Markdown")
+                else:
+                    bot.send_message(ADMIN_ID, notif_text, parse_mode="Markdown")
+                    
             except Exception as ex:
-                logger.error(f"VAULT ERROR: Failed to pack file_id: {ex}")
+                logger.error(f"VAULT ERROR: Failed to pack/save: {ex}")
     except Exception as e:
-        logger.error(f"VAULT ERROR: Failed to log media to {t_name}: {e}")
+        logger.error(f"VAULT ERROR: Failed to log message to {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -2132,7 +2150,9 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                 m_type_lower = (m_type or "").lower()
                 cap = caption or ""
                 
-                if "photo" in m_type_lower:
+                if fid == "TEXT":
+                    sender_bot.send_message(target_id, cap or " (Empty Text Message) ")
+                elif "photo" in m_type_lower:
                     sender_bot.send_photo(target_id, file_id, caption=cap)
                 elif "video" in m_type_lower:
                     sender_bot.send_video(target_id, file_id, caption=cap)
@@ -2279,6 +2299,7 @@ def setup_log_bot(token):
     try:
         bot_info = log_bot.get_me()
         bot_id = bot_info.id
+        bot_fleet[bot_id] = log_bot
     except: return
 
     @log_bot.message_handler(commands=['start'])
@@ -2328,7 +2349,9 @@ def setup_log_bot(token):
                 log_bot.send_chat_action(message.chat.id, 'upload_document')
                 caption = f"✅ **Extracted from My Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
                 
-                if "photo" in m_type:
+                if file_id == "TEXT":
+                    log_bot.send_message(message.chat.id, caption or " (Empty Text Message) ", parse_mode="Markdown")
+                elif "photo" in m_type:
                     log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
                 elif "video" in m_type:
                     log_bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
