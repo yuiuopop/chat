@@ -754,11 +754,18 @@ def setup_automation_handlers(client: TelegramClient):
             if str(abs(int(m.chat_id))) == str(abs(int(sid))):
                 # Topic filtering (0 or None means entire group/chat)
                 if s_topic not in [None, 0, "0"]:
-                    msg_topic_anchor = getattr(m, "reply_to_top_id", None)
-                    if not msg_topic_anchor and m.reply_to:
-                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
-                    
-                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
+                    # IMPROVED DETECTION
+                    msg_topic_anchor = None
+                    if m.reply_to:
+                        # If direct post in topic, msg_id is the Topic ID
+                        # If reply to someone else, top_id is the Topic ID
+                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+
+                    # Check if message is actually the topic header itself
+                    if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                        msg_topic_anchor = m.id
+
+                    if str(msg_topic_anchor) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -835,13 +842,15 @@ def setup_automation_handlers(client: TelegramClient):
                         logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
                         
                         # 3. Reply Mirroring
+                        # Resolve target: prioritize mapped message reply, then topic anchor
                         reply_to_val = None
                         if getattr(m, "reply_to_msg_id", None):
                             reply_to_val = get_message_mapping(sid, m.reply_to_msg_id, tid)
                         
-                        # Standardize anchors
-                        if target_topic_anchor:
-                            target_topic_anchor = int(target_topic_anchor)
+                        # Stabilized Anchor: use the specific reply if found, else the topic header
+                        final_anchor = reply_to_val if reply_to_val else target_topic_anchor
+                        if final_anchor:
+                            final_anchor = int(final_anchor)
 
                         sent_msg = None
                         if m.media:
@@ -849,15 +858,13 @@ def setup_automation_handlers(client: TelegramClient):
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                reply_to=reply_to_val,
-                                comment_to=target_topic_anchor if not reply_to_val else None
+                                reply_to=final_anchor
                             )
                         else:
                             sent_msg = await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                reply_to=reply_to_val,
-                                comment_to=target_topic_anchor if not reply_to_val else None
+                                reply_to=final_anchor
                             )
                         
                         # 4. Save Message Mapping
@@ -1715,15 +1722,16 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 if getattr(msg, "reply_to_msg_id", None):
                     reply_to_val = get_message_mapping(sid, msg.reply_to_msg_id, tid_ref)
 
-                if target_topic_anchor:
-                    target_topic_anchor = int(target_topic_anchor)
+                # Stabilized Anchor
+                final_anchor = reply_to_val if reply_to_val else target_topic_anchor
+                if final_anchor:
+                    final_anchor = int(final_anchor)
 
                 sent_msg = await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    reply_to=reply_to_val,
-                    comment_to=target_topic_anchor if not reply_to_val else None
+                    reply_to=final_anchor
                 )
                 
                 # 4. Save Message Mapping
