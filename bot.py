@@ -128,17 +128,6 @@ def init_db():
                 c.execute("ALTER TABLE target_pairs DROP CONSTRAINT IF EXISTS target_pairs_source_id_target_id_key")
                 c.execute("ALTER TABLE target_pairs ADD CONSTRAINT unique_pair_topics UNIQUE (source_id, source_topic_id, target_id, target_topic_id)")
             except: pass
-            
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS topic_mappings (
-                    id SERIAL PRIMARY KEY,
-                    source_chat_id BIGINT,
-                    source_topic_id BIGINT,
-                    target_chat_id BIGINT,
-                    target_topic_id BIGINT,
-                    UNIQUE(source_chat_id, source_topic_id, target_chat_id)
-                )
-            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
@@ -187,17 +176,6 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
             except: pass
-
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS topic_mappings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_chat_id BIGINT,
-                    source_topic_id BIGINT,
-                    target_chat_id BIGINT,
-                    target_topic_id BIGINT,
-                    UNIQUE(source_chat_id, source_topic_id, target_chat_id)
-                )
-            """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,42 +238,6 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
             )
-
-def save_topic_mapping(s_chat, s_topic, t_chat, t_topic):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if DATABASE_URL:
-            c.execute(
-                """
-                INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT(source_chat_id, source_topic_id, target_chat_id) 
-                DO UPDATE SET target_topic_id = EXCLUDED.target_topic_id
-                """,
-                (s_chat, s_topic, t_chat, t_topic)
-            )
-        else:
-            c.execute(
-                """
-                INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(source_chat_id, source_topic_id, target_chat_id) 
-                DO UPDATE SET target_topic_id = excluded.target_topic_id
-                """,
-                (s_chat, s_topic, t_chat, t_topic)
-            )
-
-def get_topic_mapping(s_chat, s_topic, t_chat):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(
-            f"SELECT target_topic_id FROM topic_mappings WHERE source_chat_id = {p} AND source_topic_id = {p} AND target_chat_id = {p}",
-            (s_chat, s_topic, t_chat)
-        )
-        row = c.fetchone()
-        return row[0] if row else None
 
 def get_target_pairs():
     with db_conn() as conn:
@@ -571,30 +513,21 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
-async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
+async def get_or_create_target_topic(client, target_chat_id, topic_title):
     """
     Search for a topic by title in target chat. If not found, create it.
-    Uses database mapping first, then topic_cache.
+    Uses topic_cache to avoid API spam.
     """
     if not topic_title: return None
     
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
     
-    # 1) Check Database Mapping (Most Reliable)
-    if source_chat_id and source_topic_id:
-        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
-        if existing_mapping:
-            return existing_mapping
-    
-    # 2) Check Cache
+    # 1) Check Cache
     if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
-        res = topic_cache[t_chat_id][title_key]
-        if source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-        return res
+        return topic_cache[t_chat_id][title_key]
     
-    # 3) Fetch Topics from Telegram
+    # 2) Fetch Topics from Telegram
     try:
         result = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
@@ -611,18 +544,17 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
             
         if title_key in topic_cache[t_chat_id]:
-            res = topic_cache[t_chat_id][title_key]
-            if source_chat_id and source_topic_id:
-                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-            return res
+            return topic_cache[t_chat_id][title_key]
             
-        # 4) Create if not found
+        # 3) Create if not found
         logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
             title=topic_title
         ))
         
+        # Telethon CreateForumTopic returns updates. Usually the topic is in updates[1]
+        # But let's be safer and re-fetch briefly or search in result
         await asyncio.sleep(1)
         res_after = await client(functions.channels.GetForumTopicsRequest(
             channel=t_chat_id,
@@ -631,11 +563,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         for t in res_after.topics:
             topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
             
-        final_id = topic_cache[t_chat_id].get(title_key)
-        if final_id and source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
-            
-        return final_id
+        return topic_cache[t_chat_id].get(title_key)
         
     except Exception as e:
         logger.error(f"Mirroring Error (get_or_create): {e}")
@@ -700,12 +628,9 @@ def setup_automation_handlers(client: TelegramClient):
                 if s_topic not in [None, 0, "0"]:
                     msg_topic_anchor = getattr(m, "reply_to_top_id", None)
                     if not msg_topic_anchor and m.reply_to:
-                        msg_topic_anchor = (
-                            getattr(m.reply_to, "reply_to_top_id", None) 
-                            or getattr(m.reply_to, "reply_to_msg_id", None)
-                        )
+                        msg_topic_anchor = getattr(m.reply_to, "reply_to_top_id", None) or getattr(m.reply_to, "reply_to_msg_id", None)
                     
-                    if str(msg_topic_anchor) != str(s_topic):
+                    if str(msg_topic_anchor) != str(s_topic) and str(m.id) != str(s_topic):
                         continue
 
                 # 1) Monitor
@@ -726,25 +651,12 @@ def setup_automation_handlers(client: TelegramClient):
                     if is_mir:
                         try:
                             source_topic_id = None
-                            # Normal topic messages
                             if getattr(m, "reply_to_top_id", None):
                                 source_topic_id = m.reply_to_top_id
-                            # Replies inside topic
-                            elif getattr(m, "reply_to", None):
-                                source_topic_id = (
-                                    getattr(m.reply_to, "reply_to_top_id", None)
-                                    or getattr(m.reply_to, "reply_to_msg_id", None)
-                                )
-                            # Topic starter message
+                            elif m.reply_to:
+                                source_topic_id = m.reply_to.reply_to_top_id or m.reply_to.reply_to_msg_id
                             elif getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
-
-                            logger.warning(
-                                f"SOURCE TOPIC DETECT | "
-                                f"MSG:{m.id} | "
-                                f"TOPIC:{source_topic_id} | "
-                                f"FORUM:{getattr(m, 'forum_topic', False)}"
-                            )
                             
                             if source_topic_id:
                                 src_title = None
@@ -760,36 +672,32 @@ def setup_automation_handlers(client: TelegramClient):
                                         channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                     ))
                                     for st in src_topics.topics:
-                                        if getattr(st, "top_message", None) == source_topic_id:
+                                        if (getattr(st, "id", None) == source_topic_id or 
+                                            getattr(st, "top_message", None) == source_topic_id):
                                             src_title = st.title
                                             break
                                 
                                 if src_title:
-                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
+                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
                                     if mirrored_id:
                                         target_topic_anchor = mirrored_id
                         except Exception as me:
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
-                        logger.warning(
-                            f"SEND DEBUG | "
-                            f"TARGET:{tid} | "
-                            f"REPLY_TO:{target_topic_anchor} | "
-                            f"TEXT:{m.message[:30] if m.message else 'MEDIA'}"
-                        )
+                        logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
                         if m.media:
                             await client.send_file(
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                comment_to=target_topic_anchor
+                                reply_to=target_topic_anchor
                             )
                         else:
                             await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                comment_to=target_topic_anchor
+                                reply_to=target_topic_anchor
                             )
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
@@ -1585,25 +1493,14 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 if is_mir:
                     try:
                         source_topic_id = None
-                        # Normal topic messages
                         if getattr(msg, "reply_to_top_id", None):
                             source_topic_id = msg.reply_to_top_id
-                        # Replies inside topic
-                        elif getattr(msg, "reply_to", None):
-                            source_topic_id = (
-                                getattr(msg.reply_to, "reply_to_top_id", None)
-                                or getattr(msg.reply_to, "reply_to_msg_id", None)
-                            )
-                        # Topic starter message
+                        elif msg.reply_to:
+                            source_topic_id = msg.reply_to.reply_to_top_id or msg.reply_to.reply_to_msg_id
                         elif getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-
-                        logger.warning(
-                            f"SOURCE TOPIC DETECT | "
-                            f"MSG:{msg.id} | "
-                            f"TOPIC:{source_topic_id} | "
-                            f"FORUM:{getattr(msg, 'forum_topic', False)}"
-                        )
+                        
+                        logger.warning(f"MIRROR DEBUG | MSG:{msg.id} | SRC_TOPIC:{source_topic_id}")
                         
                         if source_topic_id:
                             src_title = None
@@ -1619,29 +1516,31 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                     channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                 ))
                                 for st in src_topics.topics:
-                                    if getattr(st, "top_message", None) == source_topic_id:
+                                    logger.warning(
+                                        f"TOPIC CHECK | ID:{getattr(st,'id',None)} | "
+                                        f"TOP:{getattr(st,'top_message',None)} | TITLE:{getattr(st,'title',None)}"
+                                    )
+                                    if (getattr(st, "id", None) == source_topic_id or 
+                                        getattr(st, "top_message", None) == source_topic_id):
                                         src_title = st.title
                                         break
                             
+                            logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
+                            
                             if src_title:
-                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
+                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title)
                                 logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
                                 if mirrored_id:
                                     target_topic_anchor = mirrored_id
                     except Exception as me:
                         logger.error(f"Release Mirror Error: {me}")
 
-                logger.warning(
-                    f"SEND DEBUG | "
-                    f"TARGET:{tid_ref} | "
-                    f"REPLY_TO:{target_topic_anchor} | "
-                    f"TEXT:{msg.message[:30] if msg.message else 'MEDIA'}"
-                )
+                logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
                 await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    comment_to=target_topic_anchor
+                    reply_to=target_topic_anchor
                 )
                 
                 with db_conn() as conn:
