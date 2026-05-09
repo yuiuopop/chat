@@ -1016,9 +1016,12 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
+                
+                if not msg_topic_anchor and m.reply_to_msg_id:
+                    msg_topic_anchor = m.reply_to_msg_id
 
                 # Specific topic filtering
-                if s_topic not in [None, 0, "0", 0]:
+                if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
