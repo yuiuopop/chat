@@ -929,16 +929,22 @@ async def forward_to_log_targets(client, message, source_msg_id):
         asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
 
 async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
-    """Helper to re-send to vault natively and save the permanent File ID"""
+    """Heavy-duty helper to re-send and index media with forced entity resolution"""
     try:
-        # Resolve the entity first to avoid "Could not find input entity"
+        log_chat_id = int(log_chat_id)
+        # Force entity resolution using Peer wrappers
         try:
-            target = await client.get_input_entity(int(log_chat_id))
+            # Try resolving as a User first (most Log Bots are users)
+            target = await client.get_input_entity(types.PeerUser(log_chat_id))
         except:
-            # Fallback for usernames or cached names
-            target = await client.get_entity(int(log_chat_id))
+            try:
+                # Try as a Channel/Group
+                target = await client.get_input_entity(types.PeerChannel(log_chat_id))
+            except:
+                # Final fallback to standard resolution
+                target = await client.get_entity(log_chat_id)
 
-        # Re-send natively (no forward) to avoid "Forwarded from" tags
+        # Re-send natively
         vaulted = await client.send_message(
             target, 
             file=message.media, 
@@ -947,16 +953,18 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
             
         if vaulted and vaulted.media:
             try:
-                # Target the inner media object for packing
                 inner_media = vaulted.media
-                if hasattr(vaulted.media, 'photo'): inner_media = vaulted.media.photo
-                elif hasattr(vaulted.media, 'document'): inner_media = vaulted.media.document
+                # Deep dive into media objects for packing
+                if hasattr(vaulted.media, 'photo'):
+                    inner_media = vaulted.media.photo
+                elif hasattr(vaulted.media, 'document'):
+                    inner_media = vaulted.media.document
                 
                 fid = pack_bot_file_id(inner_media)
                 save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                logger.info(f"📤 VAULT SUCCESS: [Target: {t_name}] [Source Msg ID: {source_msg_id}]")
+                logger.info(f"📤 VAULT SUCCESS: [Target: {t_name}] [Source ID: {source_msg_id}]")
             except Exception as ex:
-                logger.error(f"❌ VAULT INDEX ERROR: Failed to pack file_id: {ex}")
+                logger.error(f"❌ VAULT INDEX ERROR: Failed to pack: {ex} | Media: {type(vaulted.media).__name__}")
     except Exception as e:
         logger.error(f"❌ VAULT SEND ERROR: Failed to re-send media to {t_name}: {e}")
 
