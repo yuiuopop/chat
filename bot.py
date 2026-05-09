@@ -761,10 +761,7 @@ def setup_automation_handlers(client: TelegramClient):
                         # Use explicit ReplyTo for forum topics to ensure thread context
                         reply_to_param = None
                         if target_topic_anchor:
-                            reply_to_param = types.InputReplyToMessage(
-                                reply_to_msg_id=int(target_topic_anchor),
-                                top_msg_id=int(target_topic_anchor)
-                            )
+                            reply_to_param = int(target_topic_anchor)
 
                         if m.media:
                             await client.send_file(
@@ -1620,10 +1617,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # Use explicit ReplyTo for forum topics to ensure thread context
                 reply_to_param = None
                 if target_topic_anchor:
-                    reply_to_param = types.InputReplyToMessage(
-                        reply_to_msg_id=int(target_topic_anchor),
-                        top_msg_id=int(target_topic_anchor)
-                    )
+                    reply_to_param = int(target_topic_anchor)
 
                 await userbot.send_message(
                     entity=tid_ref,
