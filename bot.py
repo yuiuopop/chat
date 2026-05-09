@@ -928,24 +928,24 @@ async def forward_to_log_targets(client, message, source_msg_id):
         asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
 
 async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
-    """Helper to forward to vault and save the permanent File ID"""
+    """Helper to re-send to vault natively and save the permanent File ID"""
     try:
-        # Try native forward first (efficient)
-        try:
-            vaulted = await message.forward_to(int(log_chat_id))
-        except:
-            # Fallback to re-sending if forward is restricted
-            vaulted = await client.send_message(int(log_chat_id), file=message.media, message=message.message or "")
+        # Re-send natively (no forward) to avoid "Forwarded from" tags
+        vaulted = await client.send_message(
+            int(log_chat_id), 
+            file=message.media, 
+            message=message.message or ""
+        )
             
         if vaulted and vaulted.media:
             try:
                 fid = pack_bot_file_id(vaulted.media)
                 save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                logger.info(f"VAULT: Message {source_msg_id} saved to {t_name}")
+                logger.info(f"VAULT: Message {source_msg_id} re-sent to {t_name}")
             except Exception as ex:
                 logger.error(f"VAULT ERROR: Failed to pack file_id: {ex}")
     except Exception as e:
-        logger.error(f"VAULT ERROR: Failed to log media to {t_name}: {e}")
+        logger.error(f"VAULT ERROR: Failed to re-send media to {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -1042,12 +1042,8 @@ def setup_automation_handlers(client: TelegramClient):
                     if src_title:
                         dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
 
-            # Resolve Reply Mapping
-            reply_to_mapped = None
-            if getattr(first_msg, "reply_to_msg_id", None):
-                reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-
-            final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
+            # Resolve Target Topic Only (No message-to-message reply linking)
+            final_reply_target = dest_topic_id
 
             # --- CAPTION SUPPORT ---
             # Search all messages in the grouping to find the one with the text
