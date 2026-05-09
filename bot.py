@@ -747,6 +747,7 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
+        print(f"Incoming msg from {m.chat_id} | ReplyTo: {m.reply_to}")
         # Fetch active pairs
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
@@ -780,15 +781,27 @@ def setup_automation_handlers(client: TelegramClient):
                             # 1. Detect Source Topic
                             source_topic_id = None
                             source_topic_title = None
-                            if getattr(m, "reply_to", None):
+                            
+                            # A) Check Action (Topic Creation/Edit)
+                            if getattr(m, "action", None):
+                                if isinstance(m.action, (types.MessageActionTopicCreate, types.MessageActionTopicEdit)):
+                                    source_topic_id = m.id
+                                    source_topic_title = getattr(m.action, "title", None)
+
+                            # B) Check Reply Metadata (Most Common)
+                            if not source_topic_id and getattr(m, "reply_to", None):
                                 forum = getattr(m.reply_to, "forum_topic", None)
                                 if forum:
                                     source_topic_title = getattr(forum, "title", None)
+                                
+                                # Canonical anchor search
                                 source_topic_id = (
                                     getattr(m, "reply_to_top_id", None)
                                     or getattr(m.reply_to, "reply_to_top_id", None)
                                     or getattr(m.reply_to, "reply_to_msg_id", None)
                                 )
+
+                            # C) Check Forum Flag
                             if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
                             
@@ -1647,7 +1660,15 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                         # 1. Detect Source Topic
                         source_topic_id = None
                         source_topic_title = None
-                        if getattr(msg, "reply_to", None):
+                        
+                        # A) Check Action
+                        if getattr(msg, "action", None):
+                            if isinstance(msg.action, (types.MessageActionTopicCreate, types.MessageActionTopicEdit)):
+                                source_topic_id = msg.id
+                                source_topic_title = getattr(msg.action, "title", None)
+
+                        # B) Check Reply Metadata
+                        if not source_topic_id and getattr(msg, "reply_to", None):
                             forum = getattr(msg.reply_to, "forum_topic", None)
                             if forum:
                                 source_topic_title = getattr(forum, "title", None)
@@ -1656,6 +1677,8 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                                 or getattr(msg.reply_to, "reply_to_top_id", None)
                                 or getattr(msg.reply_to, "reply_to_msg_id", None)
                             )
+                        
+                        # C) Check Forum Flag
                         if not source_topic_id and getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
                         
