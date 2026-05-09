@@ -140,6 +140,16 @@ def init_db():
                 )
             """)
             c.execute("""
+                CREATE TABLE IF NOT EXISTS message_mappings (
+                    id SERIAL PRIMARY KEY,
+                    source_chat_id BIGINT,
+                    source_msg_id BIGINT,
+                    target_chat_id BIGINT,
+                    target_msg_id BIGINT,
+                    UNIQUE(source_chat_id, source_msg_id, target_chat_id)
+                )
+            """)
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
                     source_chat_id BIGINT,
@@ -195,6 +205,16 @@ def init_db():
                     target_chat_id BIGINT,
                     target_topic_id BIGINT,
                     UNIQUE(source_chat_id, source_topic_id, target_chat_id)
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS message_mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id BIGINT,
+                    source_msg_id BIGINT,
+                    target_chat_id BIGINT,
+                    target_msg_id BIGINT,
+                    UNIQUE(source_chat_id, source_msg_id, target_chat_id)
                 )
             """)
             c.execute("""
@@ -292,6 +312,42 @@ def get_topic_mapping(s_chat, s_topic, t_chat):
         c.execute(
             f"SELECT target_topic_id FROM topic_mappings WHERE source_chat_id = {p} AND source_topic_id = {p} AND target_chat_id = {p}",
             (s_chat, s_topic, t_chat)
+        )
+        row = c.fetchone()
+        return row[0] if row else None
+
+def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                """
+                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT(source_chat_id, source_msg_id, target_chat_id) 
+                DO UPDATE SET target_msg_id = EXCLUDED.target_msg_id
+                """,
+                (s_chat, s_msg, t_chat, t_msg)
+            )
+        else:
+            c.execute(
+                """
+                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_chat_id, source_msg_id, target_chat_id) 
+                DO UPDATE SET target_msg_id = excluded.target_msg_id
+                """,
+                (s_chat, s_msg, t_chat, t_msg)
+            )
+
+def get_message_mapping(s_chat, s_msg, t_chat):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(
+            f"SELECT target_msg_id FROM message_mappings WHERE source_chat_id = {p} AND source_msg_id = {p} AND target_chat_id = {p}",
+            (s_chat, s_msg, t_chat)
         )
         row = c.fetchone()
         return row[0] if row else None
@@ -721,94 +777,80 @@ def setup_automation_handlers(client: TelegramClient):
                     # Mirroring Logic
                     if is_mir:
                         try:
+                            # 1. Detect Source Topic
                             source_topic_id = None
                             source_topic_title = None
-                            # 1. Native topic detection
                             if getattr(m, "reply_to", None):
-                                # Telegram forum object
                                 forum = getattr(m.reply_to, "forum_topic", None)
                                 if forum:
                                     source_topic_title = getattr(forum, "title", None)
-                                # Main anchor ids
                                 source_topic_id = (
                                     getattr(m, "reply_to_top_id", None)
                                     or getattr(m.reply_to, "reply_to_top_id", None)
                                     or getattr(m.reply_to, "reply_to_msg_id", None)
                                 )
-                            # 2. Topic starter message
                             if not source_topic_id and getattr(m, "forum_topic", False):
                                 source_topic_id = m.id
-                                
-                            logger.warning(
-                                f"SOURCE TOPIC | MSG:{m.id} | "
-                                f"TOPIC_ID:{source_topic_id} | "
-                                f"TITLE:{source_topic_title}"
-                            )
                             
                             if source_topic_id:
-                                src_title = None
-                                # 1) Direct metadata
-                                if getattr(m, "reply_to", None):
-                                    forum = getattr(m.reply_to, "forum_topic", None)
-                                    if forum and getattr(forum, "title", None):
-                                        src_title = forum.title
-                                
-                                # 2) Fetch fallback
-                                if not src_title:
-                                    src_topics = await client(functions.channels.GetForumTopicsRequest(
-                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                    ))
-                                    matched_topic = None
-                                    for st in src_topics.topics:
-                                        logger.warning(
-                                            f"TOPIC SCAN | "
-                                            f"ID:{getattr(st,'id',None)} | "
-                                            f"TOP:{getattr(st,'top_message',None)} | "
-                                            f"TITLE:{getattr(st,'title',None)}"
-                                        )
-                                        # Match ALL possible anchor styles
-                                        if source_topic_id in [
-                                            getattr(st, "id", None),
-                                            getattr(st, "top_message", None),
-                                        ]:
-                                            matched_topic = st
-                                            break
-                                            
-                                    if matched_topic:
-                                        src_title = matched_topic.title
-                                        # IMPORTANT: normalize to top_message ONLY for database stability
-                                        source_topic_id = matched_topic.top_message
-                                            
-                                # fallback from forum object
-                                if not src_title and source_topic_title:
+                                # 2. Check Database Mapping FIRST (Efficiency)
+                                mapped_target = get_topic_mapping(sid, source_topic_id, tid)
+                                if mapped_target:
+                                    target_topic_anchor = mapped_target
+                                else:
+                                    # 3. Canonical Normalization & Resolution
                                     src_title = source_topic_title
-                                
-                                if src_title:
-                                    mirrored_id = await get_or_create_target_topic(client, tid, src_title)
-                                    if mirrored_id:
-                                        target_topic_anchor = mirrored_id
+                                    if not src_title:
+                                        src_topics = await client(functions.channels.GetForumTopicsRequest(
+                                            channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        ))
+                                        matched_topic = None
+                                        for st in src_topics.topics:
+                                            if source_topic_id in [st.id, st.top_message]:
+                                                matched_topic = st
+                                                break
+                                        if matched_topic:
+                                            src_title = matched_topic.title
+                                            source_topic_id = matched_topic.top_message # Normalize to top_message
+                                    
+                                    if src_title:
+                                        target_topic_anchor = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                         except Exception as me:
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
                         logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
                         
+                        # 3. Reply Mirroring
+                        reply_to_val = None
+                        if getattr(m, "reply_to_msg_id", None):
+                            reply_to_val = get_message_mapping(sid, m.reply_to_msg_id, tid)
+                        
+                        # Standardize anchors
                         if target_topic_anchor:
                             target_topic_anchor = int(target_topic_anchor)
 
+                        sent_msg = None
                         if m.media:
-                            await client.send_file(
+                            sent_msg = await client.send_file(
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                comment_to=target_topic_anchor
+                                reply_to=reply_to_val,
+                                comment_to=target_topic_anchor if not reply_to_val else None
                             )
                         else:
-                            await client.send_message(
+                            sent_msg = await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                comment_to=target_topic_anchor
+                                reply_to=reply_to_val,
+                                comment_to=target_topic_anchor if not reply_to_val else None
                             )
+                        
+                        # 4. Save Message Mapping
+                        if sent_msg:
+                            save_message_mapping(sid, m.id, tid, sent_msg.id)
+                            
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
 
@@ -1586,106 +1628,71 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
         sent = 0
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}"))
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items...", reply_markup=markup)
-        
-        for row_id, smid in items:
-            if not running_tasks.get(task_key):
-                bot.send_message(admin_chat_id, f"🛑 Release stopped by user.")
-                break
-            try:
-                target_topic_anchor = t_topic
-                msg = await userbot.get_messages(sid, ids=smid)
-                if not msg:
-                    continue
-
-                # MIRROR MODE LOGIC
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{pair_id}")                # MIRROR MODE LOGIC
                 if is_mir:
                     try:
+                        # 1. Detect Source Topic
                         source_topic_id = None
                         source_topic_title = None
-                        # 1. Native topic detection
                         if getattr(msg, "reply_to", None):
-                            # Telegram forum object
                             forum = getattr(msg.reply_to, "forum_topic", None)
                             if forum:
                                 source_topic_title = getattr(forum, "title", None)
-                            # Main anchor ids
                             source_topic_id = (
                                 getattr(msg, "reply_to_top_id", None)
                                 or getattr(msg.reply_to, "reply_to_top_id", None)
                                 or getattr(msg.reply_to, "reply_to_msg_id", None)
                             )
-                        # 2. Topic starter message
                         if not source_topic_id and getattr(msg, "forum_topic", False):
                             source_topic_id = msg.id
-                            
-                        logger.warning(
-                            f"SOURCE TOPIC | MSG:{msg.id} | "
-                            f"TOPIC_ID:{source_topic_id} | "
-                            f"TITLE:{source_topic_title}"
-                        )
                         
                         if source_topic_id:
-                            src_title = None
-                            # 1) Try direct forum object first (fastest)
-                            if getattr(msg, "reply_to", None):
-                                forum = getattr(msg.reply_to, "forum_topic", None)
-                                if forum and getattr(forum, "title", None):
-                                    src_title = forum.title
-                            
-                            # 2) Fallback to topic fetch (thorough)
-                            if not src_title:
-                                src_topics = await userbot(functions.channels.GetForumTopicsRequest(
-                                    channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                ))
-                                matched_topic = None
-                                for st in src_topics.topics:
-                                    logger.warning(
-                                        f"TOPIC SCAN | "
-                                        f"ID:{getattr(st,'id',None)} | "
-                                        f"TOP:{getattr(st,'top_message',None)} | "
-                                        f"TITLE:{getattr(st,'title',None)}"
-                                    )
-                                    # Match ALL possible anchor styles
-                                    if source_topic_id in [
-                                        getattr(st, "id", None),
-                                        getattr(st, "top_message", None),
-                                    ]:
-                                        matched_topic = st
-                                        break
-                                        
-                                if matched_topic:
-                                    src_title = matched_topic.title
-                                    # IMPORTANT: normalize to top_message ONLY for database stability
-                                    source_topic_id = matched_topic.top_message
-                                        
-                            # fallback from forum object
-                            if not src_title and source_topic_title:
+                            # 2. Check Database Mapping FIRST
+                            mapped_target = get_topic_mapping(sid, source_topic_id, tid_ref)
+                            if mapped_target:
+                                target_topic_anchor = mapped_target
+                            else:
+                                # 3. Canonical Normalization & Resolution
                                 src_title = source_topic_title
+                                if not src_title:
+                                    src_topics = await userbot(functions.channels.GetForumTopicsRequest(
+                                        channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                    ))
+                                    matched_topic = None
+                                    for st in src_topics.topics:
+                                        if source_topic_id in [st.id, st.top_message]:
+                                            matched_topic = st
+                                            break
+                                    if matched_topic:
+                                        src_title = matched_topic.title
+                                        source_topic_id = matched_topic.top_message # Normalize
                                 
-                            logger.warning(f"MIRROR TITLE | TOPIC:{source_topic_id} | TITLE:{src_title}")
-                            
-                            if src_title:
-                                mirrored_id = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
-                                logger.warning(f"MIRROR TARGET | TITLE:{src_title} | TARGET:{mirrored_id}")
-                                if mirrored_id:
-                                    target_topic_anchor = mirrored_id
+                                if src_title:
+                                    target_topic_anchor = await get_or_create_target_topic(userbot, tid_ref, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                     except Exception as me:
                         logger.error(f"Release Mirror Error: {me}")
 
                 logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
                 
+                # 3. Reply Mirroring
+                reply_to_val = None
+                if getattr(msg, "reply_to_msg_id", None):
+                    reply_to_val = get_message_mapping(sid, msg.reply_to_msg_id, tid_ref)
+
                 if target_topic_anchor:
                     target_topic_anchor = int(target_topic_anchor)
 
-                await userbot.send_message(
+                sent_msg = await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    comment_to=target_topic_anchor
+                    reply_to=reply_to_val,
+                    comment_to=target_topic_anchor if not reply_to_val else None
                 )
                 
+                # 4. Save Message Mapping
+                if sent_msg:
+                    save_message_mapping(sid, msg.id, tid_ref, sent_msg.id)
                 with db_conn() as conn:
                     c = conn.cursor()
                     p = get_placeholder()
