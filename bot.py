@@ -195,9 +195,12 @@ def init_db():
                     source_message_id BIGINT,
                     log_target_id BIGINT,
                     file_id TEXT,
-                    media_type TEXT
+                    media_type TEXT,
+                    topic_title TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE media_logs ADD COLUMN topic_title TEXT")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -932,7 +935,7 @@ async def forward_to_log_targets(client, messages, source_msg_id):
         asyncio.create_task(vault_media(client, messages, t_id, source_msg_id, t_name))
 
 async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
-    """Sends single messages or albums natively to Log Bots"""
+    """Sends single messages or albums natively to Log Bots and saves Topic Structure"""
     try:
         if not isinstance(messages, list):
             messages = [messages]
@@ -958,8 +961,31 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                 logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
                 return
 
-        # 2. SEND NATIVELY (Single or Album)
-        # caption logic: find the first message in the group that has text
+        # --- 2. DETECT TOPIC TITLE ---
+        source_topic_title = None
+        first_msg = messages[0]
+        if first_msg.reply_to:
+            try:
+                source_top_id = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                if source_top_id:
+                    # Check Cache First
+                    sid = first_msg.chat_id
+                    if sid in topic_cache:
+                        for title, top_id in topic_cache[sid].items():
+                            if top_id == source_top_id:
+                                source_topic_title = title
+                                break
+                    
+                    if not source_topic_title:
+                        # Fetch from API
+                        res = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                        for t in res.topics:
+                            if source_top_id in [t.id, t.top_message]:
+                                source_topic_title = t.title
+                                break
+            except: pass
+
+        # --- 3. SEND NATIVELY (Single or Album) ---
         album_text = ""
         for m in messages:
             if m.message:
@@ -967,38 +993,46 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                 break
 
         # Send the message(s)
-        # Using messages list directly in file= groups them as an album
         vaulted_result = await client.send_message(
             target, 
             file=messages if len(messages) > 1 else messages[0].media, 
             message=album_text
         )
             
-        # 3. INDEXING FOR EXTRACT COMMAND
+        # --- 4. INDEXING WITH TOPIC MEMORY ---
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         
-        for i, v_msg in enumerate(vaulted_list):
-            try:
-                # Robust Media Packing
-                inner_media = None
-                if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner_media = v_msg.media.photo
-                elif isinstance(v_msg.media, types.MessageMediaDocument):
-                    inner_media = v_msg.media.document
-                elif hasattr(v_msg.media, 'photo'):
-                    inner_media = v_msg.media.photo
-                elif hasattr(v_msg.media, 'document'):
-                    inner_media = v_msg.media.document
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            
+            for i, v_msg in enumerate(vaulted_list):
+                try:
+                    # Robust Media Packing
+                    inner_media = None
+                    if isinstance(v_msg.media, types.MessageMediaPhoto):
+                        inner_media = v_msg.media.photo
+                    elif isinstance(v_msg.media, types.MessageMediaDocument):
+                        inner_media = v_msg.media.document
+                    elif hasattr(v_msg.media, 'photo'):
+                        inner_media = v_msg.media.photo
+                    elif hasattr(v_msg.media, 'document'):
+                        inner_media = v_msg.media.document
 
-                if inner_media and not isinstance(inner_media, list):
-                    fid = pack_bot_file_id(inner_media)
-                    # Use the actual source message ID for precise mapping
-                    real_source_id = messages[i].id if i < len(messages) else source_msg_id
-                    save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__)
-            except Exception as e:
-                logger.error(f"⚠️ Indexing skipped for item {i}: {e}")
+                    if inner_media and not isinstance(inner_media, list):
+                        fid = pack_bot_file_id(inner_media)
+                        real_source_id = messages[i].id if i < len(messages) else source_msg_id
+                        
+                        # Save with Topic Title
+                        c.execute(f"""
+                            INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) 
+                            VALUES ({p}, {p}, {p}, {p}, {p})""", 
+                            (real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                        )
+                except Exception as ex:
+                    logger.error(f"⚠️ Indexing skipped for item {i}: {ex}")
                 
-        logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} sent to {t_name}")
+        logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} sent to {t_name} (Topic: {source_topic_title or 'General'})")
 
     except Exception as e:
         logger.error(f"❌ VAULT CRASH: {e}")
