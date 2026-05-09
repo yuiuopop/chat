@@ -1,4 +1,4 @@
-#gimini
+#chatcpt
 import os
 import asyncio
 import threading
@@ -144,12 +144,18 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS message_mappings (
                     id SERIAL PRIMARY KEY,
                     source_chat_id BIGINT,
+                    source_topic_id BIGINT DEFAULT NULL,
                     source_msg_id BIGINT,
                     target_chat_id BIGINT,
+                    target_topic_id BIGINT DEFAULT NULL,
                     target_msg_id BIGINT,
                     UNIQUE(source_chat_id, source_msg_id, target_chat_id)
                 )
             """)
+            try: c.execute("ALTER TABLE message_mappings ADD COLUMN source_topic_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE message_mappings ADD COLUMN target_topic_id BIGINT DEFAULT NULL")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id SERIAL PRIMARY KEY,
@@ -212,12 +218,18 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS message_mappings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_chat_id BIGINT,
+                    source_topic_id BIGINT DEFAULT NULL,
                     source_msg_id BIGINT,
                     target_chat_id BIGINT,
+                    target_topic_id BIGINT DEFAULT NULL,
                     target_msg_id BIGINT,
                     UNIQUE(source_chat_id, source_msg_id, target_chat_id)
                 )
             """)
+            try: c.execute("ALTER TABLE message_mappings ADD COLUMN source_topic_id BIGINT DEFAULT NULL")
+            except: pass
+            try: c.execute("ALTER TABLE message_mappings ADD COLUMN target_topic_id BIGINT DEFAULT NULL")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS collected_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -317,39 +329,47 @@ def get_topic_mapping(s_chat, s_topic, t_chat):
         row = c.fetchone()
         return row[0] if row else None
 
-def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
+def save_message_mapping(s_chat, s_msg, t_chat, t_msg, s_topic=None, t_topic=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
                 """
-                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id, source_topic_id, target_topic_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT(source_chat_id, source_msg_id, target_chat_id) 
-                DO UPDATE SET target_msg_id = EXCLUDED.target_msg_id
+                DO UPDATE SET target_msg_id = EXCLUDED.target_msg_id, 
+                              source_topic_id = EXCLUDED.source_topic_id, 
+                              target_topic_id = EXCLUDED.target_topic_id
                 """,
-                (s_chat, s_msg, t_chat, t_msg)
+                (s_chat, s_msg, t_chat, t_msg, s_topic, t_topic)
             )
         else:
             c.execute(
                 """
-                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id, source_topic_id, target_topic_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_chat_id, source_msg_id, target_chat_id) 
-                DO UPDATE SET target_msg_id = excluded.target_msg_id
+                DO UPDATE SET target_msg_id = excluded.target_msg_id,
+                              source_topic_id = excluded.source_topic_id,
+                              target_topic_id = excluded.target_topic_id
                 """,
-                (s_chat, s_msg, t_chat, t_msg)
+                (s_chat, s_msg, t_chat, t_msg, s_topic, t_topic)
             )
 
-def get_message_mapping(s_chat, s_msg, t_chat):
+def get_message_mapping(s_chat, s_msg, t_chat, s_topic=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(
-            f"SELECT target_msg_id FROM message_mappings WHERE source_chat_id = {p} AND source_msg_id = {p} AND target_chat_id = {p}",
-            (s_chat, s_msg, t_chat)
-        )
+        query = f"SELECT target_msg_id FROM message_mappings WHERE source_chat_id = {p} AND source_msg_id = {p} AND target_chat_id = {p}"
+        params = [s_chat, s_msg, t_chat]
+        
+        if s_topic:
+            query += f" AND (source_topic_id = {p} OR source_topic_id IS NULL)"
+            params.append(s_topic)
+            
+        c.execute(query, tuple(params))
         row = c.fetchone()
         return row[0] if row else None
 
@@ -748,30 +768,25 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
-        if not m: return
+        # Log for debugging - you can remove this later
+        print(f"Incoming msg from {m.chat_id} | ReplyTo: {m.reply_to}")
         
-        # DEBUG: This helps verify if the ID matching is the problem
-        # print(f"DEBUG: Msg Chat ID: {m.chat_id}")
-
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
-            
-            # IMPROVED ID MATCHING: Use string containment or normalize both to absolute strings
-            source_id_str = str(sid).replace("-100", "")
-            msg_id_str = str(m.chat_id).replace("-100", "")
-
-            if source_id_str == msg_id_str:
-                # --- TOPIC DETECTION ---
+            if str(abs(int(m.chat_id))) == str(abs(int(sid))):
+                
+                # --- IMPROVED TOPIC DETECTION ---
                 msg_topic_anchor = None
                 if m.reply_to:
-                    # Logic: reply_to_top_id is the topic. If None, reply_to_msg_id is the topic.
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-                
-                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                    msg_topic_anchor = (
+                        getattr(m.reply_to, "reply_to_top_id", None)
+                        or getattr(m.reply_to, "reply_to_msg_id", None)
+                    )
+                elif getattr(m, "forum_topic", False):
                     msg_topic_anchor = m.id
 
-                # Filter: If the pair configuration targets a specific topic
-                if s_topic not in [None, 0, "0", 0]:
+                # Filter: If the pair is set to a specific topic, skip messages not in it
+                if s_topic not in [None, 0, "0"]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
@@ -780,63 +795,78 @@ def setup_automation_handlers(client: TelegramClient):
                     m_type = type(m.media).__name__
                     with db_conn() as conn:
                         db_c = conn.cursor()
+                        p = get_placeholder()
                         if DATABASE_URL:
                             db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.message or ""))
                         else:
                             db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.message or ""))
                 
                 # 2) Live Forward / Mirror
+                source_topic_id = None
                 if is_live:
-                    dest_topic_id = t_topic
+                    target_topic_anchor = t_topic
                     
                     if is_mir:
                         try:
-                            # Dynamic Mirroring: Map source topic to target topic
-                            source_top = msg_topic_anchor
-                            if source_top:
-                                # Get Title
+                            # Dynamic Topic Mirroring
+                            source_topic_id = msg_topic_anchor
+                            if source_topic_id:
+                                # Look for title if we don't have it to create in target
                                 src_title = None
-                                forum = getattr(m.reply_to, "forum_topic", None) if m.reply_to else None
-                                if forum: src_title = getattr(forum, "title", None)
                                 
-                                if not src_title:
-                                    # Fallback fetch title
-                                    res = await client(functions.channels.GetForumTopicsRequest(channel=m.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                                    for t in res.topics:
-                                        if source_top in [t.id, t.top_message]:
-                                            src_title = t.title
-                                            break
+                                # Fetch topic title from Telegram (only reliable source)
+                                src_topics = await client(functions.channels.GetForumTopicsRequest(channel=sid, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                                for st in src_topics.topics:
+                                    if str(st.top_message) == str(source_topic_id):
+                                        src_title = st.title
+                                        source_topic_id = st.top_message # Normalize
+                                        break
                                 
                                 if src_title:
-                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
+                                    target_topic_anchor = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_topic_id)
                         except Exception as me:
                             logger.error(f"Mirroring Logic Error: {me}")
 
                     try:
                         # Resolve mapping for nested replies
                         reply_to_mapped = None
-                        if getattr(m, "reply_to_msg_id", None):
-                            reply_to_mapped = get_message_mapping(sid, m.reply_to_msg_id, tid)
+                        if m.reply_to:
+                            source_reply_id = getattr(m.reply_to, "reply_to_msg_id", None)
+                            if source_reply_id:
+                                # msg_topic_anchor is the topic this message belongs to
+                                reply_to_mapped = get_message_mapping(sid, source_reply_id, tid, s_topic=msg_topic_anchor)
                         
-                        # THE KEY FIX: Using the simplified 'reply_to' integer parameter
-                        # Telethon handles the Forum routing automatically if you pass the TOPmsg ID
-                        # to a Forum-enabled chat.
-                        
+                        # THE KEY FIX: Using the simplified 'reply_to' target
                         # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
-                        final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
-
-                        sent_msg = await client.send_message(
-                            entity=tid,
-                            message=m.message or "",
-                            file=m.media if m.media else None,
-                            reply_to=int(final_reply_target) if final_reply_target else None
+                        final_reply_target = reply_to_mapped if reply_to_mapped else target_topic_anchor
+                        
+                        logger.warning(
+                            f"FORWARD DEBUG | "
+                            f"source_topic={msg_topic_anchor} | "
+                            f"target_topic={target_topic_anchor} | "
+                            f"reply_target={final_reply_target}"
                         )
+
+                        sent_msg = None
+                        if m.media:
+                            sent_msg = await client.send_file(
+                                entity=tid,
+                                file=m.media,
+                                caption=m.message or "",
+                                reply_to=int(final_reply_target) if final_reply_target else None
+                            )
+                        else:
+                            sent_msg = await client.send_message(
+                                entity=tid,
+                                message=m.message or "",
+                                reply_to=int(final_reply_target) if final_reply_target else None
+                            )
                         
                         if sent_msg:
-                            save_message_mapping(sid, m.id, tid, sent_msg.id)
+                            save_message_mapping(sid, m.id, tid, sent_msg.id, s_topic=msg_topic_anchor, t_topic=target_topic_anchor)
                             
                     except Exception as e:
-                        logger.error(f"Live Forward Send Error: {e}")
+                        logger.error(f"Live Forward Error: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -1623,35 +1653,49 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 target_topic_anchor = t_topic
                 
                 # Handle Mirroring ID detection for release
+                source_topic_anchor = None
                 if is_mir:
-                    s_top = None
                     if msg.reply_to:
-                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or msg.reply_to.reply_to_msg_id
+                        source_topic_anchor = (
+                            getattr(msg.reply_to, "reply_to_top_id", None)
+                            or getattr(msg.reply_to, "reply_to_msg_id", None)
+                        )
+                    elif getattr(msg, "forum_topic", False):
+                        source_topic_anchor = msg.id
                     
-                    if s_top:
+                    if source_topic_anchor:
                         # Priority check database mapping
-                        mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
+                        mapped = get_topic_mapping(sid_ref, source_topic_anchor, tid_ref)
                         if mapped:
                             target_topic_anchor = mapped
 
-                # Resolve reply mapping
-                reply_to_val = None
-                if getattr(msg, "reply_to_msg_id", None):
-                    reply_to_val = get_message_mapping(sid_ref, msg.reply_to_msg_id, tid_ref)
+                # Resolve mapping for nested replies
+                reply_to_mapped = None
+                if msg.reply_to:
+                    source_reply_id = getattr(msg.reply_to, "reply_to_msg_id", None)
+                    if source_reply_id:
+                        reply_to_mapped = get_message_mapping(sid_ref, source_reply_id, tid_ref, s_topic=source_topic_anchor)
 
-                # Construct Topic Header
-                # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
-                final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
+                # Simplify routing
+                final_reply_target = reply_to_mapped if reply_to_mapped else target_topic_anchor
 
-                sent_msg = await userbot.send_message(
-                    entity=target_chat,
-                    message=msg.message or "",
-                    file=msg.media,
-                    reply_to=int(final_reply_target) if final_reply_target else None
-                )
+                sent_msg = None
+                if msg.media:
+                    sent_msg = await userbot.send_file(
+                        entity=target_chat,
+                        file=msg.media,
+                        caption=msg.message or "",
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
+                else:
+                    sent_msg = await userbot.send_message(
+                        entity=target_chat,
+                        message=msg.message or "",
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
                 
                 if sent_msg:
-                    save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
+                    save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id, s_topic=source_topic_anchor, t_topic=target_topic_anchor)
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
