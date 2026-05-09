@@ -918,23 +918,29 @@ async def ensure_userbot():
     
     return True, "Connected"
 
-async def forward_to_log_targets(client, message, source_msg_id):
-    if not message or not message.media: return
+async def forward_to_log_targets(client, messages, source_msg_id):
+    """Modified to handle lists (albums) or single messages"""
+    if not messages: return
+    if not isinstance(messages, list): messages = [messages]
+    
     targets = get_log_targets()
     if not targets: return
     
     for row in targets:
         _, t_id, t_type, t_name, _ = row
-        # Run vaulting in background tasks so we don't block the main thread
-        asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
+        # Pass the whole list of messages to the vault
+        asyncio.create_task(vault_media(client, messages, t_id, source_msg_id, t_name))
 
-async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
-    """Aggressive resolution helper to re-send and index media"""
+async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
+    """Sends single messages or albums natively to Log Bots"""
     try:
+        if not isinstance(messages, list):
+            messages = [messages]
+            
         log_chat_id = int(log_chat_id)
         target = None
 
-        # 1. PEER RESOLUTION (The 3-Step Strategy)
+        # 1. PEER RESOLUTION (AUTHORITATIVE)
         try:
             target = await client.get_input_entity(log_chat_id)
         except (ValueError, errors.rpcerrorlist.PeerIdInvalidError, Exception):
@@ -952,39 +958,49 @@ async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
                 logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
                 return
 
-        # 2. SEND NATIVELY
-        vaulted = await client.send_message(
+        # 2. SEND NATIVELY (Single or Album)
+        # caption logic: find the first message in the group that has text
+        album_text = ""
+        for m in messages:
+            if m.message:
+                album_text = m.message
+                break
+
+        # Send the message(s)
+        # Using messages list directly in file= groups them as an album
+        vaulted_result = await client.send_message(
             target, 
-            file=message.media, 
-            message=message.message or ""
+            file=messages if len(messages) > 1 else messages[0].media, 
+            message=album_text
         )
             
-        if vaulted and vaulted.media:
+        # 3. INDEXING FOR EXTRACT COMMAND
+        vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+        
+        for i, v_msg in enumerate(vaulted_list):
             try:
-                # 3. ROBUST MEDIA PACKING (Fixes 'PhotoSize' error)
-                # Ensure we are passing the PARENT object (Photo/Document), not a size list
-                inner_media = None
-                
-                if isinstance(vaulted.media, types.MessageMediaPhoto):
-                    inner_media = vaulted.media.photo  # The 'Photo' object
-                elif isinstance(vaulted.media, types.MessageMediaDocument):
-                    inner_media = vaulted.media.document # The 'Document' object
-                elif hasattr(vaulted.media, 'photo'):
-                    inner_media = vaulted.media.photo
-                elif hasattr(vaulted.media, 'document'):
-                    inner_media = vaulted.media.document
+                # Robust Media Packing
+                inner_media = v_msg.media
+                if isinstance(v_msg.media, types.MessageMediaPhoto):
+                    inner_media = v_msg.media.photo
+                elif isinstance(v_msg.media, types.MessageMediaDocument):
+                    inner_media = v_msg.media.document
+                elif hasattr(v_msg.media, 'photo'):
+                    inner_media = v_msg.media.photo
+                elif hasattr(v_msg.media, 'document'):
+                    inner_media = v_msg.media.document
 
                 if inner_media and not isinstance(inner_media, list):
                     fid = pack_bot_file_id(inner_media)
-                    save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
-                    logger.info(f"✅ VAULT SUCCESS: Message {source_msg_id} -> {t_name}")
-                else:
-                    logger.error(f"❌ VAULT INDEX ERROR: inner_media is invalid or list: {type(inner_media)}")
-                    
-            except Exception as ex:
-                logger.error(f"❌ VAULT INDEX CRASH: {ex}")
+                    # Use the original source_msg_id + index for albums to keep them unique
+                    save_media_log(source_msg_id + i, log_chat_id, fid, type(v_msg.media).__name__)
+            except:
+                continue
+                
+        logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} sent to {t_name}")
+
     except Exception as e:
-        logger.error(f"❌ VAULT SEND CRASH: {e}")
+        logger.error(f"❌ VAULT CRASH: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -1022,6 +1038,9 @@ def setup_automation_handlers(client: TelegramClient):
                     logger.info(f"📥 MEDIA DETECTED: [Source: {s_title}] [ID: {m.id}] [Type: {m_type}]")
                     
                     if is_mon:
+                        # Instant vault for single media
+                        await forward_to_log_targets(client, [m], m.id)
+                        
                         with db_conn() as conn:
                             c = conn.cursor()
                             if DATABASE_URL:
@@ -1034,9 +1053,6 @@ def setup_automation_handlers(client: TelegramClient):
                                     "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                                     (pid, sid, m.id, m_type, m.message or "")
                                 )
-                        
-                        # Instantly send to log targets
-                        await forward_to_log_targets(client, m, m.id)
                     else:
                         logger.info(f"ℹ️ SKIPPING VAULT: Monitoring (is_mon) is OFF for pair {s_title}")
 
@@ -1051,18 +1067,28 @@ def setup_automation_handlers(client: TelegramClient):
                         
                         messages = album_cache.pop(m.grouped_id, [])
                         if messages:
-                            await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+                            await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, is_mon)
                     else:
                         if m.grouped_id in album_cache:
                             album_cache[m.grouped_id].append(m)
                 else:
-                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon)
 
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
+    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, is_mon=True):
         """Helper to send single or multiple messages (albums) with caption support"""
         try:
-            dest_topic_id = default_t_topic
+            if not messages: return
             first_msg = messages[0]
+
+            # --- LOG BOT SYNC ---
+            # Trigger the vault here for all media (single or album)
+            if is_mon:
+                await forward_to_log_targets(client, messages, first_msg.id)
+
+            # If mirroring is disabled, stop here
+            if not tid: return
+            
+            dest_topic_id = default_t_topic
             
             if is_mir:
                 source_top = None
