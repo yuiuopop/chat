@@ -434,19 +434,19 @@ def remove_log_target(row_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_targets WHERE id = {p}", (row_id,))
 
-def save_media_log(source_msg_id, log_target_id, file_id, media_type):
+def save_media_log(source_msg_id, log_target_id, file_id, media_type, topic_title=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s)",
-                (source_msg_id, log_target_id, file_id, media_type)
+                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) VALUES (%s, %s, %s, %s, %s)",
+                (source_msg_id, log_target_id, file_id, media_type, topic_title)
             )
         else:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?)",
-                (source_msg_id, log_target_id, file_id, media_type)
+                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) VALUES (?, ?, ?, ?, ?)",
+                (source_msg_id, log_target_id, file_id, media_type, topic_title)
             )
 
 def get_media_logs(limit=100, media_type=None):
@@ -481,7 +481,7 @@ def get_vaulted_media_for_source(source_id, log_target_id=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption
+            SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption, MAX(m.topic_title) as topic_title
             FROM media_logs m
             JOIN collected_media c ON m.source_message_id = c.source_message_id
             WHERE c.source_chat_id = {p}
@@ -956,7 +956,12 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                     limit=100, hash=0
                 ))
                 # Final attempt: direct server lookup
-                target = await client.get_entity(log_chat_id)
+                try:
+                    target = await client.get_entity(log_chat_id)
+                except:
+                    # Last resort: Direct User lookup (often works for bots)
+                    target = await client(functions.users.GetFullUserRequest(id=log_chat_id))
+                    target = target.users[0]
             except Exception as e:
                 logger.error(f"❌ GLOBAL LOOKUP FAILED for {log_chat_id}: {e}")
                 return
@@ -1019,18 +1024,17 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                     elif hasattr(v_msg.media, 'document'):
                         inner_media = v_msg.media.document
 
-                    if inner_media and not isinstance(inner_media, list):
+                    # FINAL GUARD: Ensure we don't have a list or a PhotoSize (which lacks location/access_hash)
+                    if inner_media and not isinstance(inner_media, (list, types.PhotoSize, types.PhotoSizeProgressive, types.PhotoSizeEmpty)):
                         fid = pack_bot_file_id(inner_media)
                         real_source_id = messages[i].id if i < len(messages) else source_msg_id
                         
-                        # Save with Topic Title
-                        c.execute(f"""
-                            INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) 
-                            VALUES ({p}, {p}, {p}, {p}, {p})""", 
-                            (real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                        )
+                        # Save with Topic Title using our helper
+                        save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                    else:
+                        logger.warning(f"⚠️ Item {i} skipped: Invalid media type {type(inner_media).__name__ if inner_media else 'None'}")
                 except Exception as ex:
-                    logger.error(f"⚠️ Indexing skipped for item {i}: {ex}")
+                    logger.error(f"⚠️ Indexing failed for item {i}: {ex}")
                 
         logger.info(f"✅ VAULT SUCCESS: {'Album' if len(messages)>1 else 'Single'} sent to {t_name} (Topic: {source_topic_title or 'General'})")
 
@@ -2226,27 +2230,35 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
         sent = 0
         failed = 0
         
-        for smid, file_id, m_type, caption in items:
+        for smid, file_id, m_type, caption, topic_title in items:
             try:
                 m_type_lower = (m_type or "").lower()
                 cap = caption or ""
                 
+                dest_topic_id = None
+                if topic_title:
+                    try:
+                        # Use the Userbot to create/find the topic structure
+                        dest_topic_id = await get_or_create_target_topic(userbot, int(target_id), topic_title)
+                    except Exception as topic_err:
+                        logger.warning(f"Vault Release Topic Error: {topic_err}")
+
                 if "photo" in m_type_lower:
-                    sender_bot.send_photo(target_id, file_id, caption=cap)
+                    sender_bot.send_photo(target_id, file_id, caption=cap, message_thread_id=dest_topic_id)
                 elif "video" in m_type_lower:
-                    sender_bot.send_video(target_id, file_id, caption=cap)
+                    sender_bot.send_video(target_id, file_id, caption=cap, message_thread_id=dest_topic_id)
                 else:
-                    sender_bot.send_document(target_id, file_id, caption=cap)
+                    sender_bot.send_document(target_id, file_id, caption=cap, message_thread_id=dest_topic_id)
                     
                 sent += 1
             except Exception as item_err:
                 logger.error(f"Vault Release item error: {item_err}")
                 failed += 1
                 
-            # Rate limit protection (Telegram Bot API allows ~20 msgs/minute to a single chat)
-            await asyncio.sleep(3)
+            # Rate limit protection
+            await asyncio.sleep(2.0)
             
-        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Topic structure has been reconstructed).", parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"Global Vault Release Error: {e}")
