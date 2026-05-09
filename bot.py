@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from telethon import TelegramClient, events, functions, types, errors
 from telethon.sessions import StringSession
+from telethon.utils import pack_bot_file_id
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -31,7 +32,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
-LOG_CHAT_ID = os.getenv("LOG_CHAT_ID", "")
 
 if not BOT_TOKEN:
     print("WARNING: Missing BOT_TOKEN in .env. Admin features will be limited until set.")
@@ -165,8 +165,6 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
-                    vault_msg_id BIGINT,
-                    vault_chat_id BIGINT,
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
@@ -177,10 +175,24 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
             except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_chat_id BIGINT")
-            except: pass
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_targets (
+                    id SERIAL PRIMARY KEY,
+                    target_id BIGINT,
+                    target_type TEXT,
+                    target_name TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_logs (
+                    id SERIAL PRIMARY KEY,
+                    source_message_id BIGINT,
+                    log_target_id BIGINT,
+                    file_id TEXT,
+                    media_type TEXT
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -239,8 +251,6 @@ def init_db():
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     released INTEGER DEFAULT 0,
                     pair_id INTEGER,
-                    vault_msg_id BIGINT,
-                    vault_chat_id BIGINT,
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
@@ -251,10 +261,24 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN vault_chat_id BIGINT")
-            except: pass
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_id BIGINT,
+                    target_type TEXT,
+                    target_name TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_message_id BIGINT,
+                    log_target_id BIGINT,
+                    file_id TEXT,
+                    media_type TEXT
+                )
+            """)
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
@@ -370,6 +394,62 @@ def get_message_mapping(s_chat, s_msg, t_chat):
         row = c.fetchone()
         return row[0] if row else None
 
+def get_log_targets():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, target_id, target_type, target_name FROM log_targets")
+        return c.fetchall()
+
+def add_log_target(target_id, target_type, target_name):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (%s, %s, %s)",
+                (target_id, target_type, target_name)
+            )
+        else:
+            c.execute(
+                "INSERT INTO log_targets (target_id, target_type, target_name) VALUES (?, ?, ?)",
+                (target_id, target_type, target_name)
+            )
+
+def remove_log_target(target_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"DELETE FROM log_targets WHERE target_id = {p}", (target_id,))
+
+def save_media_log(source_msg_id, log_target_id, file_id, media_type):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s)",
+                (source_msg_id, log_target_id, file_id, media_type)
+            )
+        else:
+            c.execute(
+                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?)",
+                (source_msg_id, log_target_id, file_id, media_type)
+            )
+
+def get_media_logs(limit=100, media_type=None):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        query = "SELECT source_message_id, log_target_id, file_id, media_type FROM media_logs"
+        params = []
+        if media_type:
+            query += f" WHERE media_type = {p}"
+            params.append(media_type)
+        query += f" ORDER BY id DESC LIMIT {p}"
+        params.append(limit)
+        c.execute(query, tuple(params))
+        return c.fetchall()
+
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
@@ -433,9 +513,21 @@ def get_dashboard_markup():
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
+        markup.add(InlineKeyboardButton("📝 Log Targets", callback_data="log_targets_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
+    return markup
+
+def log_targets_list_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    targets = get_log_targets()
+    for row in targets:
+        btn_text = f"📝 {row[3]} ({row[2]})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"log_remove_{row[1]}"))
+    markup.add(InlineKeyboardButton("➕ Add Log Target", callback_data="log_add_start"))
+    markup.add(InlineKeyboardButton("📥 Extract Media IDs", callback_data="log_extract_start"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
 def pairs_list_markup():
@@ -760,54 +852,31 @@ async def ensure_userbot():
             return False, f"Connection failed: {e}"
     
     return True, "Connected"
-    
-async def vault_and_collect(client, message, pair_id, log_chat_id):
-    """Forwards message to your log system and saves metadata with vaulting info"""
-    try:
-        # 1. Forward to your Log Chat (if set)
-        v_msg_id = None
-        v_chat_id = None
-        if log_chat_id:
-            try:
-                # Forwarding preserves original quality and metadata
-                vaulted_msg = await message.forward_to(log_chat_id)
-                v_msg_id = vaulted_msg.id
-                v_chat_id = log_chat_id
-            except Exception as ve:
-                logger.error(f"Forwarding to vault failed: {ve}")
 
-        # 2. Save to DB
-        m_type = type(message.media).__name__ if message.media else "Text"
-        with db_conn() as conn:
-            c = conn.cursor()
-            p = get_placeholder()
-            if DATABASE_URL and USING_POSTGRES:
-                c.execute(f"""
-                    INSERT INTO collected_media 
-                    (pair_id, source_chat_id, source_message_id, media_type, caption, vault_msg_id, vault_chat_id) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT(source_chat_id, source_message_id) DO UPDATE SET 
-                        vault_msg_id = EXCLUDED.vault_msg_id,
-                        vault_chat_id = EXCLUDED.vault_chat_id
-                """, (
-                    pair_id, message.chat_id, message.id, 
-                    m_type, message.message or "", 
-                    v_msg_id, v_chat_id
-                ))
-            else:
-                c.execute(f"""
-                    INSERT OR REPLACE INTO collected_media 
-                    (pair_id, source_chat_id, source_message_id, media_type, caption, vault_msg_id, vault_chat_id) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    pair_id, message.chat_id, message.id, 
-                    m_type, message.message or "", 
-                    v_msg_id, v_chat_id
-                ))
-        return v_msg_id
-    except Exception as e:
-        logger.error(f"Vaulting/Collection failed: {e}")
-        return None
+async def forward_to_log_targets(client, message, source_msg_id):
+    if not message.media: return
+    targets = get_log_targets()
+    if not targets: return
+    
+    media_type = type(message.media).__name__
+    
+    for row in targets:
+        _, t_id, t_type, t_name = row
+        try:
+            target_id = int(t_id)
+        except ValueError:
+            target_id = t_id
+        
+        try:
+            sent = await client.send_message(target_id, file=message.media, message=message.message or "")
+            if sent and sent.media:
+                try:
+                    file_id = pack_bot_file_id(sent.media)
+                    save_media_log(source_msg_id, target_id, file_id, media_type)
+                except Exception as ex:
+                    logger.error(f"Failed to pack file_id: {ex}")
+        except Exception as e:
+            logger.error(f"Failed to log media to {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -831,14 +900,29 @@ def setup_automation_handlers(client: TelegramClient):
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
 
+                # Specific topic filtering
                 if s_topic not in [None, 0, "0", 0]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
-                # 1) Monitor / Vault Logic
+                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
                 if is_mon and m.media:
-                    # We use a separate task for vaulting to avoid blocking the forwarder
-                    asyncio.create_task(vault_and_collect(client, m, pid, LOG_CHAT_ID))
+                    m_type = type(m.media).__name__
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if DATABASE_URL:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
+                    
+                    # Instantly send to log targets
+                    await forward_to_log_targets(client, m, m.id)
 
                 if not is_live: continue
 
@@ -992,45 +1076,6 @@ def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
 
-@bot.message_handler(commands=['get_media'])
-def cmd_get_media(message):
-    if message.from_user.id != ADMIN_ID: return
-    
-    # Usage: /get_media [row_id]
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "Usage: `/get_media [id]`")
-            return
-            
-        row_id = int(args[1])
-        
-        with db_conn() as conn:
-            c = conn.cursor()
-            p = get_placeholder()
-            c.execute(f"SELECT vault_chat_id, vault_msg_id FROM collected_media WHERE id = {p}", (row_id,))
-            res = c.fetchone()
-            
-        if res and res[0] and res[1]:
-            v_chat, v_msg = res
-            async def send_back():
-                try:
-                    # Userbot fetches it from YOUR vault, not the source!
-                    media = await userbot.get_messages(int(v_chat), ids=int(v_msg))
-                    if media:
-                        await userbot.send_message(ADMIN_ID, media)
-                    else:
-                        bot.send_message(ADMIN_ID, "❌ Media not found in vault. It might have been deleted.")
-                except Exception as e:
-                    bot.send_message(ADMIN_ID, f"❌ Failed to retrieve from vault: {e}")
-            
-            asyncio.run_coroutine_threadsafe(send_back(), loop)
-            bot.send_message(message.chat.id, f"📥 Fetching media ID `{row_id}` from vault...", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "❌ Media not found in DB or vault info missing.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {e}")
-
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
     if message.from_user.id != ADMIN_ID:
@@ -1088,6 +1133,38 @@ def handle_callbacks(call):
     if data == "dash_main":
         bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+
+    elif data == "log_targets_main":
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text("📝 **Log Targets**\nManage destinations for collected media:", call.message.chat.id, call.message.message_id, reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+
+    elif data == "log_add_start":
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = "awaiting_log_target"
+        bot.send_message(call.message.chat.id, "📝 **Add Log Target**\nPlease send the Target ID or Username (e.g. `@my_log_bot` or `-100123456789`).")
+
+    elif data.startswith("log_remove_"):
+        bot.answer_callback_query(call.id)
+        tid_str = data.split("log_remove_")[-1]
+        remove_log_target(tid_str)
+        bot.edit_message_text("📝 **Log Targets**\nManage destinations for collected media:", call.message.chat.id, call.message.message_id, reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+
+    elif data == "log_extract_start":
+        bot.answer_callback_query(call.id)
+        logs = get_media_logs(limit=1000)
+        if not logs:
+            bot.send_message(call.message.chat.id, "❌ No media logs found.")
+            return
+        
+        file_content = "Extracted Media File IDs:\n\n"
+        for row in logs:
+            file_content += f"Type: {row[3]} | FileID: {row[2]}\n"
+        
+        with open("media_logs.txt", "w", encoding="utf-8") as f:
+            f.write(file_content)
+        
+        with open("media_logs.txt", "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption="📥 Extracted Media Logs (Last 1000)")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
@@ -1481,8 +1558,28 @@ def handle_state_inputs(message):
     state = admin_states.get(uid)
     text = message.text.strip()
     
+    # --- Logging System ---
+    if state == "awaiting_log_target":
+        target = text
+        admin_states.pop(uid, None)
+        try:
+            bot.send_message(message.chat.id, "⏳ Verifying Log Target...")
+            async def verify_log_tgt():
+                try:
+                    chat = await userbot.get_entity(target)
+                    t_type = type(chat).__name__.lower()
+                    t_name = getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or str(target)
+                    add_log_target(chat.id, t_type, t_name)
+                    bot.send_message(message.chat.id, f"✅ Log Target added: `{t_name}` ({t_type})", parse_mode="Markdown")
+                    bot.send_message(message.chat.id, "📝 **Log Targets**", reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+                except Exception as e:
+                    bot.send_message(message.chat.id, f"❌ Failed to verify target: {e}")
+            asyncio.run_coroutine_threadsafe(verify_log_tgt(), loop)
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Error: {e}")
+            
     # --- Login Flow ---
-    if state == "awaiting_api_id":
+    elif state == "awaiting_api_id":
         if not text.isdigit():
             bot.reply_to(message, "Invalid API ID. Please send a numeric ID.")
             return
@@ -1635,7 +1732,10 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                             (pair_id, sid_resolved, m.id, m_type, m.message or "")
                         )
-                    if c.rowcount > 0: collected += 1
+                    if c.rowcount > 0: 
+                        collected += 1
+                        # Instantly send to log targets
+                        await forward_to_log_targets(userbot, m, m.id)
             
             if limit and collected >= limit: break
             
