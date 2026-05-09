@@ -539,6 +539,7 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
+active_log_bots = set() # Track tokens of currently polling secondary bots
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -2276,7 +2277,11 @@ log_bot_states = {} # { bot_id: { user_id: { source_id: 123 } } }
 
 def setup_log_bot(token):
     if not token: return
+    if token in active_log_bots:
+        logger.info(f"ℹ️ Bot token already active, skipping setup.")
+        return
     
+    active_log_bots.add(token)
     log_bot = telebot.TeleBot(token)
     try:
         bot_info = log_bot.get_me()
@@ -2405,8 +2410,13 @@ def setup_log_bot(token):
     def run_polling():
         while True:
             try:
-                logger.info(f"🚀 Starting Secondary Log Bot polling...")
-                log_bot.delete_webhook(drop_pending_updates=True)
+                logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
+                # Clear updates to avoid 409 Conflict
+                try:
+                    log_bot.delete_webhook(drop_pending_updates=True)
+                except: pass
+                
+                time.sleep(10) # 10s wait to ensure old instance is fully cleared
                 log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
                 logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
