@@ -533,6 +533,7 @@ def log_targets_list_markup():
             InlineKeyboardButton("🗑️ Remove", callback_data=f"log_remove_{row[0]}")
         )
     markup.row(InlineKeyboardButton("➕ Add Log Target", callback_data="log_add_start"))
+    markup.row(InlineKeyboardButton("🔄 Sync All Media", callback_data="log_sync_all"))
     markup.row(InlineKeyboardButton("📥 Extract Media IDs", callback_data="log_extract_start"))
     markup.row(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
@@ -861,29 +862,34 @@ async def ensure_userbot():
     return True, "Connected"
 
 async def forward_to_log_targets(client, message, source_msg_id):
-    if not message.media: return
+    if not message or not message.media: return
     targets = get_log_targets()
     if not targets: return
     
-    media_type = type(message.media).__name__
-    
     for row in targets:
         _, t_id, t_type, t_name = row
+        # Run vaulting in background tasks so we don't block the main thread
+        asyncio.create_task(vault_media(client, message, t_id, source_msg_id, t_name))
+
+async def vault_media(client, message, log_chat_id, source_msg_id, t_name):
+    """Helper to forward to vault and save the permanent File ID"""
+    try:
+        # Try native forward first (efficient)
         try:
-            target_id = int(t_id)
-        except ValueError:
-            target_id = t_id
-        
-        try:
-            sent = await client.send_message(target_id, file=message.media, message=message.message or "")
-            if sent and sent.media:
-                try:
-                    file_id = pack_bot_file_id(sent.media)
-                    save_media_log(source_msg_id, target_id, file_id, media_type)
-                except Exception as ex:
-                    logger.error(f"Failed to pack file_id: {ex}")
-        except Exception as e:
-            logger.error(f"Failed to log media to {t_name}: {e}")
+            vaulted = await message.forward_to(int(log_chat_id))
+        except:
+            # Fallback to re-sending if forward is restricted
+            vaulted = await client.send_message(int(log_chat_id), file=message.media, message=message.message or "")
+            
+        if vaulted and vaulted.media:
+            try:
+                fid = pack_bot_file_id(vaulted.media)
+                save_media_log(source_msg_id, log_chat_id, fid, type(vaulted.media).__name__)
+                logger.info(f"VAULT: Message {source_msg_id} saved to {t_name}")
+            except Exception as ex:
+                logger.error(f"VAULT ERROR: Failed to pack file_id: {ex}")
+    except Exception as e:
+        logger.error(f"VAULT ERROR: Failed to log media to {t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -1078,6 +1084,39 @@ def cmd_list(message):
 
     asyncio.run_coroutine_threadsafe(fetch_and_list(), loop)
     
+@bot.message_handler(commands=['extract'])
+def cmd_extract_media(message):
+    """Retrieves media from your Vault using source message ID"""
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        args = message.text.split()
+        if len(args) < 2: 
+            return bot.reply_to(message, "💡 **Usage:** `/extract [message_id]`\n\nFind the ID in your collected logs.", parse_mode="Markdown")
+        
+        smid = args[1]
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s LIMIT 1", (smid,))
+            res = c.fetchone()
+        
+        if res:
+            file_id, m_type = res
+            m_type = m_type.lower()
+            
+            bot.send_chat_action(message.chat.id, 'upload_document')
+            caption = f"✅ **Extracted from Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
+            
+            if "photo" in m_type:
+                bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+            elif "video" in m_type:
+                bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+            else:
+                bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "❌ No record found in the vault for this ID.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Extraction Error: {e}")
+
 @bot.message_handler(commands=['ping'])
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
@@ -1159,6 +1198,40 @@ def handle_callbacks(call):
     elif data == "log_ignore":
         bot.answer_callback_query(call.id)
         return
+
+    elif data == "log_sync_all":
+        bot.answer_callback_query(call.id, "🔄 Starting Log Sync...")
+        async def sync_task():
+            try:
+                # Get all collected media that are NOT in media_logs
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    if DATABASE_URL:
+                        c.execute("SELECT pair_id, source_chat_id, source_message_id FROM collected_media WHERE source_message_id NOT IN (SELECT source_message_id FROM media_logs)")
+                    else:
+                        c.execute("SELECT pair_id, source_chat_id, source_message_id FROM collected_media WHERE source_message_id NOT IN (SELECT source_message_id FROM media_logs)")
+                    items = c.fetchall()
+                
+                if not items:
+                    bot.send_message(call.message.chat.id, "✅ All media is already synced.")
+                    return
+                
+                bot.send_message(call.message.chat.id, f"🔄 Syncing `{len(items)}` media items to log targets...")
+                done = 0
+                for pid, sid, smid in items:
+                    try:
+                        msg = await userbot.get_messages(sid, ids=smid)
+                        if msg and msg.media:
+                            await forward_to_log_targets(userbot, msg, smid)
+                            done += 1
+                        if done % 10 == 0: await asyncio.sleep(1)
+                    except: continue
+                
+                bot.send_message(call.message.chat.id, f"✅ Sync Complete! Logged `{done}` items.")
+            except Exception as e:
+                bot.send_message(call.message.chat.id, f"❌ Sync Error: {e}")
+        
+        asyncio.run_coroutine_threadsafe(sync_task(), loop)
 
     elif data == "log_extract_start":
         bot.answer_callback_query(call.id)
@@ -1810,7 +1883,10 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                         c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid, m.id, m_type, m.message or ""))
                     else:
                         c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid, m.id, m_type, m.message or ""))
-                    if c.rowcount > 0: collected += 1
+                    if c.rowcount > 0: 
+                        collected += 1
+                        # Instantly send to log targets
+                        await forward_to_log_targets(userbot, m, m.id)
             
             if scanned % 20 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
