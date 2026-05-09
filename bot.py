@@ -454,6 +454,34 @@ def get_media_logs(limit=100, media_type=None):
         c.execute(query, tuple(params))
         return c.fetchall()
 
+def get_vault_sources():
+    with db_conn() as conn:
+        c = conn.cursor()
+        query = """
+            SELECT DISTINCT p.source_id, p.source_title 
+            FROM target_pairs p
+            JOIN collected_media c ON p.source_id = c.source_chat_id
+            JOIN media_logs m ON c.source_message_id = m.source_message_id
+        """
+        c.execute(query)
+        return c.fetchall()
+
+def get_vaulted_media_for_source(source_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        # Ensure we get unique file_ids per source message 
+        query = f"""
+            SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption
+            FROM media_logs m
+            JOIN collected_media c ON m.source_message_id = c.source_message_id
+            WHERE c.source_chat_id = {p}
+            GROUP BY m.source_message_id
+            ORDER BY m.source_message_id ASC
+        """
+        c.execute(query, (source_id,))
+        return c.fetchall()
+
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
@@ -516,6 +544,7 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
+        markup.add(InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
         markup.add(InlineKeyboardButton("📝 Log Targets", callback_data="log_targets_main"))
     else:
@@ -1179,6 +1208,52 @@ def handle_callbacks(call):
     if data == "dash_main":
         bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+
+    elif data == "vault_rel_main":
+        bot.answer_callback_query(call.id)
+        sources = get_vault_sources()
+        if not sources:
+            bot.edit_message_text("❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+            return
+            
+        markup = InlineKeyboardMarkup(row_width=1)
+        for sid, title in sources:
+            markup.add(InlineKeyboardButton(f"📁 {title}", callback_data=f"vault_src_{sid}"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+        
+        bot.edit_message_text("🚀 **Vault Release Engine**\n\nSelect the source group you want to release media for:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("vault_src_"):
+        bot.answer_callback_query(call.id)
+        sid = int(data.split("_")[-1])
+        login_data[uid] = {"vault_source_id": sid}
+        
+        async def show_tgt():
+            markup = await get_chat_selection_markup("vault_tgt", 0)
+            bot.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+        
+    elif data.startswith("vault_tgt_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[2] == "page":
+            page = int(parts[3])
+            async def update_tgt_list():
+                markup = await get_chat_selection_markup("vault_tgt", page)
+                if markup:
+                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
+        else:
+            tid = int(parts[2])
+            sid = login_data.get(uid, {}).get("vault_source_id")
+            if not sid:
+                bot.send_message(call.message.chat.id, "❌ Session expired. Please start over.")
+                return
+            
+            # Start background task
+            login_data.pop(uid, None)
+            bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(run_vault_release(call.message.chat.id, sid, tid), loop)
 
     elif data == "log_targets_main":
         bot.answer_callback_query(call.id)
@@ -1999,6 +2074,44 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
     finally:
         running_tasks.pop(task_key, None)
+
+async def run_vault_release(admin_chat_id, source_id, target_id):
+    try:
+        items = get_vaulted_media_for_source(source_id)
+        if not items:
+            bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
+            return
+            
+        bot.send_message(admin_chat_id, f"📦 Starting release of `{len(items)}` vaulted items...")
+        
+        sent = 0
+        failed = 0
+        
+        for smid, file_id, m_type, caption in items:
+            try:
+                m_type_lower = (m_type or "").lower()
+                cap = caption or ""
+                
+                if "photo" in m_type_lower:
+                    bot.send_photo(target_id, file_id, caption=cap)
+                elif "video" in m_type_lower:
+                    bot.send_video(target_id, file_id, caption=cap)
+                else:
+                    bot.send_document(target_id, file_id, caption=cap)
+                    
+                sent += 1
+            except Exception as item_err:
+                logger.error(f"Vault Release item error: {item_err}")
+                failed += 1
+                
+            # Rate limit protection (Telegram Bot API allows ~20 msgs/minute to a single chat)
+            await asyncio.sleep(3)
+            
+        bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Global Vault Release Error: {e}")
+        bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
 
 # -----------------------------
 # Watchdog
