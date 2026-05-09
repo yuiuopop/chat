@@ -1046,8 +1046,8 @@ def setup_automation_handlers(client: TelegramClient):
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
                     
-                    # Instantly send to log targets
-                    await forward_to_log_targets(client, m, sid, m.id)
+                    # Instantly send to log targets in background
+                    asyncio.create_task(forward_to_log_targets(client, m, sid, m.id))
 
                 if not is_live: continue
 
@@ -1077,27 +1077,37 @@ def setup_automation_handlers(client: TelegramClient):
             if is_mir and first_msg.reply_to:
                 source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
                 if source_top:
+                    # Resolve the source topic title
                     forum = getattr(first_msg.reply_to, "forum_topic", None)
-                    src_title = getattr(forum, "title", "Mirrored Thread") if forum else "Thread"
-                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
+                    src_title = getattr(forum, "title", None)
+                    
+                    # If not in cache, fetch from source group's topic list
+                    if not src_title:
+                        try:
+                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                            for t in res.topics:
+                                if t.id == source_top:
+                                    src_title = t.title; break
+                        except: pass
+                    
+                    # Mirror the topic in the target group using the real name
+                    if src_title:
+                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
 
             # 2. Resolve Reply Hierarchy
-            reply_to_mapped = None
-            if getattr(first_msg, "reply_to_msg_id", None):
-                reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+            reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid) if first_msg.reply_to_msg_id else None
 
-            # 3. CONSTRUCT REPLY LOGIC
-            # If reply_to_mapped exists, we reply to that specific message.
-            # If it DOES NOT exist, we reply to the dest_topic_id (this places it in the topic).
-            final_reply_id = int(reply_to_mapped) if reply_to_mapped else (int(dest_topic_id) if dest_topic_id else None)
+            # 3. CONSTRUCT REPLY LOGIC (InputReplyToMessage for Forums)
+            reply_param = None
+            if reply_to_mapped:
+                reply_param = types.InputReplyToMessage(
+                    reply_to_msg_id=int(reply_to_mapped),
+                    top_msg_id=int(dest_topic_id) if dest_topic_id else None
+                )
+            elif dest_topic_id:
+                reply_param = int(dest_topic_id)
 
-            # --- CAPTION SUPPORT ---
-            # Search all messages in the grouping to find the one with the text
-            album_text = ""
-            for msg in messages:
-                if msg.message:
-                    album_text = msg.message
-                    break
+            album_text = next((msg.message for msg in messages if msg.message), "")
 
             # 4. Send Content
             for _ in range(3):
@@ -1106,14 +1116,13 @@ def setup_automation_handlers(client: TelegramClient):
                         entity=int(tid), 
                         message=album_text, 
                         file=messages if len(messages) > 1 else messages[0].media,
-                        reply_to=final_reply_id
+                        reply_to=reply_param
                     )
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
                         save_message_mapping(sid, first_msg.id, tid, first_id)
                     break
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
-                    await asyncio.sleep(4)
                     await asyncio.sleep(4)
                 except Exception as inner_e:
                     logger.error(f"Failed to send mirrored content: {inner_e}")
