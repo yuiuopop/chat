@@ -2473,6 +2473,9 @@ async def main():
             logger.error(f"Userbot disconnected with error: {e}")
             if "AuthKeyDuplicatedError" in str(e):
                 logger.critical("🚨 CRITICAL: Duplicate session detected. Stopping Userbot loop.")
+            # Keep the main thread alive so background bots keep working
+            while True:
+                await asyncio.sleep(3600)
     else:
         while True:
             await asyncio.sleep(3600)
