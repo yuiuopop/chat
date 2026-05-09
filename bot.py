@@ -758,23 +758,21 @@ def setup_automation_handlers(client: TelegramClient):
                     try:
                         logger.warning(f"LIVE FORWARD | CHAT:{tid} | TOPIC:{target_topic_anchor}")
                         
-                        # Use explicit ReplyTo for forum topics to ensure thread context
-                        reply_to_param = None
                         if target_topic_anchor:
-                            reply_to_param = int(target_topic_anchor)
+                            target_topic_anchor = int(target_topic_anchor)
 
                         if m.media:
                             await client.send_file(
                                 entity=tid,
                                 file=m.media,
                                 caption=m.message or "",
-                                reply_to=reply_to_param
+                                comment_to=target_topic_anchor
                             )
                         else:
                             await client.send_message(
                                 entity=tid,
                                 message=m.message or "",
-                                reply_to=reply_to_param
+                                comment_to=target_topic_anchor
                             )
                     except Exception as e:
                         logger.error(f"Live Forward Error for Pair {pid}: {e}")
@@ -1614,16 +1612,14 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
 
                 logger.warning(f"RELEASE SEND | CHAT:{tid_ref} | TOPIC:{target_topic_anchor}")
                 
-                # Use explicit ReplyTo for forum topics to ensure thread context
-                reply_to_param = None
                 if target_topic_anchor:
-                    reply_to_param = int(target_topic_anchor)
+                    target_topic_anchor = int(target_topic_anchor)
 
                 await userbot.send_message(
                     entity=tid_ref,
                     message=msg.message or "",
                     file=msg.media,
-                    reply_to=reply_to_param
+                    comment_to=target_topic_anchor
                 )
                 
                 with db_conn() as conn:
