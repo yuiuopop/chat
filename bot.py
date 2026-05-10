@@ -2701,18 +2701,15 @@ class LogBotManager:
                 fetch_id = args[1]
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
-                    c.execute(f"SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = {p} AND bot_id = {p}", (fetch_id, bot_id))
+                    # Use %s for PostgreSQL
+                    c.execute("SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = %s AND bot_id = %s", (fetch_id, bot_id))
                     res = c.fetchone()
                 if res:
                     file_id, m_type, caption = res
                     bot_instance.send_chat_action(message.chat.id, 'upload_document')
                     if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=caption)
                     elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=caption)
-                    elif m_type == "document": bot_instance.send_document(message.chat.id, file_id, caption=caption)
-                    elif m_type == "audio": bot_instance.send_audio(message.chat.id, file_id, caption=caption)
-                    elif m_type == "animation": bot_instance.send_animation(message.chat.id, file_id, caption=caption)
-                    elif m_type == "sticker": bot_instance.send_sticker(message.chat.id, file_id)
+                    else: bot_instance.send_document(message.chat.id, file_id, caption=caption)
                 else:
                     bot_instance.reply_to(message, "🔍 ID not found in this bot's vault.")
             except Exception as e:
@@ -2724,41 +2721,34 @@ class LogBotManager:
             try:
                 args = message.text.split()
                 count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
-                if count > 30: count = 30 # Safety limit
+                if count > 30: count = 30 
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
-                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, count))
+                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = %s ORDER BY timestamp DESC LIMIT %s", (bot_id, count))
                     results = c.fetchall()
                 if not results:
                     bot_instance.reply_to(message, "🔍 Vault empty.")
                     return
                 for f_id, m_t, cap, l_id in reversed(results):
                     full_cap = f"🆔 ID: `{l_id}`\n\n{cap or ''}"
-                    try:
-                        if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "document": bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "audio": bot_instance.send_audio(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "animation": bot_instance.send_animation(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "sticker": bot_instance.send_sticker(message.chat.id, f_id)
-                        time.sleep(0.5)
-                    except: pass
+                    if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                    elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                    else: bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                    time.sleep(0.5)
             except Exception as e:
-                bot_instance.reply_to(message, f"❌ Error retrieving batch: {e}")
+                bot_instance.reply_to(message, f"❌ Error: {e}")
 
         @bot_instance.message_handler(commands=['grouplist'])
         def cmd_group_list(message):
             if message.from_user.id != ADMIN_ID: return
             with db_conn() as conn:
                 c = conn.cursor()
-                p = get_placeholder(conn)
-                # PostgreSQL fix: Group by both ID and Title
-                c.execute(f"""
+                # Correct GROUP BY for PostgreSQL
+                c.execute("""
                     SELECT m.source_chat_id, p.source_title, COUNT(m.id)
                     FROM log_media m
                     LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
-                    WHERE m.bot_id = {p}
+                    WHERE m.bot_id = %s
                     GROUP BY m.source_chat_id, p.source_title
                 """, (bot_id,))
                 groups = c.fetchall()
@@ -2780,24 +2770,56 @@ class LogBotManager:
                 group_id, count = int(args[1]), (int(args[2]) if len(args) > 2 else 5)
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
-                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = {p} AND bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (group_id, bot_id, count))
+                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = %s AND bot_id = %s ORDER BY timestamp DESC LIMIT %s", (group_id, bot_id, count))
                     results = c.fetchall()
-                if not results:
-                    bot_instance.reply_to(message, "🔍 No media found.")
-                    return
                 for f_id, m_t, cap, l_id in reversed(results):
-                    full_cap = f"🆔 ID: `{l_id}`\n\n{cap or ''}"
-                    try:
-                        if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "document": bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "audio": bot_instance.send_audio(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "animation": bot_instance.send_animation(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                        elif m_t == "sticker": bot_instance.send_sticker(message.chat.id, f_id)
-                        time.sleep(0.5)
-                    except: pass
+                    bot_instance.send_photo(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`\n{cap or ''}") if m_t == "photo" else bot_instance.send_document(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`")
+                    time.sleep(0.5)
             except Exception as e: bot_instance.reply_to(message, f"❌ Error: {e}")
+
+        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_group_stats_"))
+        def handle_group_stats(call):
+            sid = int(call.data.split("_")[-1])
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT source_title FROM target_pairs WHERE source_id = %s LIMIT 1", (sid,))
+                res = c.fetchone()
+                c.execute("SELECT COUNT(*) FROM log_media WHERE source_chat_id = %s AND bot_id = %s", (sid, bot_id))
+                total = c.fetchone()[0]
+            msg = (f"📊 **Group Statistics**\n\n"
+                   f"🏷 **Title:** `{res[0] if res else 'Unknown'}`\n"
+                   f"🆔 **ID:** `{sid}`\n"
+                   f"📦 **Total Media:** `{total}`\n\n"
+                   f"💡 To fetch, use: `/getbyid {sid} 20`")
+            bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+        @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
+        def handle_logging(message):
+            try:
+                m_type = "document"
+                file_id = None
+                caption = message.caption or ""
+                if message.photo: m_type, file_id = "photo", message.photo[-1].file_id
+                elif message.video: m_type, file_id = "video", message.video.file_id
+                elif message.document: m_type, file_id = "document", message.document.file_id
+                elif message.audio: m_type, file_id = "audio", message.audio.file_id
+                elif message.animation: m_type, file_id = "animation", message.animation.file_id
+                elif message.sticker: m_type, file_id = "sticker", message.sticker.file_id
+                
+                if file_id:
+                    sid, mid = 0, message.message_id
+                    if caption and "SID:" in caption and "MID:" in caption:
+                        try:
+                            parts = caption.split("|")
+                            sid = int(parts[0].replace("SID:", "").strip())
+                            mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
+                            caption = caption.split("\n", 1)[1] if "\n" in caption else ""
+                        except: pass
+                    
+                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption)
+                    if sid == 0 and message.from_user.id == ADMIN_ID:
+                        bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`\nFetch: `/get {message.message_id}`")
+            except Exception as e: logger.error(f"Logging Error: {e}")
 
         @bot_instance.callback_query_handler(func=lambda call: True)
         def handle_log_bot_callbacks(call):
@@ -2805,23 +2827,6 @@ class LogBotManager:
             data = call.data
             uid = call.from_user.id
             
-            if data.startswith("v_group_stats_"):
-                sid = int(data.split("_")[-1])
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = ?", (sid,))
-                    res = c.fetchone()
-                    title = res[0] if res else "Unknown"
-                    c.execute("SELECT COUNT(*) FROM log_media WHERE source_chat_id = ? AND bot_id = ?", (sid, bot_id))
-                    total = c.fetchone()[0]
-                msg = (f"📊 **Group Statistics**\n\n"
-                       f"🏷 **Title:** `{title}`\n"
-                       f"🆔 **ID:** `{sid}`\n"
-                       f"📦 **Total Media:** `{total}`\n\n"
-                       f"💡 To fetch, use: `/getbyid {sid} 20`")
-                bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                return
-
             if data == "lb_vault_main":
                 bot_instance.answer_callback_query(call.id)
                 stats = get_log_bot_stats(bot_id)
@@ -2917,66 +2922,6 @@ class LogBotManager:
                     bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
                 except:
                     bot_instance.reply_to(message, "⚠️ Invalid interval. Please send a number (e.g. `2.0`).")
-
-        @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
-        def handle_logging(message):
-            # This is the core logging logic. When userbot sends/forwards here, we save it.
-            try:
-                m_type = "document"
-                file_id = None
-                caption = message.caption or ""
-                
-                if message.photo:
-                    m_type = "photo"
-                    file_id = message.photo[-1].file_id
-                elif message.video:
-                    m_type = "video"
-                    file_id = message.video.file_id
-                elif message.document:
-                    m_type = "document"
-                    file_id = message.document.file_id
-                elif message.audio:
-                    m_type = "audio"
-                    file_id = message.audio.file_id
-                elif message.animation:
-                    m_type = "animation"
-                    file_id = message.animation.file_id
-                elif message.sticker:
-                    m_type = "sticker"
-                    file_id = message.sticker.file_id
-                
-                if file_id:
-                    # We need to identify which source chat/msg this came from.
-                    # Usually, we'd encode this in the caption or just log it.
-                    # For now, let's look for a pattern in the caption if the userbot adds it,
-                    # or just log it with 0/0 if unknown.
-                    # The plan says: "extract the file_id, media_type, and caption".
-                    # To map back to source, the userbot should ideally send this info.
-                    
-                    source_chat_id = 0
-                    source_msg_id = 0
-                    
-                    # Check if userbot included source info in caption (e.g. "SID: 123 | MID: 456")
-                    if caption and "SID:" in caption and "MID:" in caption:
-                        try:
-                            parts = caption.split("|")
-                            source_chat_id = int(parts[0].replace("SID:", "").strip())
-                            source_msg_id = int(parts[1].split("\n")[0].replace("MID:", "").strip())
-                            # Clean up the caption for storage
-                            if "\n" in caption:
-                                caption = caption.split("\n", 1)[1]
-                            else:
-                                caption = ""
-                        except: pass
-                    
-                    save_logged_media(bot_id, message.message_id, source_chat_id, source_msg_id, file_id, m_type, caption)
-                    
-                    # If it's a direct upload (no source info), send confirmation with Fetch ID
-                    if source_chat_id == 0 and message.from_user.id == ADMIN_ID:
-                        bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n\n📂 Type: `{m_type}`\n🆔 Fetch ID: `{message.message_id}`\n\nUse `/get {message.message_id}` to retrieve this later.")
-            except Exception as e:
-                logger.error(f"Log Bot indexing error: {e}")
-                logger.error(f"Logging Error on Bot {bot_id}: {e}")
 
 log_bot_manager = LogBotManager()
 
