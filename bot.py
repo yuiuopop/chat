@@ -1253,13 +1253,8 @@ def setup_automation_handlers(client: TelegramClient):
             # --- SEND WITH RETRY LOGIC ---
             retries = 3
             
-            # Construct the proper Reply object to prevent ugly reply bubbles in forums
-            reply_obj = None
-            if final_reply_target:
-                reply_obj = InputReplyToMessage(
-                    reply_to_msg_id=int(final_reply_target),
-                    top_msg_id=int(final_reply_target)
-                )
+            # Use simple integer for reply_to to prevent Telethon type errors
+            reply_obj = int(final_reply_target) if final_reply_target else None
                 
             while retries > 0:
                 try:
@@ -2379,7 +2374,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
     running_tasks[task_key] = True
     
     try:
-        target_chat_id = int(target_id)
+        def fix_id_for_bot(tid):
+            s = str(tid).strip()
+            if s.startswith("-100") or s.startswith("-"): return int(s)
+            if len(s) >= 10: return int(f"-100{s}")
+            return int(s)
+
+        target_chat_id = fix_id_for_bot(target_id)
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
@@ -2410,6 +2411,11 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                 if file_id and str(file_id).startswith("MSG_ID:"):
                     msg_id_val = int(file_id.split(":", 1)[1])
                     userbot_me = await userbot.get_me()
+                    
+                    # DEBUG LOGGING
+                    if sent == 0:
+                        logger.info(f"DEBUG: Extracting to {target_chat_id} from Userbot DM ({userbot_me.id}) using MSG_ID")
+                    
                     sender_bot.copy_message(target_chat_id, from_chat_id=userbot_me.id, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
                 else:
                     if "photo" in m_type_l:
@@ -2618,6 +2624,12 @@ def setup_log_bot(token):
                     msg_id_val = int(file_id.split(":", 1)[1])
                     # Ensure we are copying from the chat between the Log Bot and the Userbot
                     async def do_copy():
+                        def fix_id_for_bot(tid):
+                            s = str(tid)
+                            if s.startswith("-100") or s.startswith("-"): return int(s)
+                            if len(s) >= 10 and not s.startswith("1"): return int(f"-100{s}")
+                            return int(s)
+                        
                         ub_me = await userbot.get_me()
                         log_bot.copy_message(message.chat.id, from_chat_id=ub_me.id, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
                     asyncio.run_coroutine_threadsafe(do_copy(), loop)
@@ -2762,12 +2774,13 @@ def setup_log_bot(token):
             try:
                 # SERVER-SIDE CLEANUP
                 try:
+                    logger.info(f"🧹 Clearing old Log Bot sessions ({bot_id})...")
                     log_bot.delete_webhook(drop_pending_updates=True)
-                    time.sleep(2) # Give Telegram time to breathe
+                    time.sleep(5) # Increased delay to prevent 409 Conflict
                 except: pass
                 
                 logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
-                log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+                log_bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
             except Exception as e:
                 logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
                 time.sleep(30)
