@@ -2298,28 +2298,36 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
-    """Robust extraction with 429 flood protection and ID normalization"""
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None, limit=0, interval=3.5):
+    """Robust extraction with stop control and custom interval"""
+    task_key = f"rel_{source_id}_{target_id}"
+    running_tasks[task_key] = True
+    
     try:
-        # --- ID NORMALIZATION ---
         raw_id = str(target_id).replace("-100", "").strip("-")
         target_chat_id = int(f"-100{raw_id}")
-        # ---------------------------
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
             sender_bot.send_message(admin_chat_id, f"❌ No media found for source `{source_id}`.")
             return
             
-        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction of `{len(items)}` items into `{target_chat_id}`...")
+        if limit > 0: items = items[:limit]
+            
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Extraction", callback_data=f"log_stop_{task_key}"))
+        status_msg = sender_bot.send_message(admin_chat_id, f"📦 Starting extraction of `{len(items)}` items...", reply_markup=markup)
         
         sent = 0
         for smid, file_id, m_type, caption, topic_title in items:
+            if not running_tasks.get(task_key):
+                sender_bot.edit_message_text(f"🛑 **Extraction Stopped!**\nSent: `{sent}` items.", admin_chat_id, status_msg.message_id)
+                break
+                
             try:
                 dest_topic_id = None
                 if topic_title:
                     try:
-                        # Automatically reconstruct the folder structure
                         dest_topic_id = await get_or_create_target_topic(userbot, target_chat_id, topic_title)
                     except: pass
 
@@ -2334,7 +2342,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 
                 sent += 1
-                await asyncio.sleep(4.0) # Increased sleep to prevent 429
+                await asyncio.sleep(interval) 
                 
             except telebot.apihelper.ApiTelegramException as e:
                 if e.error_code == 429:
@@ -2342,7 +2350,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     logger.warning(f"🕒 Rate limited! Sleeping for {retry_after}s...")
                     await asyncio.sleep(retry_after + 5)
                 elif "wrong file identifier" in str(e):
-                    logger.error(f"❌ Skipping bad File ID: {file_id[:15]}... (likely old corrupted data)")
+                    logger.error(f"❌ Skipping bad File ID: {file_id[:15]}...")
                 else:
                     logger.error(f"⚠️ Extraction error: {e}")
             except Exception as e:
@@ -2351,6 +2359,8 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
         sender_bot.send_message(admin_chat_id, f"✅ **Extraction Done**\nSent: `{sent}` items.")
     except Exception as e:
         logger.error(f"Global Extraction Error: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
 
 # -----------------------------
 # Watchdog
@@ -2588,13 +2598,67 @@ def setup_log_bot(token):
                 asyncio.run_coroutine_threadsafe(update_tgt(), loop)
             else:
                 tid = int(parts[3])
-                sid = log_bot_states[bot_id][uid].get("source_id")
-                if not sid:
-                    log_bot.send_message(call.message.chat.id, "❌ Error: Source group not selected. Please start over.")
-                    return
+                log_bot_states[bot_id][uid]["target_id"] = tid
                 
-                log_bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nTarget: `{tid}`\nThis bot is now broadcasting its vaulted media...", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id), loop)
+                # Show Settings Menu (Limit & Interval)
+                state = log_bot_states[bot_id][uid]
+                state["limit"] = 100
+                state["interval"] = 3.5
+                
+                def show_settings():
+                    markup = InlineKeyboardMarkup(row_width=2)
+                    # Limit Buttons
+                    markup.row(InlineKeyboardButton("📦 Limit: 50", callback_data="log_set_lim_50"),
+                               InlineKeyboardButton("📦 Limit: 200", callback_data="log_set_lim_200"))
+                    markup.row(InlineKeyboardButton("📦 Limit: ALL", callback_data="log_set_lim_0"))
+                    # Interval Buttons
+                    markup.row(InlineKeyboardButton("⏱️ 1.5s Delay", callback_data="log_set_int_1.5"),
+                               InlineKeyboardButton("⏱️ 3.5s Delay", callback_data="log_set_int_3.5"),
+                               InlineKeyboardButton("⏱️ 5.0s Delay", callback_data="log_set_int_5.0"))
+                    
+                    markup.row(InlineKeyboardButton("🚀 START EXTRACTION", callback_data="log_start_final"))
+                    markup.row(InlineKeyboardButton("🔙 Back", callback_data=f"log_send_src_{state.get('source_id')}"))
+                    
+                    text = (f"⚙️ **Extraction Settings**\n\n"
+                            f"📁 Source: `{state.get('source_id')}`\n"
+                            f"🎯 Target: `{state.get('target_id')}`\n"
+                            f"🔢 Limit: `{state['limit'] if state['limit'] > 0 else 'All'}`\n"
+                            f"⏳ Interval: `{state['interval']}s`\n\n"
+                            f"Select your preferences before starting.")
+                    log_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                show_settings()
+
+        elif data.startswith("log_set_lim_"):
+            log_bot.answer_callback_query(call.id)
+            log_bot_states[bot_id][uid]["limit"] = int(data.split("_")[-1])
+            # Re-trigger settings menu logic here or simplified:
+            log_bot.send_message(call.message.chat.id, f"✅ Limit set to {log_bot_states[bot_id][uid]['limit'] if log_bot_states[bot_id][uid]['limit'] > 0 else 'All'}")
+
+        elif data.startswith("log_set_int_"):
+            log_bot.answer_callback_query(call.id)
+            log_bot_states[bot_id][uid]["interval"] = float(data.split("_")[-1])
+            log_bot.send_message(call.message.chat.id, f"✅ Interval set to {log_bot_states[bot_id][uid]['interval']}s")
+
+        elif data == "log_start_final":
+            log_bot.answer_callback_query(call.id)
+            state = log_bot_states[bot_id][uid]
+            sid = state.get("source_id")
+            tid = state.get("target_id")
+            lim = state.get("limit", 100)
+            inv = state.get("interval", 3.5)
+            
+            if not (sid and tid):
+                log_bot.send_message(call.message.chat.id, "❌ Error: Selection lost. Please start over.")
+                return
+            
+            log_bot.edit_message_text(f"🚀 **Vault Release Started**\n\nTarget: `{tid}`\nLimit: `{lim}` | Delay: `{inv}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+            asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id, lim, inv), loop)
+
+        elif data.startswith("log_stop_rel_"):
+            log_bot.answer_callback_query(call.id)
+            task_key = data.replace("log_stop_", "")
+            running_tasks[task_key] = False
+            log_bot.edit_message_text("🛑 **Extraction Stopping...**", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
     @log_bot.message_handler(func=lambda m: True)
     def log_auto_cleanup(message):
