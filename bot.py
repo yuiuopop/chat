@@ -2409,7 +2409,8 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                 
                 if file_id and str(file_id).startswith("MSG_ID:"):
                     msg_id_val = int(file_id.split(":", 1)[1])
-                    sender_bot.copy_message(target_chat_id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
+                    userbot_me = await userbot.get_me()
+                    sender_bot.copy_message(target_chat_id, from_chat_id=userbot_me.id, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
                 else:
                     if "photo" in m_type_l:
                         sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
@@ -2615,7 +2616,11 @@ def setup_log_bot(token):
                 
                 if file_id and str(file_id).startswith("MSG_ID:"):
                     msg_id_val = int(file_id.split(":", 1)[1])
-                    log_bot.copy_message(message.chat.id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
+                    # Ensure we are copying from the chat between the Log Bot and the Userbot
+                    async def do_copy():
+                        ub_me = await userbot.get_me()
+                        log_bot.copy_message(message.chat.id, from_chat_id=ub_me.id, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
+                    asyncio.run_coroutine_threadsafe(do_copy(), loop)
                 else:
                     if "photo" in m_type:
                         log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
