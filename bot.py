@@ -220,6 +220,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS log_media (
                     id SERIAL PRIMARY KEY,
                     bot_id BIGINT,
+                    log_msg_id BIGINT,
                     source_chat_id BIGINT,
                     source_msg_id BIGINT,
                     file_id TEXT,
@@ -229,6 +230,8 @@ def init_db():
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
+            try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -339,6 +342,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS log_media (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     bot_id BIGINT,
+                    log_msg_id BIGINT,
                     source_chat_id BIGINT,
                     source_msg_id BIGINT,
                     file_id TEXT,
@@ -348,6 +352,8 @@ def init_db():
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
+            try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
+            except: pass
     logger.info("DB initialized")
     logger.info("DB initialized")
 
@@ -537,7 +543,7 @@ def get_vaulted_media_for_source(source_id, bot_id=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id
             FROM log_media m
             WHERE m.source_chat_id = {p}
         """
@@ -624,22 +630,27 @@ def clear_bot_logs(bot_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
 
-def save_logged_media(bot_id, source_chat_id, source_msg_id, file_id, media_type, caption):
+def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                """INSERT INTO log_media (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (%s, %s, %s, %s, %s, %s) 
-                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO NOTHING""",
-                (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) 
+                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
+                   log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
+                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
             )
         else:
             c.execute(
-                """INSERT OR IGNORE INTO log_media (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
+                   log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
+                   media_type = excluded.media_type, caption = excluded.caption""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
             )
 
 def get_logged_media_stats(bot_id):
@@ -728,7 +739,7 @@ def log_bot_view_markup(bot_id):
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -1089,6 +1100,10 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
                 file=message.media if message.media else None,
                 message=caption_text
             )
+            await asyncio.sleep(2)
+        except errors.FloodWaitError as fwe:
+            logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
+            await asyncio.sleep(fwe.seconds)
         except Exception as e:
             if "protected" in str(e).lower() or "forward" in str(e).lower():
                 logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
@@ -1244,7 +1259,9 @@ def setup_automation_handlers(client: TelegramClient):
 
             # 4. Send Content
             album_text = next((msg.message for msg in messages if msg.message), "")
-            for _ in range(3):
+            sent = None
+            
+            for attempt in range(3):
                 try:
                     sent = await client.send_message(
                         entity=int(tid), 
@@ -1252,40 +1269,29 @@ def setup_automation_handlers(client: TelegramClient):
                         file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
                         reply_to=reply_header
                     )
-                except Exception as e:
-                    if "protected" in str(e).lower() or "forward" in str(e).lower():
-                        logger.info(f"🛡️ MIRROR: Protected chat detected. Downloading/Uploading...")
-                        # If album, download all
-                        if len(messages) > 1:
-                            paths = []
-                            for m in messages:
-                                p = await client.download_media(m)
-                                if p: paths.append(p)
-                            sent = await client.send_message(entity=int(tid), message=album_text, file=paths, reply_to=reply_header)
-                            for p in paths:
-                                if os.path.exists(p): os.remove(p)
-                        else:
-                            path = await client.download_media(messages[0])
-                            sent = await client.send_message(entity=int(tid), message=album_text, file=path, reply_to=reply_header)
-                            if path and os.path.exists(path): os.remove(path)
-                    else:
-                        raise e
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent to {tid} (Topic: {dest_topic_id}) -> MSG ID: {first_id}")
+                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
                         save_message_mapping(sid, first_msg.id, tid, first_id)
-                    break
-                except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
-                    await asyncio.sleep(4)
+                        break # Success!
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
+                    await asyncio.sleep(fwe.seconds)
+                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
+                    await asyncio.sleep(2)
                 except Exception as e:
-                    logger.error(f"MIRROR SEND ATTEMPT FAILED: {e}")
-                    # Protected Chat Fallback
-                    if "protected" in str(e).lower() or "restricted" in str(e).lower():
-                        await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
-                    break
-
+                    err_msg = str(e).lower()
+                    if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
+                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
+                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
+                        if sent: break # Success via fallback
+                    else:
+                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                        if attempt == 2: # Last attempt
+                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+            
         except Exception as e:
-            logger.error(f"Mirror Error: {e}")
+            logger.error(f"Global Mirror Error: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
@@ -2368,41 +2374,51 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             return
             
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Extraction", callback_data=f"lb_stop_rel_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"📦 **Starting extraction of `{len(items)}` items...**", reply_markup=markup, parse_mode="Markdown")
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"lb_stop_rel_{task_key}"))
+        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Userbot Release Engine...**\nItems: `{len(items)}`", reply_markup=markup, parse_mode="Markdown")
         
         sent = 0
         failed = 0
         
-        for smid, file_id, m_type, caption in items:
+        # We use the userbot to forward messages from the Log Bot's chat
+        # Since the Userbot is already authorized and in the target chats, this avoids "chat not found".
+        for smid, file_id, m_type, caption, log_msg_id, bot_id in items:
             if not running_tasks.get(task_key):
-                sender_bot.send_message(admin_chat_id, "🛑 **Extraction stopped by user.**", parse_mode="Markdown")
+                sender_bot.send_message(admin_chat_id, "🛑 **Release stopped by user.**", parse_mode="Markdown")
                 break
                 
             try:
-                m_type_lower = (m_type or "").lower()
-                cap = caption or ""
+                # 1. Resolve the Log Bot chat peer
+                log_bot_peer = await userbot.get_input_entity(int(bot_id))
                 
-                if m_type == "Text":
-                    sender_bot.send_message(target_id, cap or " (Empty Text Message) ")
-                elif "photo" in m_type_lower:
-                    sender_bot.send_photo(target_id, file_id, caption=cap)
-                elif "video" in m_type_lower:
-                    sender_bot.send_video(target_id, file_id, caption=cap)
-                else:
-                    sender_bot.send_document(target_id, file_id, caption=cap)
-                    
+                # 2. Forward from Log Bot to Target
+                await userbot.forward_messages(
+                    entity=int(target_id),
+                    messages=int(log_msg_id),
+                    from_peer=log_bot_peer
+                )
                 sent += 1
+                
                 if sent % 5 == 0:
-                    try: sender_bot.edit_message_text(f"📦 **Extracting...**\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                    try: sender_bot.edit_message_text(f"🚀 **Userbot Releasing...**\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                     except: pass
             except Exception as item_err:
-                logger.error(f"Vault Release item error: {item_err}")
-                failed += 1
+                logger.error(f"Vault Release item error (Userbot): {item_err}")
+                # Fallback to Log Bot direct send if userbot fails (unlikely)
+                try:
+                    m_type_lower = (m_type or "").lower()
+                    cap = caption or ""
+                    if m_type == "Text": sender_bot.send_message(target_id, cap or " ")
+                    elif "photo" in m_type_lower: sender_bot.send_photo(target_id, file_id, caption=cap)
+                    elif "video" in m_type_lower: sender_bot.send_video(target_id, file_id, caption=cap)
+                    else: sender_bot.send_document(target_id, file_id, caption=cap)
+                    sent += 1
+                except:
+                    failed += 1
                 
             await asyncio.sleep(interval)
             
-        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Done**\nSent: `{sent}` items.\nFailed: `{failed}`", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Release Done**\nSent: `{sent}` items.\nFailed: `{failed}`", parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"Global Vault Release Error: {e}")
@@ -2736,7 +2752,7 @@ class LogBotManager:
                                 caption = ""
                         except: pass
                     
-                    save_logged_media(bot_id, source_chat_id, source_msg_id, file_id, m_type, caption)
+                    save_logged_media(bot_id, message.message_id, source_chat_id, source_msg_id, file_id, m_type, caption)
             except Exception as e:
                 logger.error(f"Logging Error on Bot {bot_id}: {e}")
 
