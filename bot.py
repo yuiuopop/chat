@@ -759,7 +759,7 @@ def show_pair_view(chat_id, message_id, pid):
             bot.send_message(chat_id, f"❌ Pair not found (ID: {pid}). It may have been deleted.")
             return
             
-        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
+        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter = row
         stats = get_pair_stats(pid)
         mon_status = "🟢 Running" if is_mon else "🔴 Stopped"
         live_status = "🟢 Running" if is_live else "🔴 Stopped"
