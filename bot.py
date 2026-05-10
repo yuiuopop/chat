@@ -1025,28 +1025,28 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
+                # CRITICAL: We reach into the .photo or .document attribute
+                # to get the FULL object required for a valid Bot File ID
                 inner = None
-                # CRITICAL: Target the parent object ONLY
                 if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner = v_msg.media.photo
+                    inner = v_msg.media.photo 
                 elif isinstance(v_msg.media, types.MessageMediaDocument):
                     inner = v_msg.media.document
                 
-                # Check for access_hash to ensure it's a real file object
                 if inner and hasattr(inner, 'access_hash'):
                     fid = pack_bot_file_id(inner)
-                    # Associate with the actual message ID from the source group
-                    source_id_to_save = messages[i].id if i < len(messages) else source_msg_id
-                    save_media_log(source_id_to_save, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__}")
+                    # Match back to original source message ID
+                    real_sid = messages[i].id if i < len(messages) else source_msg_id
+                    save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"New ID generated for msg {real_sid}")
                 else:
                     # It's a plain text message or non-packable media
-                    source_id_to_save = messages[i].id if i < len(messages) else source_msg_id
+                    real_sid = messages[i].id if i < len(messages) else source_msg_id
                     m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
-                    save_media_log(source_id_to_save, log_chat_id, None, m_type, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored {m_type}")
-            except Exception as ex:
-                log_action("vault", "INDEX_SKIP", f"Item {i} was not packable: {ex}")
+                    save_media_log(real_sid, log_chat_id, None, m_type, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"Stored {m_type} for msg {real_sid}")
+            except Exception as e:
+                logger.error(f"⚠️ Indexing failed: {e}")
                 
         # --- Session Tracking Logic (Unchanged) ---
         with session_lock:
