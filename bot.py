@@ -2681,16 +2681,13 @@ class LogBotManager:
         @bot_instance.message_handler(commands=['start'])
         def cmd_start(message):
             if message.from_user.id != ADMIN_ID: return
-            
             count = get_logged_media_stats(bot_id)
-            text = f"🤖 **Secondary Main Bot (Vault Manager) Online**\n\n"
-            text += f"📊 **Vault Storage Stats:**\n"
-            text += f"📦 Total Vaulted: `{count}` items\n\n"
-            text += "Use the button below to release logs to a new target."
-            
+            text = (f"🤖 **Vault Manager Online**\n\n"
+                    f"📊 **Storage Stats:**\n"
+                    f"📦 Total Vaulted: `{count}` items\n\n"
+                    f"Use /grouplist to see categorized media.")
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("📤 Send Log", callback_data="lb_vault_main"))
-            
             bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
         @bot_instance.message_handler(commands=['get'])
@@ -2699,16 +2696,14 @@ class LogBotManager:
             try:
                 args = message.text.split()
                 if len(args) < 2:
-                    bot_instance.reply_to(message, "❌ Please provide a Fetch ID. Example: `/get 12345`")
+                    bot_instance.reply_to(message, "❌ Usage: `/get [Fetch_ID]`")
                     return
                 fetch_id = args[1]
-                
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder()
+                    p = get_placeholder(conn)
                     c.execute(f"SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = {p} AND bot_id = {p}", (fetch_id, bot_id))
                     res = c.fetchone()
-
                 if res:
                     file_id, m_type, caption = res
                     bot_instance.send_chat_action(message.chat.id, 'upload_document')
@@ -2719,9 +2714,9 @@ class LogBotManager:
                     elif m_type == "animation": bot_instance.send_animation(message.chat.id, file_id, caption=caption)
                     elif m_type == "sticker": bot_instance.send_sticker(message.chat.id, file_id)
                 else:
-                    bot_instance.reply_to(message, "🔍 No media found in vault with that ID.")
+                    bot_instance.reply_to(message, "🔍 ID not found in this bot's vault.")
             except Exception as e:
-                bot_instance.reply_to(message, f"❌ Retrieval error: {e}")
+                bot_instance.reply_to(message, f"❌ Error: {e}")
 
         @bot_instance.message_handler(commands=['getcount'])
         def fetch_recent_batch(message):
@@ -2729,39 +2724,26 @@ class LogBotManager:
             try:
                 args = message.text.split()
                 count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
-                if count > 50: count = 50
-
-                bot_instance.send_message(message.chat.id, f"🔍 Fetching the last `{count}` items from vault...")
-
+                if count > 30: count = 30 # Safety limit
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"""
-                        SELECT file_id, media_type, caption, log_msg_id, bot_id 
-                        FROM log_media 
-                        WHERE bot_id = {p}
-                        ORDER BY timestamp DESC LIMIT {p}
-                    """, (bot_id, count))
+                    p = get_placeholder(conn)
+                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, count))
                     results = c.fetchall()
-
                 if not results:
-                    bot_instance.reply_to(message, "🔍 The vault is empty.")
+                    bot_instance.reply_to(message, "🔍 Vault empty.")
                     return
-
-                for file_id, m_type, caption, log_msg_id, owner_bot_id in reversed(results):
-                    # Construct a helpful caption including the ID for future /get use
-                    full_caption = f"🆔 ID: `{log_msg_id}`\n\n{caption if caption else ''}"
-                    
+                for f_id, m_t, cap, l_id in reversed(results):
+                    full_cap = f"🆔 ID: `{l_id}`\n\n{cap or ''}"
                     try:
-                        if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
-                        elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
-                        elif m_type == "document": bot_instance.send_document(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
-                        elif m_type == "audio": bot_instance.send_audio(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
-                        elif m_type == "animation": bot_instance.send_animation(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
-                        elif m_type == "sticker": bot_instance.send_sticker(message.chat.id, file_id)
+                        if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "document": bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "audio": bot_instance.send_audio(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "animation": bot_instance.send_animation(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "sticker": bot_instance.send_sticker(message.chat.id, f_id)
                         time.sleep(0.5)
-                    except Exception as e:
-                        logger.error(f"Error sending batch item {log_msg_id}: {e}")
+                    except: pass
             except Exception as e:
                 bot_instance.reply_to(message, f"❌ Error retrieving batch: {e}")
 
@@ -2770,73 +2752,52 @@ class LogBotManager:
             if message.from_user.id != ADMIN_ID: return
             with db_conn() as conn:
                 c = conn.cursor()
-                # PostgreSQL requires all non-aggregate columns in GROUP BY
-                query = """
+                p = get_placeholder(conn)
+                # PostgreSQL fix: Group by both ID and Title
+                c.execute(f"""
                     SELECT m.source_chat_id, p.source_title, COUNT(m.id)
                     FROM log_media m
                     LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
-                    WHERE m.bot_id = %s
+                    WHERE m.bot_id = {p}
                     GROUP BY m.source_chat_id, p.source_title
-                """ if USING_POSTGRES else """
-                    SELECT m.source_chat_id, p.source_title, COUNT(m.id)
-                    FROM log_media m
-                    LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
-                    WHERE m.bot_id = ?
-                    GROUP BY m.source_chat_id, p.source_title
-                """
-                c.execute(query, (bot_id,))
+                """, (bot_id,))
                 groups = c.fetchall()
-
             if not groups:
-                bot_instance.send_message(message.chat.id, "📭 No media groups found in this bot's vault.")
+                bot_instance.send_message(message.chat.id, "📭 No media found.")
                 return
-
             markup = InlineKeyboardMarkup(row_width=1)
-            text = "📂 **Media Vault Groups**\nSelect a group to see details:\n"
-            for sid, title, count in groups:
-                if sid is None: continue
-                display_title = title if title and title != "None" else f"Unknown Group ({sid})"
-                markup.add(InlineKeyboardButton(f"📁 {display_title} — {count} items", callback_data=f"v_group_stats_{sid}"))
-            bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+            for sid, title, cnt in groups:
+                if sid is None or sid == 0: continue
+                markup.add(InlineKeyboardButton(f"📁 {title or 'Direct'} — {cnt}", callback_data=f"v_group_stats_{sid}"))
+            bot_instance.send_message(message.chat.id, "📂 **Vault Groups**", reply_markup=markup, parse_mode="Markdown")
 
         @bot_instance.message_handler(commands=['getbyid'])
         def fetch_by_group_id(message):
             if message.from_user.id != ADMIN_ID: return
             try:
                 args = message.text.split()
-                if len(args) < 2:
-                    bot_instance.reply_to(message, "❌ Usage: `/getbyid [Group_ID] [Count]`")
-                    return
-                group_id = int(args[1])
-                count = int(args[2]) if len(args) > 2 and args[2].isdigit() else 5
-                if count > 50: count = 50
-
+                if len(args) < 2: return bot_instance.reply_to(message, "❌ `/getbyid [ID] [Count]`")
+                group_id, count = int(args[1]), (int(args[2]) if len(args) > 2 else 5)
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"""
-                        SELECT file_id, media_type, caption, log_msg_id 
-                        FROM log_media 
-                        WHERE source_chat_id = {p} AND bot_id = {p}
-                        ORDER BY timestamp DESC LIMIT {p}
-                    """, (group_id, bot_id, count))
+                    p = get_placeholder(conn)
+                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = {p} AND bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (group_id, bot_id, count))
                     results = c.fetchall()
-
                 if not results:
-                    bot_instance.reply_to(message, f"🔍 No media found in this bot for group ID `{group_id}`.")
+                    bot_instance.reply_to(message, "🔍 No media found.")
                     return
-
-                bot_instance.send_message(message.chat.id, f"📥 Sending `{len(results)}` items...")
-                for file_id, m_type, caption, log_msg_id in reversed(results):
-                    cap = f"🆔 ID: `{log_msg_id}`\n\n{caption if caption else ''}"
+                for f_id, m_t, cap, l_id in reversed(results):
+                    full_cap = f"🆔 ID: `{l_id}`\n\n{cap or ''}"
                     try:
-                        if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=cap, parse_mode="Markdown")
-                        elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=cap, parse_mode="Markdown")
-                        else: bot_instance.send_document(message.chat.id, file_id, caption=cap, parse_mode="Markdown")
+                        if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "document": bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "audio": bot_instance.send_audio(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "animation": bot_instance.send_animation(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
+                        elif m_t == "sticker": bot_instance.send_sticker(message.chat.id, f_id)
                         time.sleep(0.5)
                     except: pass
-            except Exception as e:
-                bot_instance.reply_to(message, f"❌ Error: {e}")
+            except Exception as e: bot_instance.reply_to(message, f"❌ Error: {e}")
 
         @bot_instance.callback_query_handler(func=lambda call: True)
         def handle_log_bot_callbacks(call):
