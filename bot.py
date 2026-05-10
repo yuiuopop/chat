@@ -2522,18 +2522,12 @@ class LogBotManager:
         def cmd_start(message):
             if message.from_user.id != ADMIN_ID: return
             
-            # First, send a dummy message to clear any old reply keyboards from previous uses of this bot token
-            msg_to_del = bot_instance.send_message(message.chat.id, "🔄 Connecting...", reply_markup=ReplyKeyboardRemove())
-            try: bot_instance.delete_message(message.chat.id, msg_to_del.message_id)
-            except: pass
-            
             count = get_logged_media_stats(bot_id)
             text = f"🤖 **Log Bot Active**\n\n"
             text += f"📊 **Vault Stats:**\n"
             text += f"📦 Total Vaulted: `{count}` items\n\n"
             text += "I am automatically logging all media forwarded to me by the main userbot."
             
-            # Try to get the main bot's username to provide a link back
             main_bot_username = bot.get_me().username
             markup = InlineKeyboardMarkup()
             markup.add(
@@ -2541,7 +2535,7 @@ class LogBotManager:
                 InlineKeyboardButton("📥 Fetch Logs", callback_data="lb_fetch")
             )
             markup.add(InlineKeyboardButton("🗑 Clear All Logs", callback_data="lb_clear_confirm"))
-            markup.add(InlineKeyboardButton("🔙 Back to Main Admin Panel", url=f"https://t.me/{main_bot_username}"))
+            markup.add(InlineKeyboardButton("🔙 Back to Main Bot", url=f"https://t.me/{main_bot_username}"))
             
             bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
