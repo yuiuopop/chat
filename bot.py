@@ -1188,8 +1188,8 @@ def setup_automation_handlers(client: TelegramClient):
                                 (pair_id, sid, m.id, m_type, m.message or "")
                             )
                 
-                # Trigger the Log Bot Vaulting
-                await forward_to_log_targets(client, messages, first_msg.id)
+                # Trigger the Log Bot Vaulting is now handled exclusively by auto_handler
+                # to prevent duplicate uploads and blocking of the live mirror flow.
 
             # --- MIRRORING (LIVE FORWARD) ---
             if not tid or not is_mir:
@@ -1221,6 +1221,13 @@ def setup_automation_handlers(client: TelegramClient):
 
             # Resolve Target Topic Only (No message-to-message reply linking)
             final_reply_target = dest_topic_id
+            
+            # Prevent replying to random messages in non-forum groups
+            try:
+                tgt_ent = await client.get_entity(tid)
+                if not getattr(tgt_ent, 'forum', False):
+                    final_reply_target = None
+            except: pass
 
             # --- CAPTION SUPPORT ---
             # Search all messages in the grouping to find the one with the text
@@ -1263,8 +1270,41 @@ def setup_automation_handlers(client: TelegramClient):
                     logger.warning(f"Telegram Busy. Retrying in 4s... ({retries} left)")
                     await asyncio.sleep(4)
                 except Exception as inner_e:
-                    logger.error(f"Failed to send mirrored content: {inner_e}")
-                    break
+                    err_str = str(inner_e).lower()
+                    if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
+                        logger.info("Live Mirror: Protected chat detected. Falling back to local download...")
+                        import os
+                        downloaded_files = []
+                        try:
+                            for m in messages:
+                                if m.media:
+                                    dl = await client.download_media(m.media)
+                                    if dl: downloaded_files.append(dl)
+                            if downloaded_files:
+                                if len(downloaded_files) > 1:
+                                    sent_messages = await client.send_message(
+                                        entity=tid, message=album_text, file=downloaded_files,
+                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                    )
+                                    if sent_messages and isinstance(sent_messages, list):
+                                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                                else:
+                                    sent_msg = await client.send_message(
+                                        entity=tid, message=album_text, file=downloaded_files[0],
+                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                    )
+                                    if sent_msg:
+                                        save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
+                                logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
+                            else:
+                                logger.error("Mirror Fallback: Download failed.")
+                        finally:
+                            for f in downloaded_files:
+                                if os.path.exists(f): os.remove(f)
+                        break
+                    else:
+                        logger.error(f"Failed to send mirrored content: {inner_e}")
+                        break
 
         except Exception as e:
             logger.error(f"Global Mirror Send Error: {e}")
