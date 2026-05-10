@@ -1029,33 +1029,37 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         # 3. Send to Log Bot
         log_action("vault", "UPLOADING", f"Sending {len(messages)} items...")
         album_text = next((m.message for m in messages if m.message), "")
-        vaulted_result = await client.send_message(target, file=messages, message=album_text)
+        
+        vaulted_result = await client.send_message(
+            target, 
+            file=[m.media for m in messages] if isinstance(messages, list) else messages.media,
+            message=album_text
+        )
         log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
-        # 4. Final Deep-Indexing Fix
+        # 4. Final Precision Indexing Fix
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
-                media_obj = v_msg.media
-                inner = None
+                # We must grab the 'photo' or 'document' attribute to get the access_hash/location
+                media_to_pack = None
+                if isinstance(v_msg.media, types.MessageMediaPhoto):
+                    media_to_pack = v_msg.media.photo
+                elif isinstance(v_msg.media, types.MessageMediaDocument):
+                    media_to_pack = v_msg.media.document
                 
-                if isinstance(media_obj, types.MessageMediaPhoto):
-                    inner = media_obj.photo
-                elif isinstance(media_obj, types.MessageMediaDocument):
-                    inner = media_obj.document
-                
-                # Verify we have the parent object, not just a size version
-                if inner and hasattr(inner, 'access_hash'):
-                    fid = pack_bot_file_id(inner)
-                    # Associate with original message ID
-                    real_source_id = messages[i].id if i < len(messages) else source_msg_id
-                    save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__}")
+                # Verify we have the parent object, NOT a PhotoSize variant
+                if media_to_pack and hasattr(media_to_pack, 'access_hash'):
+                    fid = pack_bot_file_id(media_to_pack)
+                    # Associate with the actual message ID from the source group
+                    source_msg_id_actual = messages[i].id if isinstance(messages, list) else messages.id
+                    save_media_log(source_msg_id_actual, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"Indexed {type(v_msg.media).__name__}")
                 else:
                     # It's a plain text message or non-packable media
-                    real_source_id = messages[i].id if i < len(messages) else source_msg_id
+                    source_msg_id_actual = messages[i].id if isinstance(messages, list) else messages.id
                     m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
-                    save_media_log(real_source_id, log_chat_id, None, m_type, source_topic_title)
+                    save_media_log(source_msg_id_actual, log_chat_id, None, m_type, source_topic_title)
                     log_action("vault", "INDEX_SUCCESS", f"Stored {m_type}")
             except Exception as e:
                 log_action("vault", "INDEX_ERROR", str(e))
