@@ -1032,21 +1032,21 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         vaulted_result = await client.send_message(target, file=messages, message=album_text)
         log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
-        # 4. Final Indexing Fix
+        # 4. Final Deep-Indexing Fix
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
-                inner_media = None
-                # Check for media parent objects
-                if v_msg.media:
-                    if isinstance(v_msg.media, types.MessageMediaPhoto):
-                        inner_media = v_msg.media.photo
-                    elif isinstance(v_msg.media, types.MessageMediaDocument):
-                        inner_media = v_msg.media.document
+                media_obj = v_msg.media
+                inner = None
                 
-                # If it's a file with an access_hash, pack the bot file ID
-                if inner_media and hasattr(inner_media, 'access_hash'):
-                    fid = pack_bot_file_id(inner_media)
+                if isinstance(media_obj, types.MessageMediaPhoto):
+                    inner = media_obj.photo
+                elif isinstance(media_obj, types.MessageMediaDocument):
+                    inner = media_obj.document
+                
+                # Verify we have the parent object, not just a size version
+                if inner and hasattr(inner, 'access_hash'):
+                    fid = pack_bot_file_id(inner)
                     # Associate with original message ID
                     real_source_id = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
@@ -1060,7 +1060,7 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
             except Exception as e:
                 log_action("vault", "INDEX_ERROR", str(e))
                 
-        # --- Session Tracking Logic ---
+        # --- Session Tracking Logic (Unchanged) ---
         with session_lock:
             sid = first_msg.chat_id
             now = datetime.now()
@@ -1068,14 +1068,12 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                 vault_sessions[sid] = {
                     "count": 0, "start": now, "last": now, "timer": None, "titles": set()
                 }
-                log_action("session", "STARTED", f"New cycle for {sid}")
             
             sess = vault_sessions[sid]
             sess["count"] += len(messages)
             sess["last"] = now
             if t_name: sess["titles"].add(t_name)
             
-            # Reset the 5-minute timer (300 seconds)
             if sess["timer"]: sess["timer"].cancel()
             t = threading.Timer(300, finalize_session, args=[sid])
             sess["timer"] = t
@@ -1092,32 +1090,42 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
+        # LOG: Incoming message detected
+        log_action("traffic", "INCOMING", f"Chat: {m.chat_id} | Msg ID: {m.id} | Media: {bool(m.media)}")
+
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             
-            # Normalize ID matching
+            # Normalize IDs
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
 
             if source_id_str == msg_id_str:
-                log_action("pair_match", "MATCH FOUND", f"Pair: {s_title} -> {t_title}")
+                log_action("live_match", "MATCH FOUND", f"Pair: {s_title} -> {t_title}")
                 
-                # --- ROBUST TOPIC DETECTION ---
-                msg_topic_anchor = None
-                if m.reply_to:
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-                
-                if not msg_topic_anchor and getattr(m, 'is_topic', False):
-                    msg_topic_anchor = m.id
+                # CHECK: Is Live Forwarding enabled?
+                if not is_live:
+                    log_action("live_skip", "DISABLED", f"Live Forwarding is OFF for {s_title}")
+                else:
+                    # --- Topic Decision Logic ---
+                    msg_topic_anchor = None
+                    if m.reply_to:
+                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+                    
+                    if s_topic and str(s_topic) not in ["None", "0", ""]:
+                        if str(msg_topic_anchor) != str(s_topic):
+                            log_action("live_skip", "TOPIC MISMATCH", f"Expected {s_topic}, got {msg_topic_anchor}. Skipping.")
+                        else:
+                            # Proceed with live mirroring
+                            log_action("live_send", "ATTEMPTING", f"Forwarding msg {m.id} to {t_title}")
+                            # Trigger live mirror task...
+                            asyncio.create_task(send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid))
+                    else:
+                        # No topic filtering, send all
+                        log_action("live_send", "ATTEMPTING", f"Forwarding msg {m.id} to {t_title}")
+                        asyncio.create_task(send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid))
 
-                # Specific topic filtering
-                if s_topic and str(s_topic) not in ["None", "0", ""]:
-                    if str(msg_topic_anchor) != str(s_topic):
-                        log_action("filter", "TOPIC MISMATCH", f"Expected {s_topic}, got {msg_topic_anchor}. Skipping.")
-                        continue
-                
-                # --- VAULTING & COLLECTION (Log Bot) ---
-                # Now captures BOTH media and plain text messages
+                # --- VAULTING & COLLECTION (Independent of Live Forwarding) ---
                 if is_mon:
                     # Sync album collection (only for media groups)
                     if m.grouped_id:
@@ -1344,6 +1352,19 @@ def cmd_mood(message):
         "🧘 **System Mood**: Zen. (Waiting for the next collection cycle.)"
     ]
     bot.reply_to(message, random.choice(moods), parse_mode="Markdown")
+
+@bot.message_handler(commands=['clearlogs'])
+def cmd_clear_logs(message):
+    """Wipes corrupted legacy vault data to allow for fresh, perfect collection"""
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM media_logs")
+            c.execute("UPDATE collected_media SET released = 0")
+        bot.reply_to(message, "🧹 **Database Cleared!**\n\nAll corrupted legacy records have been wiped. The bot will now re-collect and re-index your media with the perfect File IDs and Topic Titles.", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Cleanup Error: {e}")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
@@ -2274,14 +2295,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         running_tasks.pop(task_key, None)
 
 async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
+    """Robust extraction with 429 flood protection and ID normalization"""
     try:
-        # --- ID CORRECTION LOGIC ---
-        raw_id = str(target_id).strip()
-        if not raw_id.startswith("-"):
-            # If it's a positive number, it's likely a group ID missing the prefix
-            target_chat_id = int(f"-100{raw_id}")
-        else:
-            target_chat_id = int(raw_id)
+        # --- ID NORMALIZATION ---
+        raw_id = str(target_id).replace("-100", "").strip("-")
+        target_chat_id = int(f"-100{raw_id}")
         # ---------------------------
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
@@ -2289,16 +2307,15 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
             sender_bot.send_message(admin_chat_id, f"❌ No media found for source `{source_id}`.")
             return
             
-        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction into Group: `{target_chat_id}`...")
+        sender_bot.send_message(admin_chat_id, f"📦 Starting extraction of `{len(items)}` items into `{target_chat_id}`...")
         
         sent = 0
-        failed = 0
-        
         for smid, file_id, m_type, caption, topic_title in items:
             try:
                 dest_topic_id = None
                 if topic_title:
                     try:
+                        # Automatically reconstruct the folder structure
                         dest_topic_id = await get_or_create_target_topic(userbot, target_chat_id, topic_title)
                     except: pass
 
@@ -2307,6 +2324,8 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 elif "video" in m_type_l:
                     sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
+                elif "text" in m_type_l:
+                    sender_bot.send_message(target_chat_id, caption or "Empty Message", message_thread_id=dest_topic_id)
                 else:
                     sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 
