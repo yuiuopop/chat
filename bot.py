@@ -923,7 +923,7 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
-async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
+async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None, icon_emoji_id=None):
     """
     Search for a topic by title in target chat. If not found, create it.
     Uses database mapping first, then topic_cache.
@@ -970,10 +970,11 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             return res
             
         # 4) Create if not found
-        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
+        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
-            title=topic_title
+            title=topic_title,
+            icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
         ))
         
         await asyncio.sleep(1)
@@ -989,7 +990,6 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
             
         return final_id
-        
     except Exception as e:
         logger.error(f"Mirroring Error (get_or_create): {e}")
         return None
@@ -1159,16 +1159,22 @@ def setup_automation_handlers(client: TelegramClient):
                 if source_top:
                     forum = getattr(first_msg.reply_to, "forum_topic", None)
                     src_title = getattr(forum, "title", None)
+                    src_icon = None
                     if not src_title:
                         try:
                             res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
                             for t in res.topics:
                                 if t.id == source_top:
-                                    src_title = t.title; break
+                                    src_title = t.title
+                                    src_icon = getattr(t, "icon_emoji_id", None)
+                                    break
                         except: pass
                     
                     if src_title:
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
+                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
+                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+                    else:
+                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
 
             # 2. Check if Target is a Forum
             is_forum = False
@@ -1209,11 +1215,13 @@ def setup_automation_handlers(client: TelegramClient):
                     )
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        logger.info(f"✅ MIRROR: Sent to {tid} (Topic: {dest_topic_id}) -> MSG ID: {first_id}")
                         save_message_mapping(sid, first_msg.id, tid, first_id)
                     break
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
                     await asyncio.sleep(4)
                 except Exception as e:
+                    logger.error(f"MIRROR SEND ATTEMPT FAILED: {e}")
                     # Protected Chat Fallback
                     if "protected" in str(e).lower() or "restricted" in str(e).lower():
                         await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
