@@ -601,7 +601,7 @@ def get_vault_sources():
         c.execute(query)
         return c.fetchall()
 
-def get_vaulted_media_for_source(source_id, bot_id=None):
+def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
@@ -618,6 +618,10 @@ def get_vaulted_media_for_source(source_id, bot_id=None):
             
         query += " ORDER BY m.source_msg_id ASC"
         
+        if limit:
+            query += f" LIMIT {p}"
+            params.append(limit)
+            
         c.execute(query, tuple(params))
         return c.fetchall()
 
@@ -700,7 +704,7 @@ def stop_task(task_key):
         return True
     return False
 
-async def run_vault_release(bot_instance, chat_id, source_id, target_id, interval=1.5):
+async def run_vault_release(bot_instance, chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None):
     """Releases vaulted media using the Userbot for forwarding."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
@@ -712,7 +716,7 @@ async def run_vault_release(bot_instance, chat_id, source_id, target_id, interva
     
     try:
         # Get items to release
-        items = get_vaulted_media_for_source(source_id)
+        items = get_vaulted_media_for_source(source_id, bot_id=log_target_id, limit=limit)
         if not items:
             bot_instance.send_message(chat_id, "❌ No vaulted items found for this source.")
             return
@@ -2959,12 +2963,53 @@ class LogBotManager:
                 res = c.fetchone()
                 c.execute("SELECT COUNT(*) FROM log_media WHERE source_chat_id = %s AND bot_id = %s", (sid, bot_id))
                 total = c.fetchone()[0]
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🚀 Send batch to Group", callback_data=f"v_dump_start_{sid}"))
+            markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="lb_vault_main"))
+
             msg = (f"📊 **Group Statistics**\n\n"
                    f"🏷 **Title:** `{res[0] if res else 'Unknown'}`\n"
                    f"🆔 **ID:** `{sid}`\n"
                    f"📦 **Total Media:** `{total}`\n\n"
-                   f"💡 To fetch, use: `/getbyid {sid} 20`")
-            bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                   f"💡 Click the button below to send this media into a different group via the Log Bot.")
+            bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_dump_start_"))
+        def start_dump_flow(call):
+            sid = int(call.data.split("_")[-1])
+            login_data[call.from_user.id] = {"dump_sid": sid}
+            
+            async def get_list():
+                markup = await get_chat_selection_markup("lb_vault_tgt", 0) # Reuse the tgt selection markup
+                if not markup:
+                    bot_instance.answer_callback_query(call.id, "❌ Main Userbot Offline", show_alert=True)
+                    return
+                bot_instance.edit_message_text(
+                    "🎯 **Select Destination**\nWhere should the Log Bot send this media?",
+                    call.message.chat.id, call.message.message_id, reply_markup=markup
+                )
+            asyncio.run_coroutine_threadsafe(get_list(), loop)
+
+        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("lb_vault_tgt_") and login_data.get(call.from_user.id, {}).get("dump_sid"))
+        def finish_dump_flow(call):
+            # Format: lb_vault_tgt_{tid}
+            parts = call.data.split("_")
+            if parts[3] == "page": return # Handled by the generic tgt handler if needed
+            
+            target_chat_id = int(parts[3])
+            source_chat_id = login_data.get(call.from_user.id, {}).get("dump_sid")
+            
+            if not source_chat_id:
+                bot_instance.answer_callback_query(call.id, "❌ Session expired")
+                return
+
+            login_data[call.from_user.id]["dump_tid"] = target_chat_id
+            admin_states[f"lb_{bot_id}_{call.from_user.id}"] = f"wait_dump_count_{target_chat_id}"
+            bot_instance.edit_message_text(
+                f"🔢 **How many items?**\nEnter the number of media to send to target `{target_chat_id}`:",
+                call.message.chat.id, call.message.message_id
+            )
 
         @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
         def handle_logging(message):
@@ -3095,6 +3140,24 @@ class LogBotManager:
                     bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
                 except:
                     bot_instance.reply_to(message, "⚠️ Invalid interval. Please send a number (e.g. `2.0`).")
+
+            elif state.startswith("wait_dump_count_"):
+                try:
+                    target_cid = int(state.split("_")[-1])
+                    count = int(text)
+                    source_cid = login_data[uid]["dump_sid"]
+                    admin_states.pop(f"lb_{bot_id}_{uid}", None)
+                    
+                    bot_instance.send_message(message.chat.id, f"🚀 **Log Bot starting transfer...**\nTarget: `{target_cid}`\nLimit: `{count}`")
+                    
+                    # Start the background task (using existing run_vault_release with a limit)
+                    # We might need to update run_vault_release to support a limit
+                    asyncio.run_coroutine_threadsafe(
+                        run_vault_release(bot_instance, message.chat.id, source_cid, target_cid, interval=2.0, limit=count), 
+                        loop
+                    )
+                except Exception as e:
+                    bot_instance.reply_to(message, f"❌ Error: {e}. Please send a number.")
 
 log_bot_manager = LogBotManager()
 
