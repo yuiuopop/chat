@@ -47,6 +47,11 @@ logger = logging.getLogger("userbot_v2")
 # {target_chat_id: {topic_title.lower(): top_message_id}}
 topic_cache = {}
 
+# Global State Dictionaries
+login_data = {}    # { user_id: { state_data } }
+admin_states = {}  # { user_id: "current_state" }
+running_tasks = {} # { task_key: bool }
+
 # -----------------------------
 # DB (SQLite/PostgreSQL)
 # -----------------------------
@@ -630,6 +635,74 @@ def clear_bot_logs(bot_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
 
+def stop_task(task_key):
+    if task_key in running_tasks:
+        running_tasks.pop(task_key, None)
+        return True
+    return False
+
+async def run_vault_release(bot_instance, chat_id, source_id, target_id, interval=1.5):
+    """Releases vaulted media using the Userbot for forwarding."""
+    task_key = f"vault_rel_{source_id}_{target_id}"
+    if task_key in running_tasks:
+        bot_instance.send_message(chat_id, "⚠️ This release task is already running!")
+        return
+
+    running_tasks[task_key] = True
+    status_msg = bot_instance.send_message(chat_id, "🚀 **Initializing Engine...**\nStarting message transfer via Userbot engine...", parse_mode="Markdown")
+    
+    try:
+        # Get items to release
+        items = get_vaulted_media_for_source(source_id)
+        if not items:
+            bot_instance.send_message(chat_id, "❌ No vaulted items found for this source.")
+            return
+
+        total = len(items)
+        success = 0
+        
+        # Stop button markup
+        stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
+
+        for i, item in enumerate(items):
+            if task_key not in running_tasks:
+                bot_instance.send_message(chat_id, "🛑 **Release Stopped** by user.")
+                break
+                
+            source_msg_id, file_id, m_type, caption, log_msg_id, l_bot_id = item
+            
+            try:
+                # 1. Forward from Log Bot using Userbot
+                # Userbot needs to forward message with ID log_msg_id from the chat with Log Bot
+                await userbot.forward_messages(int(target_id), log_msg_id, int(l_bot_id))
+                success += 1
+            except Exception as e:
+                logger.error(f"Vault Release item error: {e}")
+                # Fallback: Send directly via Bot API if Userbot fails
+                try:
+                    if m_type == "photo": bot_instance.send_photo(target_id, file_id, caption=caption)
+                    elif m_type == "video": bot_instance.send_video(target_id, file_id, caption=caption)
+                    elif m_type == "document": bot_instance.send_document(target_id, file_id, caption=caption)
+                    elif m_type == "audio": bot_instance.send_audio(target_id, file_id, caption=caption)
+                    elif m_type == "animation": bot_instance.send_animation(target_id, file_id, caption=caption)
+                    elif m_type == "sticker": bot_instance.send_sticker(target_id, file_id)
+                    success += 1
+                except Exception as e2:
+                    logger.error(f"Vault Release fallback error: {e2}")
+
+            # Status Update every 5 items
+            if (i + 1) % 5 == 0 or (i + 1) == total:
+                bot_instance.edit_message_text(f"📊 **Release Status:** `{i+1}/{total}`\nSuccess: `{success}`", chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
+
+            await asyncio.sleep(interval)
+            
+        bot_instance.send_message(chat_id, f"✅ **Vault Release Complete!**\nTotal: `{total}`\nSuccessful: `{success}`")
+    except Exception as e:
+        logger.error(f"Global Release Error: {e}")
+        bot_instance.send_message(chat_id, f"❌ Engine Error: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
+
 def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption):
     with db_conn() as conn:
         c = conn.cursor()
@@ -794,7 +867,7 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
