@@ -932,6 +932,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
     
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
+    logger.info(f"TOPIC_SEARCH: Looking for '{topic_title}' (Key: '{title_key}') in {t_chat_id}")
     
     # 1) Check Database Mapping (Most Reliable)
     if source_chat_id and source_topic_id:
@@ -1078,7 +1079,7 @@ def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
-        if not m: return
+        if not m or m.out: return
 
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
@@ -1123,39 +1124,41 @@ def setup_automation_handlers(client: TelegramClient):
                     # Instantly send to log bots in background
                     asyncio.create_task(forward_to_log_bots(client, m, sid, m.id))
 
-                if not is_live: continue
+                if not is_live: 
+                    # If we matched a pair but live is off, we still break to prevent 
+                    # processing the same message for other generic pairs.
+                    break
 
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        # Wait for all parts (10 items need a bit more time)
-                        await asyncio.sleep(3.5) 
-                        
-                        messages = album_cache.pop(m.grouped_id, [])
-                        if messages:
-                            await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
-                    else:
-                        if m.grouped_id in album_cache:
-                            album_cache[m.grouped_id].append(m)
+                        # Wait for all parts
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
+                            await asyncio.sleep(3.5) 
+                            messages = album_cache.pop(gid, [])
+                            if messages:
+                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic))
                 else:
                     await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                
+                # CRITICAL: Break the pair loop once the message is handled to prevent duplication
+                break
 
     async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Helper to send single or multiple messages (albums) with caption support"""
+        """Unified Hub for mirrored sending with native Forum Topic support."""
         try:
-            dest_topic_id = default_t_topic
+            if not messages: return
             first_msg = messages[0]
+            dest_topic_id = default_t_topic
             
             # 1. Resolve Topic Mapping
-            if is_mir and first_msg.reply_to:
+            if is_mir:
                 source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
                 if source_top:
-                    # Resolve the source topic title
                     forum = getattr(first_msg.reply_to, "forum_topic", None)
                     src_title = getattr(forum, "title", None)
-                    
-                    # If not in cache, fetch from source group's topic list
                     if not src_title:
                         try:
                             res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
@@ -1164,33 +1167,45 @@ def setup_automation_handlers(client: TelegramClient):
                                     src_title = t.title; break
                         except: pass
                     
-                    # Mirror the topic in the target group using the real name
                     if src_title:
                         dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
 
-            # 2. Resolve Reply Hierarchy
-            reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid) if first_msg.reply_to_msg_id else None
+            # 2. Check if Target is a Forum
+            is_forum = False
+            try:
+                # Ensure we have the -100 prefix for entity lookup
+                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+                try:
+                    tgt_ent = await client.get_entity(real_tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+                except:
+                    tgt_ent = await client.get_entity(tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+            except: pass
 
-            # 3. CONSTRUCT REPLY LOGIC (InputReplyToMessage for Forums)
-            reply_param = None
-            if reply_to_mapped:
-                reply_param = types.InputReplyToMessage(
-                    reply_to_msg_id=int(reply_to_mapped),
-                    top_msg_id=int(dest_topic_id) if dest_topic_id else None
-                )
-            elif dest_topic_id:
-                reply_param = int(dest_topic_id)
-
-            album_text = next((msg.message for msg in messages if msg.message), "")
+            # 3. Resolve Reply Header
+            reply_header = None
+            if is_forum:
+                if dest_topic_id:
+                    reply_header = types.InputReplyToMessage(
+                        reply_to_msg_id=int(dest_topic_id),
+                        top_msg_id=int(dest_topic_id)
+                    )
+            else:
+                # Normal Group: Use Message Mapping for Replies
+                if first_msg.reply_to_msg_id:
+                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                    if mapped: reply_header = int(mapped)
 
             # 4. Send Content
+            album_text = next((msg.message for msg in messages if msg.message), "")
             for _ in range(3):
                 try:
                     sent = await client.send_message(
                         entity=int(tid), 
                         message=album_text, 
                         file=messages if len(messages) > 1 else messages[0].media,
-                        reply_to=reply_param
+                        reply_to=reply_header
                     )
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
@@ -1198,12 +1213,36 @@ def setup_automation_handlers(client: TelegramClient):
                     break
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
                     await asyncio.sleep(4)
-                except Exception as inner_e:
-                    logger.error(f"Failed to send mirrored content: {inner_e}")
+                except Exception as e:
+                    # Protected Chat Fallback
+                    if "protected" in str(e).lower() or "restricted" in str(e).lower():
+                        await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
                     break
 
         except Exception as e:
-            logger.error(f"Global Mirror Send Error: {e}")
+            logger.error(f"Mirror Error: {e}")
+
+    async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
+        """Downloads and re-uploads protected content."""
+        import os
+        downloaded = []
+        try:
+            for m in messages:
+                if m.media:
+                    path = await client.download_media(m.media)
+                    if path: downloaded.append(path)
+            if downloaded:
+                sent = await client.send_message(
+                    entity=int(tid), message=album_text, 
+                    file=downloaded if len(downloaded) > 1 else downloaded[0],
+                    reply_to=reply_header
+                )
+                if sent:
+                    first_id = sent[0].id if isinstance(sent, list) else sent.id
+                    save_message_mapping(sid, first_msg.id, tid, first_id)
+        finally:
+            for p in downloaded:
+                if os.path.exists(p): os.remove(p)
 
 # -----------------------------
 # Bot Handlers
