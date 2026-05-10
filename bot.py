@@ -1198,6 +1198,16 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             
         if vaulted:
             logger.info(f"✅ VAULT: Message {source_msg_id} logged successfully to @{t_name}")
+            # Immediately save log_msg_id to prevent NoneType errors in release
+            save_logged_media(
+                bot_id=int(log_chat_id),
+                log_msg_id=int(vaulted.id),
+                source_chat_id=int(source_chat_id),
+                source_msg_id=int(source_msg_id),
+                file_id=None, # Bot API file_id will be filled by the Log Bot's own listener
+                media_type=type(message.media).__name__ if message.media else "text",
+                caption=message.message or ""
+            )
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
@@ -2654,10 +2664,15 @@ class LogBotManager:
                 try:
                     logger.info(f"🚀 Log Bot @{bot_info.username} started polling.")
                     new_bot.delete_webhook(drop_pending_updates=True)
-                    new_bot.infinity_polling(skip_pending=True, timeout=60)
+                    # Use a shorter timeout and skip pending to reduce conflict duration
+                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
                 except Exception as e:
-                    logger.error(f"Log Bot @{bot_info.username} crashed: {e}")
-                    time.sleep(10)
+                    if "Conflict" in str(e):
+                        logger.warning(f"⚠️ Log Bot @{bot_info.username} conflict. Retrying in 15s...")
+                        time.sleep(15)
+                    else:
+                        logger.error(f"Log Bot @{bot_info.username} crashed: {e}")
+                        time.sleep(10)
         
         threading.Thread(target=run_polling, daemon=True).start()
         return bot_id
