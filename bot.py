@@ -130,6 +130,8 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
             except: pass
+            try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
+            except: pass
             # Update UNIQUE constraint for Postgres
             try:
                 c.execute("ALTER TABLE target_pairs DROP CONSTRAINT IF EXISTS target_pairs_source_id_target_id_key")
@@ -567,14 +569,14 @@ def get_log_bot_stats(bot_id):
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -787,6 +789,12 @@ def pair_view_markup(pair_id):
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
     markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
+    
+    # Content Filter Button
+    cf = pair[10] or "everything"
+    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
+    cf_text = cf_map.get(cf, "🔄 All Content")
+    markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_toggle_filter_{pair_id}"))
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
@@ -1082,7 +1090,7 @@ def setup_automation_handlers(client: TelegramClient):
         if not m: return
 
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             
             # Normalize ID matching
             source_id_str = str(sid).replace("-100", "")
@@ -1099,6 +1107,13 @@ def setup_automation_handlers(client: TelegramClient):
                 
                 if not msg_topic_anchor and m.reply_to_msg_id:
                     msg_topic_anchor = m.reply_to_msg_id
+
+                # --- CONTENT FILTERING ---
+                cf = cf or "everything"
+                if cf == "media" and not m.media:
+                    continue
+                if cf == "text" and m.media:
+                    continue
 
                 # Specific topic filtering
                 if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
@@ -1135,7 +1150,7 @@ def setup_automation_handlers(client: TelegramClient):
                         album_cache[m.grouped_id] = [m]
                         # Wait for all parts
                         async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
-                            await asyncio.sleep(3.5) 
+                            await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
                                 await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
@@ -1210,7 +1225,7 @@ def setup_automation_handlers(client: TelegramClient):
                     sent = await client.send_message(
                         entity=int(tid), 
                         message=album_text, 
-                        file=messages if len(messages) > 1 else messages[0].media,
+                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
                         reply_to=reply_header
                     )
                     if sent:
@@ -1488,8 +1503,12 @@ def handle_callbacks(call):
         with open(filename, "w", encoding="utf-8") as f:
             f.write(file_content)
             
+        # Find username
+        bots = get_log_bots()
+        username = next((b[1] for b in bots if b[2] == bot_id), str(bot_id))
+        
         with open(filename, "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption=f"📂 Media Logs for @{bot_id}")
+            bot.send_document(call.message.chat.id, f, caption=f"📂 Media Logs for @{username}")
         
         try: os.remove(filename)
         except: pass
@@ -1669,6 +1688,21 @@ def handle_callbacks(call):
             p = get_placeholder()
             c.execute(f"UPDATE target_pairs SET is_mirror = {p} WHERE id = {p}", (new_val, pid))
         bot.answer_callback_query(call.id, f"Mirror Mode {'Enabled' if new_val else 'Disabled'}")
+        show_pair_view(call.message.chat.id, call.message.message_id, pid)
+
+    elif data.startswith("pair_toggle_filter_"):
+        pid = int(data.split("_")[-1])
+        pair = get_target_pair(pid)
+        if not pair: return
+        current = pair[10] or "everything"
+        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
+        
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"UPDATE target_pairs SET content_filter = {p} WHERE id = {p}", (next_filter, pid))
+        
+        bot.answer_callback_query(call.id, f"🎯 Filter: {next_filter.title()}")
         show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
     elif data.startswith("pair_toggle_live_"):
@@ -2177,11 +2211,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT source_id, target_id, source_title, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
+            c.execute(f"SELECT source_id, target_id, source_title, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs WHERE id = {p}", (pair_id,))
             row = c.fetchone()
         
         if not row: return
-        sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic = row
+        sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic, cf = row
     
         try:
             # Pre-resolve entities to warm up Telethon cache and ensure access
@@ -2212,6 +2246,22 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
             try:
                 msg = await userbot.get_messages(sid_ref, ids=smid)
                 if not msg: continue
+
+                # --- CONTENT FILTERING ---
+                cf = cf or "everything"
+                if cf == "media" and not msg.media:
+                    # Mark as released so we don't try again
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    continue
+                if cf == "text" and msg.media:
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                    continue
 
                 target_topic_anchor = t_topic
                 
