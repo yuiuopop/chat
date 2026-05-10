@@ -864,73 +864,57 @@ async def get_topic_selection_markup(chat_id, prefix):
 # Userbot Logic
 # -----------------------------
 async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
-    """
-    Search for a topic by title in target chat. If not found, create it.
-    Uses database mapping first, then topic_cache.
-    """
+    """Aggressive topic management: fetches current list or creates if missing"""
     if not topic_title: return None
-    
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
-    
-    # 1) Check Database Mapping (Most Reliable)
-    if source_chat_id and source_topic_id:
-        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
-        if existing_mapping:
-            return existing_mapping
-    
-    # 2) Check Cache
+
+    # 1. Check local cache
     if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
-        res = topic_cache[t_chat_id][title_key]
-        if source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-        return res
-    
-    # 3) Fetch Topics from Telegram
+        return topic_cache[t_chat_id][title_key]
+
     try:
+        # 2. Fetch current topics from Telegram to see if it exists
         result = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
-            offset_date=0,
-            offset_id=0,
-            offset_topic=0,
-            limit=100
+            channel=t_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
         ))
         
-        if t_chat_id not in topic_cache:
-            topic_cache[t_chat_id] = {}
-            
+        if t_chat_id not in topic_cache: topic_cache[t_chat_id] = {}
+        
         for topic in result.topics:
             topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
-            
-        if title_key in topic_cache[t_chat_id]:
-            res = topic_cache[t_chat_id][title_key]
-            if source_chat_id and source_topic_id:
-                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-            return res
-            
-        # 4) Create if not found
-        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
+            if topic.title.lower().strip() == title_key:
+                return topic.top_message
+
+        # 3. Create it if it really doesn't exist
+        log_action("mirror", "CREATING_TOPIC", f"'{topic_title}' in {t_chat_id}")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
             title=topic_title
         ))
         
-        await asyncio.sleep(1)
-        res_after = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
-            offset_date=0, offset_id=0, offset_topic=0, limit=20
-        ))
-        for t in res_after.topics:
-            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
-            
-        final_id = topic_cache[t_chat_id].get(title_key)
-        if final_id and source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
-            
-        return final_id
+        # Extract the new top_message ID from updates
+        new_topic_id = None
+        for update in created.updates:
+            if hasattr(update, 'id'):
+                new_topic_id = update.id
+                break
+                
+        if not new_topic_id:
+            # Fallback: re-fetch
+            res_after = await client(functions.channels.GetForumTopicsRequest(channel=t_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=10))
+            for t in res_after.topics:
+                if t.title.lower().strip() == title_key:
+                    new_topic_id = t.top_message
+                    break
         
+        if new_topic_id:
+            topic_cache[t_chat_id][title_key] = new_topic_id
+            
+        return new_topic_id
+
     except Exception as e:
-        logger.error(f"Mirroring Error (get_or_create): {e}")
+        logger.error(f"❌ Topic Management Error: {e}")
         return None
 
 async def start_userbot():
@@ -1041,28 +1025,28 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
-                # We must grab the 'photo' or 'document' attribute to get the access_hash/location
-                media_to_pack = None
+                inner = None
+                # CRITICAL: Target the parent object ONLY
                 if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    media_to_pack = v_msg.media.photo
+                    inner = v_msg.media.photo
                 elif isinstance(v_msg.media, types.MessageMediaDocument):
-                    media_to_pack = v_msg.media.document
+                    inner = v_msg.media.document
                 
-                # Verify we have the parent object, NOT a PhotoSize variant
-                if media_to_pack and hasattr(media_to_pack, 'access_hash'):
-                    fid = pack_bot_file_id(media_to_pack)
+                # Check for access_hash to ensure it's a real file object
+                if inner and hasattr(inner, 'access_hash'):
+                    fid = pack_bot_file_id(inner)
                     # Associate with the actual message ID from the source group
-                    source_msg_id_actual = messages[i].id if isinstance(messages, list) else messages.id
-                    save_media_log(source_msg_id_actual, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Indexed {type(v_msg.media).__name__}")
+                    source_id_to_save = messages[i].id if i < len(messages) else source_msg_id
+                    save_media_log(source_id_to_save, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__}")
                 else:
                     # It's a plain text message or non-packable media
-                    source_msg_id_actual = messages[i].id if isinstance(messages, list) else messages.id
+                    source_id_to_save = messages[i].id if i < len(messages) else source_msg_id
                     m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
-                    save_media_log(source_msg_id_actual, log_chat_id, None, m_type, source_topic_title)
+                    save_media_log(source_id_to_save, log_chat_id, None, m_type, source_topic_title)
                     log_action("vault", "INDEX_SUCCESS", f"Stored {m_type}")
-            except Exception as e:
-                log_action("vault", "INDEX_ERROR", str(e))
+            except Exception as ex:
+                log_action("vault", "INDEX_SKIP", f"Item {i} was not packable: {ex}")
                 
         # --- Session Tracking Logic (Unchanged) ---
         with session_lock:
