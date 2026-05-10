@@ -1,4 +1,4 @@
-#giminichat
+#gimini
 import os
 import asyncio
 import threading
@@ -1329,6 +1329,21 @@ def cmd_extract_media(message):
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=['mood'])
+def cmd_mood(message):
+    """Fun command to check the bot's current vibe"""
+    if message.from_user.id != ADMIN_ID: return
+    import random
+    moods = [
+        "🤖 **System Mood**: Productive. (Ready to vault the world!)",
+        "🔋 **System Mood**: Charging. (Need more RAM... or coffee.)",
+        "😎 **System Mood**: Cool. (Handling rate limits like a pro.)",
+        "🧐 **System Mood**: Analytical. (Currently judging your target choices.)",
+        "🔥 **System Mood**: On Fire! (Processing media at light speed!)",
+        "🧘 **System Mood**: Zen. (Waiting for the next collection cycle.)"
+    ]
+    bot.reply_to(message, random.choice(moods), parse_mode="Markdown")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
