@@ -2723,6 +2723,48 @@ class LogBotManager:
             except Exception as e:
                 bot_instance.reply_to(message, f"❌ Retrieval error: {e}")
 
+        @bot_instance.message_handler(commands=['getcount'])
+        def fetch_recent_batch(message):
+            if message.from_user.id != ADMIN_ID: return
+            try:
+                args = message.text.split()
+                count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
+                if count > 50: count = 50
+
+                bot_instance.send_message(message.chat.id, f"🔍 Fetching the last `{count}` items from vault...")
+
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"""
+                        SELECT file_id, media_type, caption, log_msg_id, bot_id 
+                        FROM log_media 
+                        WHERE bot_id = {p}
+                        ORDER BY timestamp DESC LIMIT {p}
+                    """, (bot_id, count))
+                    results = c.fetchall()
+
+                if not results:
+                    bot_instance.reply_to(message, "🔍 The vault is empty.")
+                    return
+
+                for file_id, m_type, caption, log_msg_id, owner_bot_id in reversed(results):
+                    # Construct a helpful caption including the ID for future /get use
+                    full_caption = f"🆔 ID: `{log_msg_id}`\n\n{caption if caption else ''}"
+                    
+                    try:
+                        if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "document": bot_instance.send_document(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "audio": bot_instance.send_audio(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "animation": bot_instance.send_animation(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "sticker": bot_instance.send_sticker(message.chat.id, file_id)
+                        time.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"Error sending batch item {log_msg_id}: {e}")
+            except Exception as e:
+                bot_instance.reply_to(message, f"❌ Error retrieving batch: {e}")
+
         @bot_instance.callback_query_handler(func=lambda call: True)
         def handle_log_bot_callbacks(call):
             if call.from_user.id != ADMIN_ID: return
