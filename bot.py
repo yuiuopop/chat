@@ -2321,19 +2321,28 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.2, log_target_id=None):
+    task_key = f"vault_rel_{source_id}_{target_id}"
+    running_tasks[task_key] = True
+    
     try:
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
             sender_bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
             return
             
-        sender_bot.send_message(admin_chat_id, f"📦 Starting release of `{len(items)}` vaulted items...")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Extraction", callback_data=f"lb_stop_rel_{task_key}"))
+        status_msg = sender_bot.send_message(admin_chat_id, f"📦 **Starting extraction of `{len(items)}` items...**", reply_markup=markup, parse_mode="Markdown")
         
         sent = 0
         failed = 0
         
         for smid, file_id, m_type, caption in items:
+            if not running_tasks.get(task_key):
+                sender_bot.send_message(admin_chat_id, "🛑 **Extraction stopped by user.**", parse_mode="Markdown")
+                break
+                
             try:
                 m_type_lower = (m_type or "").lower()
                 cap = caption or ""
@@ -2348,18 +2357,22 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     sender_bot.send_document(target_id, file_id, caption=cap)
                     
                 sent += 1
+                if sent % 5 == 0:
+                    try: sender_bot.edit_message_text(f"📦 **Extracting...**\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                    except: pass
             except Exception as item_err:
                 logger.error(f"Vault Release item error: {item_err}")
                 failed += 1
                 
-            # Rate limit protection (Telegram Bot API allows ~20 msgs/minute to a single chat)
-            await asyncio.sleep(3)
+            await asyncio.sleep(interval)
             
-        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Done**\nSent: `{sent}` items.\nFailed: `{failed}`", parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"Global Vault Release Error: {e}")
         sender_bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
+    finally:
+        running_tasks.pop(task_key, None)
 
 # -----------------------------
 # Watchdog
@@ -2523,19 +2536,13 @@ class LogBotManager:
             if message.from_user.id != ADMIN_ID: return
             
             count = get_logged_media_stats(bot_id)
-            text = f"🤖 **Log Bot Active**\n\n"
-            text += f"📊 **Vault Stats:**\n"
+            text = f"🤖 **Secondary Main Bot (Vault Manager) Online**\n\n"
+            text += f"📊 **Vault Storage Stats:**\n"
             text += f"📦 Total Vaulted: `{count}` items\n\n"
-            text += "I am automatically logging all media forwarded to me by the main userbot."
+            text += "Use the button below to release logs to a new target."
             
-            main_bot_username = bot.get_me().username
             markup = InlineKeyboardMarkup()
-            markup.add(
-                InlineKeyboardButton("📤 Send Log", callback_data="lb_vault_main"),
-                InlineKeyboardButton("📥 Fetch Logs", callback_data="lb_fetch")
-            )
-            markup.add(InlineKeyboardButton("🗑 Clear All Logs", callback_data="lb_clear_confirm"))
-            markup.add(InlineKeyboardButton("🔙 Back to Main Bot", url=f"https://t.me/{main_bot_username}"))
+            markup.add(InlineKeyboardButton("📤 Send Log", callback_data="lb_vault_main"))
             
             bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
@@ -2586,46 +2593,52 @@ class LogBotManager:
                         bot_instance.send_message(call.message.chat.id, "❌ Session expired. Please start over.")
                         return
                     
-                    login_data.pop(uid, None)
-                    bot_instance.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                    # Pass bot_instance as the sender_bot
-                    asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid), loop)
+                    # Instead of starting, ask for interval
+                    login_data[uid]["vault_target_id"] = tid
+                    admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
+                    bot_instance.edit_message_text("⏳ **Release Interval**\n\nPlease send the time period (in seconds) between each message:\n(Example: `1.5` or `3`)", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+        @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
+        def handle_lb_messages(message):
+            uid = message.from_user.id
+            state = admin_states.get(f"lb_{bot_id}_{uid}")
+            text = message.text.strip()
+            
+            if state == "awaiting_rel_interval":
+                try:
+                    interval = float(text)
+                    if interval < 0.1: raise ValueError()
+                    
+                    admin_states.pop(f"lb_{bot_id}_{uid}", None)
+                    sid = login_data.get(uid, {}).get("vault_source_id")
+                    tid = login_data.get(uid, {}).get("vault_target_id")
+                    
+                    markup = InlineKeyboardMarkup()
+                    markup.add(InlineKeyboardButton("🚀 Start Release", callback_data=f"lb_do_release_{sid}_{tid}_{interval}"))
+                    markup.add(InlineKeyboardButton("❌ Cancel", callback_data="lb_cancel"))
+                    
+                    bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
+                except:
+                    bot_instance.reply_to(message, "⚠️ Invalid interval. Please send a number (e.g. `2.0`).")
                     
             elif data == "lb_cancel":
                 bot_instance.answer_callback_query(call.id)
-                # Redirect back to start
+                admin_states.pop(f"lb_{bot_id}_{uid}", None)
                 cmd_start(call.message)
 
-            elif data == "lb_fetch":
-                bot_instance.answer_callback_query(call.id, "📂 Generating log file...")
-                media = fetch_logged_media(bot_id)
-                if not media:
-                    bot_instance.send_message(call.message.chat.id, "❌ No logs found.")
-                    return
-                
-                content = f"LOG MEDIA REPORT - BOT ID: {bot_id}\n" + "="*40 + "\n\n"
-                for sid, smid, fid, mtype, cap in media:
-                    content += f"SOURCE: {sid} | MSG: {smid} | TYPE: {mtype}\nFILE_ID: {fid}\n"
-                    if cap: content += f"CAPTION: {cap[:50]}...\n"
-                    content += "-"*20 + "\n"
-                
-                filename = f"log_media_{bot_id}.txt"
-                with open(filename, "w", encoding="utf-8") as f: f.write(content)
-                with open(filename, "rb") as f:
-                    bot_instance.send_document(call.message.chat.id, f, caption=f"📂 Logs for @{bot_instance.get_me().username}")
-                os.remove(filename)
+            elif data.startswith("lb_stop_rel_"):
+                bot_instance.answer_callback_query(call.id, "🛑 Stopping...")
+                task_key = data.replace("lb_stop_rel_", "")
+                stop_task(task_key)
 
-            elif data == "lb_clear_confirm":
+            elif data.startswith("lb_do_release_"):
+                # lb_do_release_{sid}_{tid}_{interval}
                 bot_instance.answer_callback_query(call.id)
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("✅ Yes, Delete Everything", callback_data="lb_clear_do"))
-                markup.add(InlineKeyboardButton("❌ Cancel", callback_data="lb_cancel"))
-                bot_instance.edit_message_text("⚠️ **Wipe All Logs?**\n\nThis will delete all media records for this bot from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-            elif data == "lb_clear_do":
-                clear_bot_logs(bot_id)
-                bot_instance.answer_callback_query(call.id, "💥 Vault Cleared!")
-                cmd_start(call.message)
+                parts = data.split("_")
+                sid, tid = int(parts[3]), int(parts[4])
+                interval = float(parts[5])
+                bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval), loop)
 
         @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
         def handle_logging(message):
