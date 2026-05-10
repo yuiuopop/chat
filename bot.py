@@ -1192,11 +1192,11 @@ def setup_automation_handlers(client: TelegramClient):
             # 3. Resolve Reply Header
             reply_header = None
             if is_forum:
-                if dest_topic_id:
-                    reply_header = types.InputReplyToMessage(
-                        reply_to_msg_id=int(dest_topic_id),
-                        top_msg_id=int(dest_topic_id)
-                    )
+                reply_header = int(dest_topic_id) if dest_topic_id else None
+                # If replying to a specific message inside the topic, use mapped ID
+                if first_msg.reply_to_msg_id:
+                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                    if mapped: reply_header = int(mapped)
             else:
                 # Normal Group: Use Message Mapping for Replies
                 if first_msg.reply_to_msg_id:
