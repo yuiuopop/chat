@@ -1009,13 +1009,14 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         for i, v_msg in enumerate(vaulted_list):
             try:
                 inner_media = None
-                # WE ONLY PACK THE FULL PARENT OBJECTS
-                if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner_media = v_msg.media.photo
-                elif isinstance(v_msg.media, types.MessageMediaDocument):
-                    inner_media = v_msg.media.document
+                # Check for media parent objects
+                if v_msg.media:
+                    if isinstance(v_msg.media, types.MessageMediaPhoto):
+                        inner_media = v_msg.media.photo
+                    elif isinstance(v_msg.media, types.MessageMediaDocument):
+                        inner_media = v_msg.media.document
                 
-                # Check if it has an access_hash (confirms it's a valid Telegram file)
+                # If it's a file with an access_hash, pack the bot file ID
                 if inner_media and hasattr(inner_media, 'access_hash'):
                     fid = pack_bot_file_id(inner_media)
                     # Associate with original message ID
@@ -1023,7 +1024,11 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                     save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
                     log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__}")
                 else:
-                    log_action("vault", "INDEX_SKIP", f"Invalid media metadata: {type(v_msg.media)}")
+                    # It's a plain text message or non-packable media
+                    real_source_id = messages[i].id if i < len(messages) else source_msg_id
+                    m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
+                    save_media_log(real_source_id, log_chat_id, None, m_type, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"Stored {m_type}")
             except Exception as e:
                 log_action("vault", "INDEX_ERROR", str(e))
                 
@@ -1061,25 +1066,26 @@ def setup_automation_handlers(client: TelegramClient):
                         log_action("filter", "TOPIC MISMATCH", f"Expected {s_topic}, got {msg_topic_anchor}. Skipping.")
                         continue
                 
-                # --- MEDIA COLLECTION & HUB DELEGATION ---
-                if m.media:
-                    log_action("traffic", "MEDIA DETECTED", f"Source: {s_title} | ID: {m.id} | Type: {type(m.media).__name__}")
-                    
-                    # --- ALBUM / SINGLE MESSAGE LOGIC ---
+                # --- VAULTING & COLLECTION (Log Bot) ---
+                # Now captures BOTH media and plain text messages
+                if is_mon:
+                    # Sync album collection (only for media groups)
                     if m.grouped_id:
                         if m.grouped_id not in album_cache:
                             album_cache[m.grouped_id] = [m]
                             # Wait for all parts
-                            await asyncio.sleep(4.0) 
-                            
-                            messages = album_cache.pop(m.grouped_id, [])
-                            if messages:
-                                await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid, is_mon, pid)
+                            async def collect_album(gid, sid_ref, pid_ref):
+                                await asyncio.sleep(4.0) # Wait for album parts
+                                messages = album_cache.pop(gid, [])
+                                if messages:
+                                    await forward_to_log_targets(client, messages, messages[0].id)
+                            asyncio.create_task(collect_album(m.grouped_id, m.chat_id, pid))
                         else:
                             if m.grouped_id in album_cache:
                                 album_cache[m.grouped_id].append(m)
                     else:
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid)
+                        # Single message (Text or Media)
+                        await forward_to_log_targets(client, [m], m.id)
                 
                 # Exit the pair loop as we've handled this message
                 break
