@@ -62,6 +62,17 @@ def log_action(action_name, status, details=""):
 logging.getLogger().handlers = [] # Clear default handler
 # --- End Logger Setup ---
 
+app = Flask(__name__)
+
+@app.route('/')
+def health():
+    log_action("keep_alive", "PULSE", f"Ping received from {request.remote_addr}")
+    return "Bot is alive and monitoring", 200
+
+def run_web():
+    logger.info(f"🚀 Starting web server on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT)
+
 # Topic Mirroring Cache
 # {target_chat_id: {topic_title.lower(): top_message_id}}
 topic_cache = {}
@@ -993,27 +1004,32 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         vaulted_result = await client.send_message(target, file=messages, message=album_text)
         log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
-        # 4. Indexing (The 'PhotoSize' fix)
+        # 4. Final Indexing Fix
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
                 inner_media = None
+                # WE ONLY PACK THE FULL PARENT OBJECTS
                 if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner_media = v_msg.media.photo # Correct Parent Object
+                    inner_media = v_msg.media.photo
                 elif isinstance(v_msg.media, types.MessageMediaDocument):
                     inner_media = v_msg.media.document
                 
+                # Check if it has an access_hash (confirms it's a valid Telegram file)
                 if inner_media and hasattr(inner_media, 'access_hash'):
                     fid = pack_bot_file_id(inner_media)
-                    # Associate with original message ID from source
+                    # Associate with original message ID
                     real_source_id = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_source_id, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
+                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__}")
+                else:
+                    log_action("vault", "INDEX_SKIP", f"Invalid media metadata: {type(v_msg.media)}")
             except Exception as e:
-                logger.debug(f"Indexing skip: {e}")
+                log_action("vault", "INDEX_ERROR", str(e))
                 
         logger.info(f"✅ VAULT SUCCESS: Sent to {t_name} (Topic: {source_topic_title or 'General'})")
     except Exception as e:
-        logger.error(f"❌ VAULT CRASH: {e}")
+        log_action("vault", "CRITICAL_FAILURE", str(e))
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
