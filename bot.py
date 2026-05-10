@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types, errors
 from telethon.sessions import StringSession
 from telethon.utils import pack_bot_file_id
-from telethon.tl.types import InputReplyToMessage
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -1064,18 +1063,21 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                 
                 # Verify we have the parent object with access data
                 if inner and hasattr(inner, 'access_hash'):
-                    # ALWAYS save the internal message ID for bulletproof Bot API forwarding
-                    fid = f"MSG_ID:{v_msg.id}"
-                    
+                    fid = None
+                    try:
+                        fid = pack_bot_file_id(inner)
+                    except Exception as pack_err:
+                        log_action("vault", "INDEX_WARNING", f"Could not pack File ID: {pack_err}")
+                        
                     # Use the original source message's ID for tracking
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored msg {real_sid} as {fid}")
+                    log_action("vault", "INDEX_SUCCESS", f"Stored msg {real_sid}")
                 else:
                     # It's a plain text message or non-packable media/thumbnail
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
-                    save_media_log(real_sid, log_chat_id, f"MSG_ID:{v_msg.id}", m_type, source_topic_title)
+                    save_media_log(real_sid, log_chat_id, None, m_type, source_topic_title)
                     log_action("vault", "INDEX_SUCCESS", f"Stored {m_type} for msg {real_sid}")
             except Exception as e:
                 log_action("vault", "INDEX_ERROR", f"Item {i} failed: {e}")
@@ -1252,15 +1254,6 @@ def setup_automation_handlers(client: TelegramClient):
 
             # --- SEND WITH RETRY LOGIC ---
             retries = 3
-            
-            # Construct the proper Reply object to prevent ugly reply bubbles in forums
-            reply_obj = None
-            if final_reply_target:
-                reply_obj = InputReplyToMessage(
-                    reply_to_msg_id=int(final_reply_target),
-                    top_msg_id=int(final_reply_target)
-                )
-                
             while retries > 0:
                 try:
                     if len(messages) > 1:
@@ -1269,7 +1262,7 @@ def setup_automation_handlers(client: TelegramClient):
                             entity=tid,
                             message=album_text,
                             file=messages, 
-                            reply_to=reply_obj
+                            reply_to=int(final_reply_target) if final_reply_target else None
                         )
                         if sent_messages and isinstance(sent_messages, list):
                             save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
@@ -1279,7 +1272,7 @@ def setup_automation_handlers(client: TelegramClient):
                             entity=tid,
                             message=first_msg.message or "",
                             file=first_msg.media if first_msg.media else None,
-                            reply_to=reply_obj
+                            reply_to=int(final_reply_target) if final_reply_target else None
                         )
                         if sent_msg:
                             save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
@@ -1306,14 +1299,14 @@ def setup_automation_handlers(client: TelegramClient):
                                 if len(downloaded_files) > 1:
                                     sent_messages = await client.send_message(
                                         entity=tid, message=album_text, file=downloaded_files,
-                                        reply_to=reply_obj
+                                        reply_to=int(final_reply_target) if final_reply_target else None
                                     )
                                     if sent_messages and isinstance(sent_messages, list):
                                         save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
                                 else:
                                     sent_msg = await client.send_message(
                                         entity=tid, message=album_text, file=downloaded_files[0],
-                                        reply_to=reply_obj
+                                        reply_to=int(final_reply_target) if final_reply_target else None
                                     )
                                     if sent_msg:
                                         save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
@@ -2379,7 +2372,8 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
     running_tasks[task_key] = True
     
     try:
-        target_chat_id = int(target_id)
+        raw_id = str(target_id).replace("-100", "").strip("-")
+        target_chat_id = int(f"-100{raw_id}")
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
@@ -2406,19 +2400,14 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     except: pass
 
                 m_type_l = (m_type or "").lower()
-                
-                if file_id and str(file_id).startswith("MSG_ID:"):
-                    msg_id_val = int(file_id.split(":", 1)[1])
-                    sender_bot.copy_message(target_chat_id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
+                if "photo" in m_type_l:
+                    sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
+                elif "video" in m_type_l:
+                    sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
+                elif "text" in m_type_l:
+                    sender_bot.send_message(target_chat_id, caption or "Empty Message", message_thread_id=dest_topic_id)
                 else:
-                    if "photo" in m_type_l:
-                        sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
-                    elif "video" in m_type_l:
-                        sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
-                    elif "text" in m_type_l:
-                        sender_bot.send_message(target_chat_id, caption or "Empty Message", message_thread_id=dest_topic_id)
-                    else:
-                        sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
+                    sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
                 
                 sent += 1
                 await asyncio.sleep(interval) 
@@ -2428,7 +2417,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                     retry_after = e.result_json.get('parameters', {}).get('retry_after', 30)
                     logger.warning(f"🕒 Rate limited! Sleeping for {retry_after}s...")
                     await asyncio.sleep(retry_after + 5)
-                elif "wrong file identifier" in str(e).lower() or "failed to get http url" in str(e).lower():
+                elif "wrong file identifier" in str(e):
                     logger.error(f"❌ Skipping bad File ID: {file_id[:15]}...")
                 else:
                     logger.error(f"⚠️ Extraction error: {e}")
@@ -2613,16 +2602,12 @@ def setup_log_bot(token):
                 log_bot.send_chat_action(message.chat.id, 'upload_document')
                 caption = f"✅ **Extracted from My Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
                 
-                if file_id and str(file_id).startswith("MSG_ID:"):
-                    msg_id_val = int(file_id.split(":", 1)[1])
-                    log_bot.copy_message(message.chat.id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
+                if "photo" in m_type:
+                    log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+                elif "video" in m_type:
+                    log_bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
                 else:
-                    if "photo" in m_type:
-                        log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-                    elif "video" in m_type:
-                        log_bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-                    else:
-                        log_bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
+                    log_bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
             else:
                 log_bot.reply_to(message, "❌ No record found in my vault for this ID.")
         except Exception as e:
