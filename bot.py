@@ -93,9 +93,10 @@ USING_POSTGRES = False
 album_cache = {}
 
 def get_placeholder(conn=None):
-    if conn and isinstance(conn, sqlite3.Connection):
-        return "?"
-    return "%s" if DATABASE_URL and USING_POSTGRES else "?"
+    # If we are explicitly told we are using Postgres or the connection is not a sqlite3 type
+    if DATABASE_URL and (USING_POSTGRES or (conn and not isinstance(conn, sqlite3.Connection))):
+        return "%s"
+    return "?"
 
 def init_db():
     with db_conn() as conn:
@@ -2972,9 +2973,14 @@ class LogBotManager:
             sid = int(call.data.split("_")[-1])
             with db_conn() as conn:
                 c = conn.cursor()
-                c.execute("SELECT source_title FROM target_pairs WHERE source_id = %s LIMIT 1", (sid,))
+                p = get_placeholder(conn)
+                # FIX: Use adaptive placeholder for the title lookup
+                title_query = f"SELECT source_title FROM target_pairs WHERE source_id = {p} LIMIT 1"
+                c.execute(title_query, (sid,))
                 res = c.fetchone()
-                c.execute("SELECT COUNT(*) FROM log_media WHERE source_chat_id = %s AND bot_id = %s", (sid, bot_id))
+                
+                # FIX: Use adaptive placeholder for count
+                c.execute(f"SELECT COUNT(*) FROM log_media WHERE source_chat_id = {p} AND bot_id = {p}", (sid, bot_id))
                 total = c.fetchone()[0]
 
             markup = InlineKeyboardMarkup()
