@@ -994,7 +994,11 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
             await client(functions.messages.GetDialogsRequest(
                 offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=20, hash=0
             ))
-            target = await client.get_entity(log_chat_id)
+            try:
+                target = await client.get_entity(log_chat_id)
+            except Exception as cache_err:
+                log_action("vault", "CRITICAL_FAILURE", f"Entity {log_chat_id} missing. You MUST /start this bot from your userbot!")
+                return
 
         # 2. SOURCE TOPIC DETECTION
         source_topic_title = None
@@ -1009,7 +1013,7 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                         break
             except: pass
 
-        # 3. SEND NATIVELY (ALBUM FIX)
+        # 3. SEND NATIVELY (ALBUM FIX) WITH PROTECTED CHAT FALLBACK
         album_text = next((m.message for m in messages if m.message), "")
         # CRITICAL: Extract the actual .media attribute from each message object
         media_to_send = [m.media for m in messages if m.media]
@@ -1019,8 +1023,30 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
             return
 
         log_action("vault", "UPLOADING", f"Sending {len(media_to_send)} items...")
-        vaulted_result = await client.send_message(target, file=media_to_send, message=album_text)
-        log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
+        try:
+            vaulted_result = await client.send_message(target, file=media_to_send, message=album_text)
+            log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
+        except Exception as send_err:
+            err_str = str(send_err).lower()
+            if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
+                log_action("vault", "FALLBACK", "Protected/Invalid media detected. Downloading locally...")
+                downloaded_files = []
+                try:
+                    for m in messages:
+                        if m.media:
+                            dl = await client.download_media(m.media)
+                            if dl: downloaded_files.append(dl)
+                    
+                    if downloaded_files:
+                        vaulted_result = await client.send_message(target, file=downloaded_files, message=album_text)
+                        log_action("vault", "UPLOAD_COMPLETE", f"Fallback upload successful for {t_name}")
+                    else:
+                        raise Exception("Fallback download failed.")
+                finally:
+                    for f in downloaded_files:
+                        if os.path.exists(f): os.remove(f)
+            else:
+                raise send_err
             
         # 4. Final Precision Indexing Fix
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
