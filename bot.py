@@ -93,8 +93,7 @@ USING_POSTGRES = False
 album_cache = {}
 
 def get_placeholder(conn=None):
-    # If we are explicitly told we are using Postgres or the connection is not a sqlite3 type
-    if DATABASE_URL and (USING_POSTGRES or (conn and not isinstance(conn, sqlite3.Connection))):
+    if DATABASE_URL and USING_POSTGRES:
         return "%s"
     return "?"
 
@@ -721,17 +720,16 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             sender_bot.send_message(admin_chat_id, "❌ No vaulted items found for this source.")
             return
 
-        # Apply the limit if one was provided
+        # Apply the limit logic
         if limit and isinstance(limit, int):
             items = items[:limit]
 
-        total_to_send = len(items)
+        total = len(items)
         success = 0
         failed = 0
         
-        # Stop button markup
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Starting batch transfer...**\nProcessing `{total_to_send}` items via Log Bot engine.", reply_markup=stop_markup, parse_mode="Markdown")
+        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
 
         for i, item in enumerate(items):
             if task_key not in running_tasks:
@@ -741,45 +739,23 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             source_msg_id, file_id, m_type, caption, log_msg_id, bot_id = item
             
             try:
-                # 1. Forward from Log Bot using Userbot
                 if log_msg_id is None or bot_id is None:
-                    raise ValueError("Missing logging IDs for Userbot forwarding")
-                
+                    continue 
+
                 log_bot_peer = await userbot.get_input_entity(int(bot_id))
-                await userbot.forward_messages(
-                    entity=int(target_id),
-                    messages=int(log_msg_id),
-                    from_peer=log_bot_peer
-                )
+                await userbot.forward_messages(int(target_id), int(log_msg_id), from_peer=log_bot_peer)
                 success += 1
             except Exception as e:
-                logger.error(f"Vault Release item error (Userbot): {e}")
-                # Fallback: Send directly via Bot API if Userbot fails or data is missing
-                try:
-                    if not file_id:
-                        logger.warning(f"Skipping item {source_msg_id}: No file_id found.")
-                        failed += 1
-                        continue
-                        
-                    if m_type == "photo": sender_bot.send_photo(target_id, file_id, caption=caption)
-                    elif m_type == "video": sender_bot.send_video(target_id, file_id, caption=caption)
-                    elif m_type == "document": sender_bot.send_document(target_id, file_id, caption=caption)
-                    elif m_type == "audio": sender_bot.send_audio(target_id, file_id, caption=caption)
-                    elif m_type == "animation": sender_bot.send_animation(target_id, file_id, caption=caption)
-                    elif m_type == "sticker": sender_bot.send_sticker(target_id, file_id)
-                    success += 1
-                except Exception as e2:
-                    logger.error(f"Vault Release fallback error (Bot API): {e2}")
-                    failed += 1
+                logger.error(f"Vault Release item error: {e}")
+                failed += 1
 
-            # Status Update every 5 items
-            if (i + 1) % 5 == 0 or (i + 1) == total_to_send:
-                try: sender_bot.edit_message_text(f"🚀 **Transferring...**\nProgress: `{i+1}/{total_to_send}`\nSuccess: `{success}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
+            if (i + 1) % 5 == 0 or (i + 1) == total:
+                try: sender_bot.edit_message_text(f"📊 **Status:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
                 except: pass
 
             await asyncio.sleep(interval)
             
-        sender_bot.send_message(admin_chat_id, f"✅ **Batch Transfer Complete**\nSent: `{success}`\nFailed: `{failed}`", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Transfer Complete!**\nTotal: `{total}`\nSuccessful: `{success}`")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
         sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
@@ -2974,12 +2950,18 @@ class LogBotManager:
             with db_conn() as conn:
                 c = conn.cursor()
                 p = get_placeholder(conn)
-                # FIX: Use adaptive placeholder for the title lookup
-                title_query = f"SELECT source_title FROM target_pairs WHERE source_id = {p} LIMIT 1"
-                c.execute(title_query, (sid,))
-                res = c.fetchone()
                 
-                # FIX: Use adaptive placeholder for count
+                # Use standard string formatting for the query to avoid "end of input" errors
+                # Ensure sid is passed as a tuple (sid,)
+                if USING_POSTGRES:
+                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = %s LIMIT 1", (sid,))
+                else:
+                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = ? LIMIT 1", (sid,))
+                
+                res = c.fetchone()
+                title = res[0] if res else "Unknown Group"
+                
+                # Fetch count for this specific bot
                 c.execute(f"SELECT COUNT(*) FROM log_media WHERE source_chat_id = {p} AND bot_id = {p}", (sid, bot_id))
                 total = c.fetchone()[0]
 
@@ -2988,10 +2970,10 @@ class LogBotManager:
             markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="lb_vault_main"))
 
             msg = (f"📊 **Group Statistics**\n\n"
-                   f"🏷 **Title:** `{res[0] if res else 'Unknown'}`\n"
+                   f"🏷 **Title:** `{title}`\n"
                    f"🆔 **ID:** `{sid}`\n"
                    f"📦 **Total Media:** `{total}`\n\n"
-                   f"💡 Click the button below to send this media into a different group via the Log Bot.")
+                   f"💡 Click the button below to send this media into a different group via this Log Bot.")
             bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_dump_start_"))
