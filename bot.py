@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types, errors
 from telethon.sessions import StringSession
 from telethon.utils import pack_bot_file_id
+from telethon.tl.types import InputReplyToMessage
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -1254,6 +1255,15 @@ def setup_automation_handlers(client: TelegramClient):
 
             # --- SEND WITH RETRY LOGIC ---
             retries = 3
+            
+            # Construct the proper Reply object to prevent ugly reply bubbles in forums
+            reply_obj = None
+            if final_reply_target:
+                reply_obj = InputReplyToMessage(
+                    reply_to_msg_id=int(final_reply_target),
+                    top_msg_id=int(final_reply_target)
+                )
+                
             while retries > 0:
                 try:
                     if len(messages) > 1:
@@ -1262,7 +1272,7 @@ def setup_automation_handlers(client: TelegramClient):
                             entity=tid,
                             message=album_text,
                             file=messages, 
-                            reply_to=int(final_reply_target) if final_reply_target else None
+                            reply_to=reply_obj
                         )
                         if sent_messages and isinstance(sent_messages, list):
                             save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
@@ -1272,7 +1282,7 @@ def setup_automation_handlers(client: TelegramClient):
                             entity=tid,
                             message=first_msg.message or "",
                             file=first_msg.media if first_msg.media else None,
-                            reply_to=int(final_reply_target) if final_reply_target else None
+                            reply_to=reply_obj
                         )
                         if sent_msg:
                             save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
@@ -1299,14 +1309,14 @@ def setup_automation_handlers(client: TelegramClient):
                                 if len(downloaded_files) > 1:
                                     sent_messages = await client.send_message(
                                         entity=tid, message=album_text, file=downloaded_files,
-                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                        reply_to=reply_obj
                                     )
                                     if sent_messages and isinstance(sent_messages, list):
                                         save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
                                 else:
                                     sent_msg = await client.send_message(
                                         entity=tid, message=album_text, file=downloaded_files[0],
-                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                        reply_to=reply_obj
                                     )
                                     if sent_msg:
                                         save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
