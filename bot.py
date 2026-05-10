@@ -851,6 +851,10 @@ async def get_chat_selection_markup(prefix, page=0):
     end = start + 10
     page_items = chats[start:end]
     
+    if not page_items:
+        markup.add(InlineKeyboardButton("❌ No Groups Found", callback_data="none"))
+        return markup
+        
     for dialog in page_items:
         chat = dialog.entity
         is_forum = getattr(chat, "forum", False)
@@ -2573,6 +2577,14 @@ class LogBotManager:
                 
                 async def show_tgt():
                     markup = await get_chat_selection_markup("lb_vault_tgt", 0)
+                    if not markup:
+                        main_bot_username = bot.get_me().username
+                        msg = "⚠️ **Userbot Offline**\n\nI cannot fetch your group list because the main userbot is not connected.\n\nPlease go to your **Main Admin Bot** and use the **'Connect Userbot'** button."
+                        btn = InlineKeyboardMarkup().add(InlineKeyboardButton("🔌 Connect at Main Bot", url=f"https://t.me/{main_bot_username}"))
+                        btn.add(InlineKeyboardButton("🔙 Back", callback_data="lb_vault_main"))
+                        bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=btn, parse_mode="Markdown")
+                        return
+                        
                     bot_instance.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 asyncio.run_coroutine_threadsafe(show_tgt(), loop)
                 
