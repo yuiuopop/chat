@@ -1081,15 +1081,29 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
 
         # SEND CONTENT with metadata for Log Bot extraction
         metadata = f"SID: {source_chat_id} | MID: {source_msg_id}\n"
-        vaulted = await client.send_message(
-            entity=target_peer,
-            file=message.media if message.media else None,
-            message=metadata + (message.message or "")
-        )
+        caption_text = metadata + (message.message or "")
+        
+        try:
+            vaulted = await client.send_message(
+                entity=target_peer,
+                file=message.media if message.media else None,
+                message=caption_text
+            )
+        except Exception as e:
+            if "protected" in str(e).lower() or "forward" in str(e).lower():
+                logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
+                path = await client.download_media(message)
+                vaulted = await client.send_message(
+                    entity=target_peer,
+                    file=path,
+                    message=caption_text
+                )
+                if path and os.path.exists(path): os.remove(path)
+            else:
+                raise e
             
         if vaulted:
-            logger.info(f"✅ VAULT: Message {source_msg_id} forwarded to @{t_name} for logging")
-            # The Log Bot handler will catch this and save the File ID
+            logger.info(f"✅ VAULT: Message {source_msg_id} logged successfully to @{t_name}")
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
@@ -1238,6 +1252,24 @@ def setup_automation_handlers(client: TelegramClient):
                         file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
                         reply_to=reply_header
                     )
+                except Exception as e:
+                    if "protected" in str(e).lower() or "forward" in str(e).lower():
+                        logger.info(f"🛡️ MIRROR: Protected chat detected. Downloading/Uploading...")
+                        # If album, download all
+                        if len(messages) > 1:
+                            paths = []
+                            for m in messages:
+                                p = await client.download_media(m)
+                                if p: paths.append(p)
+                            sent = await client.send_message(entity=int(tid), message=album_text, file=paths, reply_to=reply_header)
+                            for p in paths:
+                                if os.path.exists(p): os.remove(p)
+                        else:
+                            path = await client.download_media(messages[0])
+                            sent = await client.send_message(entity=int(tid), message=album_text, file=path, reply_to=reply_header)
+                            if path and os.path.exists(path): os.remove(path)
+                    else:
+                        raise e
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
                         logger.info(f"✅ MIRROR: Sent to {tid} (Topic: {dest_topic_id}) -> MSG ID: {first_id}")
@@ -2393,16 +2425,17 @@ async def userbot_watchdog():
                 await userbot.get_me()
             except Exception as e:
                 err_msg = str(e).lower()
-                if "deactivated" in err_msg or "authorized" in err_msg:
-                    logger.warning(f"WATCHDOG: Userbot session invalid: {e}")
+                if "deactivated" in err_msg or "authorized" in err_msg or "simultaneous" in err_msg or "ip address" in err_msg:
+                    logger.warning(f"WATCHDOG: Userbot session invalid or conflict: {e}")
                     try: await userbot.disconnect()
                     except: pass
                     userbot = None
                     
-                    # Clear session from DB
+                    # Clear session from DB to force re-login
                     with db_conn() as conn:
                         c = conn.cursor()
                         c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+                    logger.info("WATCHDOG: Session cleared from DB due to conflict/invalidation.")
                     
                     bot.send_message(ADMIN_ID, f"⚠️ **USERBOT SESSION EXPIRED/BANNED**\n\nThe account has been deactivated or unauthorized. Session has been cleared.\nError: `{e}`", parse_mode="Markdown")
                 else:
@@ -2609,6 +2642,25 @@ class LogBotManager:
                     login_data[uid]["vault_target_id"] = tid
                     admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
                     bot_instance.edit_message_text("⏳ **Release Interval**\n\nPlease send the time period (in seconds) between each message:\n(Example: `1.5` or `3`)", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                    
+            elif data == "lb_cancel":
+                bot_instance.answer_callback_query(call.id)
+                admin_states.pop(f"lb_{bot_id}_{uid}", None)
+                cmd_start(call.message)
+
+            elif data.startswith("lb_stop_rel_"):
+                bot_instance.answer_callback_query(call.id, "🛑 Stopping...")
+                task_key = data.replace("lb_stop_rel_", "")
+                stop_task(task_key)
+
+            elif data.startswith("lb_do_release_"):
+                # lb_do_release_{sid}_{tid}_{interval}
+                bot_instance.answer_callback_query(call.id)
+                parts = data.split("_")
+                sid, tid = int(parts[3]), int(parts[4])
+                interval = float(parts[5])
+                bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval), loop)
 
         @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
         def handle_lb_messages(message):
@@ -2632,25 +2684,6 @@ class LogBotManager:
                     bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
                 except:
                     bot_instance.reply_to(message, "⚠️ Invalid interval. Please send a number (e.g. `2.0`).")
-                    
-            elif data == "lb_cancel":
-                bot_instance.answer_callback_query(call.id)
-                admin_states.pop(f"lb_{bot_id}_{uid}", None)
-                cmd_start(call.message)
-
-            elif data.startswith("lb_stop_rel_"):
-                bot_instance.answer_callback_query(call.id, "🛑 Stopping...")
-                task_key = data.replace("lb_stop_rel_", "")
-                stop_task(task_key)
-
-            elif data.startswith("lb_do_release_"):
-                # lb_do_release_{sid}_{tid}_{interval}
-                bot_instance.answer_callback_query(call.id)
-                parts = data.split("_")
-                sid, tid = int(parts[3]), int(parts[4])
-                interval = float(parts[5])
-                bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval), loop)
 
         @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
         def handle_logging(message):
