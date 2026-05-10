@@ -30,48 +30,18 @@ load_dotenv()
 # Config
 # -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+bot_fleet = {} # { bot_id: telebot_instance })
 PORT = int(os.getenv("PORT", "8080"))
 
 if not BOT_TOKEN:
     print("WARNING: Missing BOT_TOKEN in .env. Admin features will be limited until set.")
 
-# --- Logger Setup ---
-logger = logging.getLogger("UserbotV2")
-logger.setLevel(logging.INFO)
-
-# Create console handler with a specific format
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-ch.setFormatter(formatter)
-
-# Prevent duplicate handlers if script is re-run
-if not logger.handlers:
-    logger.addHandler(ch)
-
-def log_action(action_name, status, details=""):
-    """Standardized format for tracking bot events in hosting logs"""
-    msg = f"[{action_name.upper()}] {status} - {details}"
-    logger.info(msg)
-
-# Alias old logger calls to the new one if needed
-logging.getLogger().handlers = [] # Clear default handler
-# --- End Logger Setup ---
-
-app = Flask(__name__)
-
-@app.route('/')
-def health():
-    log_action("keep_alive", "PULSE", f"Ping received from {request.remote_addr}")
-    return "Bot is alive and monitoring", 200
-
-def run_web():
-    logger.info(f"🚀 Starting web server on port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT)
+logger = logging.getLogger("userbot_v2")
 
 # Topic Mirroring Cache
 # {target_chat_id: {topic_title.lower(): top_message_id}}
@@ -112,34 +82,6 @@ def db_conn():
             conn.close()
 
 USING_POSTGRES = False
-
-# Session Tracking for Summaries
-# {source_id: {"count": 0, "start": datetime, "last": datetime, "timer": Timer, "titles": set()}}
-vault_sessions = {}
-session_lock = threading.Lock()
-
-def finalize_session(sid):
-    """Sends the collection summary to admin after inactivity"""
-    with session_lock:
-        sess = vault_sessions.pop(sid, None)
-        if not sess: return
-        
-    count = sess["count"]
-    start_str = sess["start"].strftime("%H:%M:%S")
-    end_str = sess["last"].strftime("%H:%M:%S")
-    titles = ", ".join(sess["titles"])
-    
-    summary = (
-        f"📊 **Collection Cycle Complete**\n\n"
-        f"📂 **Sources:** `{titles}`\n"
-        f"📦 **Items Vaulted:** `{count}`\n"
-        f"⏱️ **Duration:** `{start_str}` to `{end_str}`\n"
-        f"✨ *Vault is now idle.*"
-    )
-    try:
-        bot.send_message(ADMIN_ID, summary, parse_mode="Markdown")
-        log_action("session", "FINALIZED", f"Source: {sid} | Items: {count}")
-    except: pass
 
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
@@ -251,15 +193,40 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id SERIAL PRIMARY KEY,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     log_target_id BIGINT,
                     file_id TEXT,
-                    media_type TEXT,
-                    topic_title TEXT
+                    media_type TEXT
                 )
             """)
-            try: c.execute("ALTER TABLE media_logs ADD COLUMN topic_title TEXT")
+            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
             except: pass
+            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
+            except: pass
+
+            # Log Bot System Tables
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_bots (
+                    id SERIAL PRIMARY KEY,
+                    bot_token TEXT UNIQUE,
+                    bot_username TEXT,
+                    bot_id BIGINT UNIQUE
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_media (
+                    id SERIAL PRIMARY KEY,
+                    bot_id BIGINT,
+                    source_chat_id BIGINT,
+                    source_msg_id BIGINT,
+                    file_id TEXT,
+                    media_type TEXT,
+                    caption TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(bot_id, source_chat_id, source_msg_id)
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -345,12 +312,41 @@ def init_db():
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id BIGINT,
                     source_message_id BIGINT,
                     log_target_id BIGINT,
                     file_id TEXT,
                     media_type TEXT
                 )
             """)
+            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
+            except: pass
+
+            # Log Bot System Tables
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_bots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bot_token TEXT UNIQUE,
+                    bot_username TEXT,
+                    bot_id BIGINT UNIQUE
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS log_media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bot_id BIGINT,
+                    source_chat_id BIGINT,
+                    source_msg_id BIGINT,
+                    file_id TEXT,
+                    media_type TEXT,
+                    caption TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(bot_id, source_chat_id, source_msg_id)
+                )
+            """)
+    logger.info("DB initialized")
     logger.info("DB initialized")
 
 def get_setting(key, default=None):
@@ -493,19 +489,19 @@ def remove_log_target(row_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_targets WHERE id = {p}", (row_id,))
 
-def save_media_log(source_msg_id, log_target_id, file_id, media_type, topic_title=None):
+def save_media_log(source_chat_id, source_message_id, log_target_id, file_id, media_type):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) VALUES (%s, %s, %s, %s, %s)",
-                (source_msg_id, log_target_id, file_id, media_type, topic_title)
+                "INSERT INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s, %s) ON CONFLICT(source_chat_id, source_message_id, log_target_id) DO NOTHING",
+                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
             )
         else:
             c.execute(
-                "INSERT INTO media_logs (source_message_id, log_target_id, file_id, media_type, topic_title) VALUES (?, ?, ?, ?, ?)",
-                (source_msg_id, log_target_id, file_id, media_type, topic_title)
+                "INSERT OR IGNORE INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?, ?)",
+                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
             )
 
 def get_media_logs(limit=100, media_type=None):
@@ -528,47 +524,44 @@ def get_vault_sources():
         query = """
             SELECT DISTINCT p.source_id, p.source_title 
             FROM target_pairs p
-            JOIN collected_media c ON p.source_id = c.source_chat_id
-            JOIN media_logs m ON c.source_message_id = m.source_message_id
+            JOIN log_media m ON p.source_id = m.source_chat_id
         """
         c.execute(query)
         return c.fetchall()
 
-def get_vaulted_media_for_source(source_id, log_target_id=None):
+def get_vaulted_media_for_source(source_id, bot_id=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_message_id, MAX(m.file_id) as file_id, MAX(m.media_type) as media_type, MAX(c.caption) as caption, MAX(m.topic_title) as topic_title
-            FROM media_logs m
-            JOIN collected_media c ON m.source_message_id = c.source_message_id
-            WHERE c.source_chat_id = {p}
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption
+            FROM log_media m
+            WHERE m.source_chat_id = {p}
         """
         params = [source_id]
-        if log_target_id:
-            query += f" AND m.log_target_id = {p}"
-            params.append(log_target_id)
+        if bot_id:
+            query += f" AND m.bot_id = {p}"
+            params.append(bot_id)
             
-        query += " GROUP BY m.source_message_id ORDER BY m.source_message_id ASC"
+        query += " ORDER BY m.source_msg_id ASC"
         
         c.execute(query, tuple(params))
         return c.fetchall()
 
-def get_log_bot_stats(log_target_id):
+def get_log_bot_stats(bot_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         query = f"""
             SELECT p.source_id, p.source_title, COUNT(m.id) as item_count
-            FROM media_logs m
-            JOIN collected_media c ON m.source_message_id = c.source_message_id
-            JOIN target_pairs p ON c.source_chat_id = p.source_id
-            WHERE m.log_target_id = {p}
+            FROM log_media m
+            JOIN target_pairs p ON m.source_chat_id = p.source_id
+            WHERE m.bot_id = {p}
             GROUP BY p.source_id, p.source_title
             ORDER BY item_count DESC
         """
-        c.execute(query, (log_target_id,))
+        c.execute(query, (bot_id,))
         return c.fetchall()
 
 def get_target_pairs():
@@ -593,6 +586,69 @@ def get_pair_stats(pair_id):
         return {"total": row[0] or 0, "pending": row[1] or 0}
 
 # -----------------------------
+# Log Bot Helpers
+# -----------------------------
+def add_log_bot(token, username, bot_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                "INSERT INTO log_bots (bot_token, bot_username, bot_id) VALUES (%s, %s, %s) ON CONFLICT(bot_token) DO UPDATE SET bot_username = EXCLUDED.bot_username, bot_id = EXCLUDED.bot_id",
+                (token, username, bot_id)
+            )
+        else:
+            c.execute(
+                "INSERT INTO log_bots (bot_token, bot_username, bot_id) VALUES (?, ?, ?) ON CONFLICT(bot_token) DO UPDATE SET bot_username = excluded.bot_username, bot_id = excluded.bot_id",
+                (token, username, bot_id)
+            )
+
+def get_log_bots():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT bot_token, bot_username, bot_id FROM log_bots")
+        return c.fetchall()
+
+def delete_log_bot(bot_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"DELETE FROM log_bots WHERE bot_id = {p}", (bot_id,))
+        c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
+
+def save_logged_media(bot_id, source_chat_id, source_msg_id, file_id, media_type, caption):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if DATABASE_URL:
+            c.execute(
+                """INSERT INTO log_media (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (%s, %s, %s, %s, %s, %s) 
+                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO NOTHING""",
+                (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+            )
+        else:
+            c.execute(
+                """INSERT OR IGNORE INTO log_media (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (bot_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+            )
+
+def get_logged_media_stats(bot_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"SELECT COUNT(*) FROM log_media WHERE bot_id = {p}", (bot_id,))
+        return c.fetchone()[0] or 0
+
+def fetch_logged_media(bot_id, limit=1000):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"SELECT source_chat_id, source_msg_id, file_id, media_type, caption FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, limit))
+        return c.fetchall()
+
+# -----------------------------
 # Global State
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -601,7 +657,6 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
-active_log_bots = set() # Track tokens of currently polling secondary bots
 
 def stop_task(task_key):
     if task_key in running_tasks:
@@ -636,25 +691,30 @@ def get_dashboard_markup():
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
         markup.add(InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
-        markup.add(InlineKeyboardButton("📝 Log Targets", callback_data="log_targets_main"))
+        markup.add(InlineKeyboardButton("📜 Log Bots", callback_data="log_bot_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
     return markup
 
-def log_targets_list_markup():
-    markup = InlineKeyboardMarkup()
-    targets = get_log_targets()
-    for row in targets:
-        # row: id, target_id, target_type, target_name
-        markup.row(
-            InlineKeyboardButton(f"📝 {row[3]}", callback_data="log_ignore"),
-            InlineKeyboardButton("🗑️ Remove", callback_data=f"log_remove_{row[0]}")
-        )
-    markup.row(InlineKeyboardButton("➕ Add Log Target", callback_data="log_add_start"))
-    markup.row(InlineKeyboardButton("🔄 Sync All Media", callback_data="log_sync_all"))
-    markup.row(InlineKeyboardButton("📥 Extract Media IDs", callback_data="log_extract_start"))
-    markup.row(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+def log_bot_list_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    bots = get_log_bots()
+    for token, username, bot_id in bots:
+        stats = get_logged_media_stats(bot_id)
+        markup.add(InlineKeyboardButton(f"🤖 @{username} ({stats})", callback_data=f"log_bot_view_{bot_id}"))
+    
+    markup.add(InlineKeyboardButton("➕ Add Log Bot", callback_data="log_bot_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
+    return markup
+
+def log_bot_view_markup(bot_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📥 Fetch Logs", callback_data=f"log_bot_fetch_{bot_id}"),
+        InlineKeyboardButton("🗑 Remove", callback_data=f"log_bot_delete_confirm_{bot_id}")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_bot_main"))
     return markup
 
 def pairs_list_markup():
@@ -864,57 +924,73 @@ async def get_topic_selection_markup(chat_id, prefix):
 # Userbot Logic
 # -----------------------------
 async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
-    """Aggressive topic management: fetches current list or creates if missing"""
+    """
+    Search for a topic by title in target chat. If not found, create it.
+    Uses database mapping first, then topic_cache.
+    """
     if not topic_title: return None
+    
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
-
-    # 1. Check local cache
+    
+    # 1) Check Database Mapping (Most Reliable)
+    if source_chat_id and source_topic_id:
+        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
+        if existing_mapping:
+            return existing_mapping
+    
+    # 2) Check Cache
     if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
-        return topic_cache[t_chat_id][title_key]
-
+        res = topic_cache[t_chat_id][title_key]
+        if source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+        return res
+    
+    # 3) Fetch Topics from Telegram
     try:
-        # 2. Fetch current topics from Telegram to see if it exists
         result = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            channel=t_chat_id,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
         ))
         
-        if t_chat_id not in topic_cache: topic_cache[t_chat_id] = {}
-        
+        if t_chat_id not in topic_cache:
+            topic_cache[t_chat_id] = {}
+            
         for topic in result.topics:
             topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
-            if topic.title.lower().strip() == title_key:
-                return topic.top_message
-
-        # 3. Create it if it really doesn't exist
-        log_action("mirror", "CREATING_TOPIC", f"'{topic_title}' in {t_chat_id}")
+            
+        if title_key in topic_cache[t_chat_id]:
+            res = topic_cache[t_chat_id][title_key]
+            if source_chat_id and source_topic_id:
+                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+            return res
+            
+        # 4) Create if not found
+        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
             title=topic_title
         ))
         
-        # Extract the new top_message ID from updates
-        new_topic_id = None
-        for update in created.updates:
-            if hasattr(update, 'id'):
-                new_topic_id = update.id
-                break
-                
-        if not new_topic_id:
-            # Fallback: re-fetch
-            res_after = await client(functions.channels.GetForumTopicsRequest(channel=t_chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=10))
-            for t in res_after.topics:
-                if t.title.lower().strip() == title_key:
-                    new_topic_id = t.top_message
-                    break
-        
-        if new_topic_id:
-            topic_cache[t_chat_id][title_key] = new_topic_id
+        await asyncio.sleep(1)
+        res_after = await client(functions.channels.GetForumTopicsRequest(
+            channel=t_chat_id,
+            offset_date=0, offset_id=0, offset_topic=0, limit=20
+        ))
+        for t in res_after.topics:
+            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
             
-        return new_topic_id
-
+        final_id = topic_cache[t_chat_id].get(title_key)
+        if final_id and source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
+            
+        return final_id
+        
     except Exception as e:
-        logger.error(f"❌ Topic Management Error: {e}")
+        logger.error(f"Mirroring Error (get_or_create): {e}")
         return None
 
 async def start_userbot():
@@ -964,147 +1040,39 @@ async def ensure_userbot():
     
     return True, "Connected"
 
-async def forward_to_log_targets(client, messages, source_msg_id):
-    """Modified to handle lists (albums) or single messages"""
-    if not messages: return
-    if not isinstance(messages, list): messages = [messages]
+async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
+    """Sends collected content to all registered log bots."""
+    if not message: return
+    bots = get_log_bots()
+    if not bots: return
     
-    targets = get_log_targets()
-    if not targets: return
-    
-    for row in targets:
-        _, t_id, t_type, t_name, _ = row
-        # Pass the whole list of messages to the vault
-        asyncio.create_task(vault_media(client, messages, t_id, source_msg_id, t_name))
+    for token, username, bot_id in bots:
+        # Run vaulting in background tasks
+        asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(source_msg_id), username))
 
-async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
-    """Sends albums/singles to Log Bot and saves Topic titles for extraction"""
+async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
+    """Helper to forward to vault and save the permanent File ID"""
     try:
-        if not messages: return
-        if not isinstance(messages, list): messages = [messages]
-        log_chat_id = int(log_chat_id)
-        
-        log_action("vault", "STARTING", f"Target: {t_name} ({log_chat_id})")
-        
-        # 1. PEER RESOLUTION
+        # RESOLVE ENTITY: Fetch the access hash for the bot
         try:
-            target = await client.get_input_entity(log_chat_id)
-        except Exception:
-            log_action("vault", "CACHE_MISS", f"Bot {log_chat_id} resolving globally...")
-            await client(functions.messages.GetDialogsRequest(
-                offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=20, hash=0
-            ))
-            try:
-                target = await client.get_entity(log_chat_id)
-            except Exception as cache_err:
-                log_action("vault", "CRITICAL_FAILURE", f"Entity {log_chat_id} missing. You MUST /start this bot from your userbot!")
-                return
+            target_peer = await client.get_input_entity(int(log_chat_id))
+        except:
+            # If not found, try to 'find' the bot by ID directly (forces session lookup)
+            target_peer = await client.get_entity(int(log_chat_id))
 
-        # 2. SOURCE TOPIC DETECTION
-        source_topic_title = None
-        first_msg = messages[0]
-        if first_msg.reply_to:
-            try:
-                source_top_id = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                for t in res.topics:
-                    if t.id == source_top_id:
-                        source_topic_title = t.title
-                        break
-            except: pass
-
-        # 3. SEND NATIVELY (ALBUM FIX) WITH PROTECTED CHAT FALLBACK
-        album_text = next((m.message for m in messages if m.message), "")
-        # CRITICAL: Extract the actual .media attribute from each message object
-        media_to_send = [m.media for m in messages if m.media]
-        
-        if not media_to_send:
-            log_action("vault", "SKIP", "No media found to upload")
-            return
-
-        log_action("vault", "UPLOADING", f"Sending {len(media_to_send)} items...")
-        try:
-            vaulted_result = await client.send_message(target, file=media_to_send, message=album_text)
-            log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
-        except Exception as send_err:
-            err_str = str(send_err).lower()
-            if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
-                log_action("vault", "FALLBACK", "Protected/Invalid media detected. Downloading locally...")
-                downloaded_files = []
-                try:
-                    for m in messages:
-                        if m.media:
-                            dl = await client.download_media(m.media)
-                            if dl: downloaded_files.append(dl)
-                    
-                    if downloaded_files:
-                        vaulted_result = await client.send_message(target, file=downloaded_files, message=album_text)
-                        log_action("vault", "UPLOAD_COMPLETE", f"Fallback upload successful for {t_name}")
-                    else:
-                        raise Exception("Fallback download failed.")
-                finally:
-                    for f in downloaded_files:
-                        if os.path.exists(f): os.remove(f)
-            else:
-                raise send_err
+        # SEND CONTENT with metadata for Log Bot extraction
+        metadata = f"SID: {source_chat_id} | MID: {source_msg_id}\n"
+        vaulted = await client.send_message(
+            entity=target_peer,
+            file=message.media if message.media else None,
+            message=metadata + (message.message or "")
+        )
             
-        # 4. Final Precision Indexing Fix
-        vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-        
-        # We iterate through the RESULT of the send (the vaulted messages)
-        for i, v_msg in enumerate(vaulted_list):
-            try:
-                # CRITICAL: Extract the actual Parent Media Object
-                inner = None
-                if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner = v_msg.media.photo
-                elif isinstance(v_msg.media, types.MessageMediaDocument):
-                    inner = v_msg.media.document
-                
-                # Verify we have the parent object with access data
-                if inner and hasattr(inner, 'access_hash'):
-                    fid = None
-                    try:
-                        fid = pack_bot_file_id(inner)
-                    except Exception as pack_err:
-                        log_action("vault", "INDEX_WARNING", f"Could not pack File ID: {pack_err}")
-                        
-                    # Use the original source message's ID for tracking
-                    real_sid = messages[i].id if i < len(messages) else source_msg_id
-                    save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored msg {real_sid}")
-                else:
-                    # It's a plain text message or non-packable media/thumbnail
-                    real_sid = messages[i].id if i < len(messages) else source_msg_id
-                    m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
-                    save_media_log(real_sid, log_chat_id, None, m_type, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored {m_type} for msg {real_sid}")
-            except Exception as e:
-                log_action("vault", "INDEX_ERROR", f"Item {i} failed: {e}")
-                
-        # --- Session Tracking Logic (Unchanged) ---
-        with session_lock:
-            sid = first_msg.chat_id
-            now = datetime.now()
-            if sid not in vault_sessions:
-                vault_sessions[sid] = {
-                    "count": 0, "start": now, "last": now, "timer": None, "titles": set()
-                }
-            
-            sess = vault_sessions[sid]
-            sess["count"] += len(messages)
-            sess["last"] = now
-            if t_name: sess["titles"].add(t_name)
-            
-            if sess["timer"]: sess["timer"].cancel()
-            t = threading.Timer(300, finalize_session, args=[sid])
-            sess["timer"] = t
-            t.start()
-        # -----------------------------
-
-        logger.info(f"✅ VAULT SUCCESS: Sent to {t_name} (Topic: {source_topic_title or 'General'})")
+        if vaulted:
+            logger.info(f"✅ VAULT: Message {source_msg_id} forwarded to @{t_name} for logging")
+            # The Log Bot handler will catch this and save the File ID
     except Exception as e:
-        log_action("vault", "CRITICAL_FAILURE", str(e))
+        logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
@@ -1112,214 +1080,127 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
-        # LOG: Incoming message detected
-        log_action("traffic", "INCOMING", f"Chat: {m.chat_id} | Msg ID: {m.id} | Media: {bool(m.media)}")
-
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             
-            # Normalize IDs
+            # Normalize ID matching
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
 
             if source_id_str == msg_id_str:
-                log_action("live_match", "MATCH FOUND", f"Pair: {s_title} -> {t_title}")
+                # --- TOPIC DETECTION ---
+                msg_topic_anchor = None
+                if m.reply_to:
+                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
                 
-                # CHECK: Is Live Forwarding enabled?
-                if not is_live:
-                    log_action("live_skip", "DISABLED", f"Live Forwarding is OFF for {s_title}")
-                else:
-                    # --- Topic Decision Logic ---
-                    msg_topic_anchor = None
-                    if m.reply_to:
-                        msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
-                    
-                    if s_topic and str(s_topic) not in ["None", "0", ""]:
-                        if str(msg_topic_anchor) != str(s_topic):
-                            log_action("live_skip", "TOPIC MISMATCH", f"Expected {s_topic}, got {msg_topic_anchor}. Skipping.")
-                        else:
-                            # Proceed with live mirroring
-                            log_action("live_send", "ATTEMPTING", f"Forwarding msg {m.id} to {t_title}")
-                            # Trigger live mirror task...
-                            asyncio.create_task(send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid))
-                    else:
-                        # No topic filtering, send all
-                        log_action("live_send", "ATTEMPTING", f"Forwarding msg {m.id} to {t_title}")
-                        asyncio.create_task(send_mirrored_content(client, tid, [m], t_topic, is_mir, sid, is_mon, pid))
-
-                # --- VAULTING & COLLECTION (Independent of Live Forwarding) ---
-                if is_mon:
-                    # Sync album collection (only for media groups)
-                    if m.grouped_id:
-                        if m.grouped_id not in album_cache:
-                            album_cache[m.grouped_id] = [m]
-                            # Wait for all parts
-                            async def collect_album(gid, sid_ref, pid_ref):
-                                await asyncio.sleep(4.0) # Wait for album parts
-                                messages = album_cache.pop(gid, [])
-                                if messages:
-                                    await forward_to_log_targets(client, messages, messages[0].id)
-                            asyncio.create_task(collect_album(m.grouped_id, m.chat_id, pid))
-                        else:
-                            if m.grouped_id in album_cache:
-                                album_cache[m.grouped_id].append(m)
-                    else:
-                        # Single message (Text or Media)
-                        await forward_to_log_targets(client, [m], m.id)
+                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                    msg_topic_anchor = m.id
                 
-                # Exit the pair loop as we've handled this message
-                break
+                if not msg_topic_anchor and m.reply_to_msg_id:
+                    msg_topic_anchor = m.reply_to_msg_id
 
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, is_mon, pair_id):
-        """Unified Hub to send single or multiple messages (albums) and vault them"""
-        try:
-            if not messages: return
-            first_msg = messages[0]
+                # Specific topic filtering
+                if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
+                    if str(msg_topic_anchor) != str(s_topic):
+                        continue
 
-            # --- DB COLLECTION ---
-            if is_mon:
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    for m in messages:
-                        m_type = type(m.media).__name__ if m.media else "Text"
+                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
+                if is_mon and m.media:
+                    m_type = type(m.media).__name__
+                    with db_conn() as conn:
+                        c = conn.cursor()
                         if DATABASE_URL:
                             c.execute(
                                 "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pair_id, sid, m.id, m_type, m.message or "")
+                                (pid, sid, m.id, m_type, m.message or "")
                             )
                         else:
                             c.execute(
                                 "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, sid, m.id, m_type, m.message or "")
+                                (pid, sid, m.id, m_type, m.message or "")
                             )
-                
-                # Trigger the Log Bot Vaulting is now handled exclusively by auto_handler
-                # to prevent duplicate uploads and blocking of the live mirror flow.
-
-            # --- MIRRORING (LIVE FORWARD) ---
-            if not tid:
-                return # Stop here if no target set
-            
-            dest_topic_id = default_t_topic
-            
-            if is_mir:
-                source_top = None
-                if first_msg.reply_to:
-                    source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                
-                if source_top:
-                    src_title = None
-                    forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
-                    if forum: src_title = getattr(forum, "title", None)
                     
+                    # Instantly send to log bots in background
+                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id))
+
+                if not is_live: continue
+
+                # --- ALBUM / SINGLE MESSAGE LOGIC ---
+                if m.grouped_id:
+                    if m.grouped_id not in album_cache:
+                        album_cache[m.grouped_id] = [m]
+                        # Wait for all parts (10 items need a bit more time)
+                        await asyncio.sleep(3.5) 
+                        
+                        messages = album_cache.pop(m.grouped_id, [])
+                        if messages:
+                            await send_mirrored_content(client, tid, messages, t_topic, is_mir, sid)
+                    else:
+                        if m.grouped_id in album_cache:
+                            album_cache[m.grouped_id].append(m)
+                else:
+                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+
+    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
+        """Helper to send single or multiple messages (albums) with caption support"""
+        try:
+            dest_topic_id = default_t_topic
+            first_msg = messages[0]
+            
+            # 1. Resolve Topic Mapping
+            if is_mir and first_msg.reply_to:
+                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                if source_top:
+                    # Resolve the source topic title
+                    forum = getattr(first_msg.reply_to, "forum_topic", None)
+                    src_title = getattr(forum, "title", None)
+                    
+                    # If not in cache, fetch from source group's topic list
                     if not src_title:
                         try:
-                            res = await client(functions.channels.GetForumTopicsRequest(channel=first_msg.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
                             for t in res.topics:
-                                if source_top in [t.id, t.top_message]:
-                                    src_title = t.title
-                                    break
+                                if t.id == source_top:
+                                    src_title = t.title; break
                         except: pass
                     
+                    # Mirror the topic in the target group using the real name
                     if src_title:
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
+                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top)
 
-            # Resolve Target Topic Only (No message-to-message reply linking)
-            final_reply_target = dest_topic_id
-            
-            # Prevent replying to random messages in non-forum groups
-            is_forum = False
-            try:
-                # Need to handle potential missing -100 for groups
-                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+            # 2. Resolve Reply Hierarchy
+            reply_to_mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid) if first_msg.reply_to_msg_id else None
+
+            # 3. CONSTRUCT REPLY LOGIC (InputReplyToMessage for Forums)
+            reply_param = None
+            if reply_to_mapped:
+                reply_param = types.InputReplyToMessage(
+                    reply_to_msg_id=int(reply_to_mapped),
+                    top_msg_id=int(dest_topic_id) if dest_topic_id else None
+                )
+            elif dest_topic_id:
+                reply_param = int(dest_topic_id)
+
+            album_text = next((msg.message for msg in messages if msg.message), "")
+
+            # 4. Send Content
+            for _ in range(3):
                 try:
-                    tgt_ent = await client.get_entity(real_tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-                except Exception:
-                    tgt_ent = await client.get_entity(tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-            except Exception:
-                pass
-            
-            if not is_forum:
-                final_reply_target = None
-
-            # --- CAPTION SUPPORT ---
-            # Search all messages in the grouping to find the one with the text
-            album_text = ""
-            for msg in messages:
-                if msg.message:
-                    album_text = msg.message
+                    sent = await client.send_message(
+                        entity=int(tid), 
+                        message=album_text, 
+                        file=messages if len(messages) > 1 else messages[0].media,
+                        reply_to=reply_param
+                    )
+                    if sent:
+                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        save_message_mapping(sid, first_msg.id, tid, first_id)
                     break
-
-            # --- SEND WITH RETRY LOGIC ---
-            retries = 3
-            while retries > 0:
-                try:
-                    if len(messages) > 1:
-                        # Send as Album
-                        sent_messages = await client.send_message(
-                            entity=tid,
-                            message=album_text,
-                            file=messages, 
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
-                        if sent_messages and isinstance(sent_messages, list):
-                            save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
-                    else:
-                        # Send as Single
-                        sent_msg = await client.send_message(
-                            entity=tid,
-                            message=first_msg.message or "",
-                            file=first_msg.media if first_msg.media else None,
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
-                        if sent_msg:
-                            save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                            logger.info(f"🚀 MIRROR SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
-                    
-                    break # Success, exit retry loop
-                    
                 except errors.rpcerrorlist.WorkerBusyTooLongRetryError:
-                    retries -= 1
-                    logger.warning(f"Telegram Busy. Retrying in 4s... ({retries} left)")
                     await asyncio.sleep(4)
                 except Exception as inner_e:
-                    err_str = str(inner_e).lower()
-                    if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
-                        logger.info("Live Mirror: Protected chat detected. Falling back to local download...")
-                        import os
-                        downloaded_files = []
-                        try:
-                            for m in messages:
-                                if m.media:
-                                    dl = await client.download_media(m.media)
-                                    if dl: downloaded_files.append(dl)
-                            if downloaded_files:
-                                if len(downloaded_files) > 1:
-                                    sent_messages = await client.send_message(
-                                        entity=tid, message=album_text, file=downloaded_files,
-                                        reply_to=int(final_reply_target) if final_reply_target else None
-                                    )
-                                    if sent_messages and isinstance(sent_messages, list):
-                                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
-                                else:
-                                    sent_msg = await client.send_message(
-                                        entity=tid, message=album_text, file=downloaded_files[0],
-                                        reply_to=int(final_reply_target) if final_reply_target else None
-                                    )
-                                    if sent_msg:
-                                        save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                                logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
-                            else:
-                                logger.error("Mirror Fallback: Download failed.")
-                        finally:
-                            for f in downloaded_files:
-                                if os.path.exists(f): os.remove(f)
-                        break
-                    else:
-                        logger.error(f"Failed to send mirrored content: {inner_e}")
-                        break
+                    logger.error(f"Failed to send mirrored content: {inner_e}")
+                    break
 
         except Exception as e:
             logger.error(f"Global Mirror Send Error: {e}")
@@ -1409,34 +1290,6 @@ def cmd_extract_media(message):
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
-
-@bot.message_handler(commands=['mood'])
-def cmd_mood(message):
-    """Fun command to check the bot's current vibe"""
-    if message.from_user.id != ADMIN_ID: return
-    import random
-    moods = [
-        "🤖 **System Mood**: Productive. (Ready to vault the world!)",
-        "🔋 **System Mood**: Charging. (Need more RAM... or coffee.)",
-        "😎 **System Mood**: Cool. (Handling rate limits like a pro.)",
-        "🧐 **System Mood**: Analytical. (Currently judging your target choices.)",
-        "🔥 **System Mood**: On Fire! (Processing media at light speed!)",
-        "🧘 **System Mood**: Zen. (Waiting for the next collection cycle.)"
-    ]
-    bot.reply_to(message, random.choice(moods), parse_mode="Markdown")
-
-@bot.message_handler(commands=['clearlogs'])
-def cmd_clear_logs(message):
-    """Wipes corrupted legacy vault data to allow for fresh, perfect collection"""
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        with db_conn() as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM media_logs")
-            c.execute("UPDATE collected_media SET released = 0")
-        bot.reply_to(message, "🧹 **Database Cleared!**\n\nAll corrupted legacy records have been wiped. The bot will now re-collect and re-index your media with the perfect File IDs and Topic Titles.", parse_mode="Markdown")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Cleanup Error: {e}")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
@@ -1542,75 +1395,77 @@ def handle_callbacks(call):
             bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(run_vault_release(bot, call.message.chat.id, sid, tid), loop)
 
-    elif data == "log_targets_main":
+    elif data == "log_bot_main":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text("📝 **Log Targets**\nManage destinations for collected media:", call.message.chat.id, call.message.message_id, reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
 
-    elif data == "log_add_start":
+    elif data == "log_bot_add_start":
         bot.answer_callback_query(call.id)
-        admin_states[uid] = "awaiting_log_target"
-        bot.send_message(call.message.chat.id, "📝 **Add Log Bot**\nPlease send the **Bot Token** of your Log Bot (from @BotFather).")
+        admin_states[uid] = "awaiting_log_bot_token"
+        bot.send_message(call.message.chat.id, "📜 **Add Log Bot**\nPlease send the **Bot Token** of your backup bot.\n\n_Note: You must create this bot via @BotFather._")
 
-    elif data.startswith("log_remove_"):
+    elif data.startswith("log_bot_view_"):
+        bot_id = int(data.split("_")[-1])
         bot.answer_callback_query(call.id)
-        row_id = int(data.split("_")[-1])
-        remove_log_target(row_id)
-        bot.edit_message_text("📝 **Log Targets**\nManage destinations for collected media:", call.message.chat.id, call.message.message_id, reply_markup=log_targets_list_markup(), parse_mode="Markdown")
-
-    elif data == "log_ignore":
-        bot.answer_callback_query(call.id)
-        return
-
-    elif data == "log_sync_all":
-        bot.answer_callback_query(call.id, "🔄 Starting Log Sync...")
-        async def sync_task():
-            try:
-                # Get all collected media that are NOT in media_logs
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    if DATABASE_URL:
-                        c.execute("SELECT pair_id, source_chat_id, source_message_id FROM collected_media WHERE source_message_id NOT IN (SELECT source_message_id FROM media_logs)")
-                    else:
-                        c.execute("SELECT pair_id, source_chat_id, source_message_id FROM collected_media WHERE source_message_id NOT IN (SELECT source_message_id FROM media_logs)")
-                    items = c.fetchall()
-                
-                if not items:
-                    bot.send_message(call.message.chat.id, "✅ All media is already synced.")
-                    return
-                
-                bot.send_message(call.message.chat.id, f"🔄 Syncing `{len(items)}` media items to log targets...")
-                done = 0
-                for pid, sid, smid in items:
-                    try:
-                        msg = await userbot.get_messages(sid, ids=smid)
-                        if msg and msg.media:
-                            await forward_to_log_targets(userbot, msg, smid)
-                            done += 1
-                        if done % 10 == 0: await asyncio.sleep(1)
-                    except: continue
-                
-                bot.send_message(call.message.chat.id, f"✅ Sync Complete! Logged `{done}` items.")
-            except Exception as e:
-                bot.send_message(call.message.chat.id, f"❌ Sync Error: {e}")
+        stats = get_logged_media_stats(bot_id)
         
-        asyncio.run_coroutine_threadsafe(sync_task(), loop)
+        # Find username
+        bots = get_log_bots()
+        username = next((b[1] for b in bots if b[2] == bot_id), "Unknown")
+        
+        text = f"🤖 **Log Bot:** @{username}\n\n"
+        text += f"📊 **Stats:**\n"
+        text += f"📦 Total Items: `{stats}`\n\n"
+        text += "_Click Fetch to download a file containing all logged media IDs._"
+        
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=log_bot_view_markup(bot_id), parse_mode="Markdown")
 
-    elif data == "log_extract_start":
-        bot.answer_callback_query(call.id)
-        logs = get_media_logs(limit=1000)
-        if not logs:
-            bot.send_message(call.message.chat.id, "❌ No media logs found.")
+    elif data.startswith("log_bot_fetch_"):
+        bot_id = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "📂 Generating log file...")
+        
+        media = fetch_logged_media(bot_id)
+        if not media:
+            bot.send_message(call.message.chat.id, "❌ No logs found for this bot.")
             return
-        
-        file_content = "Extracted Media File IDs:\n\n"
-        for row in logs:
-            file_content += f"Type: {row[3]} | FileID: {row[2]}\n"
-        
-        with open("media_logs.txt", "w", encoding="utf-8") as f:
+            
+        file_content = f"LOG MEDIA REPORT - BOT ID: {bot_id}\n"
+        file_content += "="*40 + "\n\n"
+        for sid, smid, fid, mtype, cap in media:
+            file_content += f"SOURCE: {sid} | MSG: {smid} | TYPE: {mtype}\n"
+            file_content += f"FILE_ID: {fid}\n"
+            if cap: file_content += f"CAPTION: {cap[:50]}...\n"
+            file_content += "-"*20 + "\n"
+            
+        filename = f"log_media_{bot_id}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(file_content)
+            
+        with open(filename, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"📂 Media Logs for @{bot_id}")
         
-        with open("media_logs.txt", "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption="📥 Extracted Media Logs (Last 1000)")
+        try: os.remove(filename)
+        except: pass
+
+    elif data.startswith("log_bot_delete_confirm_"):
+        bot_id = int(data.split("_")[-1])
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"log_bot_delete_do_{bot_id}"))
+        markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"log_bot_view_{bot_id}"))
+        bot.edit_message_text(f"⚠️ **Delete Log Bot?**\n\nThis will stop the bot and delete all `{get_logged_media_stats(bot_id)}` logged media records from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("log_bot_delete_do_"):
+        bot_id = int(data.split("_")[-1])
+        delete_log_bot(bot_id)
+        # Remove from fleet
+        if bot_id in log_bot_manager.bots:
+            try:
+                log_bot_manager.bots[bot_id].stop_polling()
+                del log_bot_manager.bots[bot_id]
+            except: pass
+            
+        bot.answer_callback_query(call.id, "Log Bot Removed")
+        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
@@ -2005,27 +1860,24 @@ def handle_state_inputs(message):
     text = message.text.strip()
     
     # --- Logging System ---
-    if state == "awaiting_log_target":
+    # --- Log Bot System ---
+    if state == "awaiting_log_bot_token":
         token = text
         admin_states.pop(uid, None)
         bot.send_message(message.chat.id, "⏳ Verifying Log Bot Token...")
         
-        # Verify the token using TeleBot
         try:
             temp_bot = telebot.TeleBot(token)
             bot_info = temp_bot.get_me()
-            t_id = bot_info.id
-            t_name = bot_info.username
-            t_type = "bot"
             
             # Save to DB
-            add_log_target(t_id, t_type, t_name, token)
+            add_log_bot(token, bot_info.username, bot_info.id)
             
-            # Start the bot dynamically
-            setup_log_bot(token)
+            # Start in fleet
+            log_bot_manager.add_bot(token)
             
-            bot.send_message(message.chat.id, f"✅ Log Bot added and started: `@{t_name}`", parse_mode="Markdown")
-            bot.send_message(message.chat.id, "📝 **Log Targets**", reply_markup=log_targets_list_markup(), parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"✅ **Log Bot Added!**\nUsername: @{bot_info.username}\nID: `{bot_info.id}`", parse_mode="Markdown")
+            bot.send_message(message.chat.id, "📜 **Log Bot System**", reply_markup=log_bot_list_markup(), parse_mode="Markdown")
         except Exception as e:
             bot.send_message(message.chat.id, f"❌ Failed to verify Bot Token: {e}")
             
@@ -2186,7 +2038,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     if c.rowcount > 0: 
                         collected += 1
                         # Instantly send to log targets
-                        await forward_to_log_targets(userbot, m, m.id)
+                        await forward_to_log_bots(userbot, m, sid_resolved, m.id)
             
             if limit and collected >= limit: break
             
@@ -2252,7 +2104,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     if c.rowcount > 0: 
                         collected += 1
                         # Instantly send to log targets
-                        await forward_to_log_targets(userbot, m, m.id)
+                        await forward_to_log_bots(userbot, m, sid, m.id)
             
             if scanned % 20 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -2366,69 +2218,45 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None, limit=0, interval=3.5):
-    """Robust extraction with stop control and custom interval"""
-    task_key = f"rel_{source_id}_{target_id}"
-    running_tasks[task_key] = True
-    
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log_target_id=None):
     try:
-        raw_id = str(target_id).replace("-100", "").strip("-")
-        target_chat_id = int(f"-100{raw_id}")
-
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
-            sender_bot.send_message(admin_chat_id, f"❌ No media found for source `{source_id}`.")
+            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
             return
             
-        if limit > 0: items = items[:limit]
-            
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Extraction", callback_data=f"log_stop_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"📦 Starting extraction of `{len(items)}` items...", reply_markup=markup)
+        sender_bot.send_message(admin_chat_id, f"📦 Starting release of `{len(items)}` vaulted items...")
         
         sent = 0
-        for smid, file_id, m_type, caption, topic_title in items:
-            if not running_tasks.get(task_key):
-                sender_bot.edit_message_text(f"🛑 **Extraction Stopped!**\nSent: `{sent}` items.", admin_chat_id, status_msg.message_id)
-                break
-                
+        failed = 0
+        
+        for smid, file_id, m_type, caption in items:
             try:
-                dest_topic_id = None
-                if topic_title:
-                    try:
-                        dest_topic_id = await get_or_create_target_topic(userbot, target_chat_id, topic_title)
-                    except: pass
-
-                m_type_l = (m_type or "").lower()
-                if "photo" in m_type_l:
-                    sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
-                elif "video" in m_type_l:
-                    sender_bot.send_video(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
-                elif "text" in m_type_l:
-                    sender_bot.send_message(target_chat_id, caption or "Empty Message", message_thread_id=dest_topic_id)
-                else:
-                    sender_bot.send_document(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
+                m_type_lower = (m_type or "").lower()
+                cap = caption or ""
                 
+                if m_type == "Text":
+                    sender_bot.send_message(target_id, cap or " (Empty Text Message) ")
+                elif "photo" in m_type_lower:
+                    sender_bot.send_photo(target_id, file_id, caption=cap)
+                elif "video" in m_type_lower:
+                    sender_bot.send_video(target_id, file_id, caption=cap)
+                else:
+                    sender_bot.send_document(target_id, file_id, caption=cap)
+                    
                 sent += 1
-                await asyncio.sleep(interval) 
+            except Exception as item_err:
+                logger.error(f"Vault Release item error: {item_err}")
+                failed += 1
                 
-            except telebot.apihelper.ApiTelegramException as e:
-                if e.error_code == 429:
-                    retry_after = e.result_json.get('parameters', {}).get('retry_after', 30)
-                    logger.warning(f"🕒 Rate limited! Sleeping for {retry_after}s...")
-                    await asyncio.sleep(retry_after + 5)
-                elif "wrong file identifier" in str(e):
-                    logger.error(f"❌ Skipping bad File ID: {file_id[:15]}...")
-                else:
-                    logger.error(f"⚠️ Extraction error: {e}")
-            except Exception as e:
-                logger.error(f"⚠️ Unexpected error: {e}")
-                
-        sender_bot.send_message(admin_chat_id, f"✅ **Extraction Done**\nSent: `{sent}` items.")
+            # Rate limit protection (Telegram Bot API allows ~20 msgs/minute to a single chat)
+            await asyncio.sleep(3)
+            
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete**\n\n📤 Successfully Sent: `{sent}`\n❌ Failed: `{failed}`\n\n(Failures usually mean the bot is not an admin in the target chat).", parse_mode="Markdown")
+        
     except Exception as e:
-        logger.error(f"Global Extraction Error: {e}")
-    finally:
-        running_tasks.pop(task_key, None)
+        logger.error(f"Global Vault Release Error: {e}")
+        sender_bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
 
 # -----------------------------
 # Watchdog
@@ -2515,7 +2343,14 @@ from flask import Flask, request
 app = Flask(__name__)
 @app.route("/")
 def health():
-    log_action("keep_alive", "PULSE", f"Ping received from {request.remote_addr}")
+    # Auto-detect URL from the first request
+    if not get_setting("detected_url"):
+        # We assume https because Render/Railway use it
+        protocol = "https" if request.is_secure or "https" in request.url_root else "http"
+        detected = f"{protocol}://{request.host}"
+        set_setting("detected_url", detected)
+        logger.info(f"KEEP_ALIVE: Auto-detected and SAVED public URL: {detected}")
+    
     return "Userbot v2 Running", 200
 
 def run_web():
@@ -2538,221 +2373,114 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 # -----------------------------
-# Secondary Log Bot Fleet Manager
+# Log Bot System (Fleet Manager)
 # -----------------------------
-log_bot_states = {} # { bot_id: { user_id: { source_id: 123 } } }
+class LogBotManager:
+    def __init__(self):
+        self.bots = {} # { bot_id: telebot_instance }
+        self.states = {} # { bot_id: { user_id: { state_data } } }
 
-def setup_log_bot(token):
-    if not token: return
-    if token in active_log_bots:
-        logger.info(f"ℹ️ Bot token already active, skipping setup.")
-        return
-    
-    active_log_bots.add(token)
-    log_bot = telebot.TeleBot(token)
-    try:
-        bot_info = log_bot.get_me()
-        bot_id = bot_info.id
-    except: return
-
-    @log_bot.message_handler(commands=['start'])
-    def log_cmd_start(message):
-        if message.from_user.id != ADMIN_ID: return
-        
-        stats = get_log_bot_stats(bot_id)
-        text = "🤖 **Secondary Main Bot (Vault Manager) Online**\n\n"
-        text += "📊 **Vault Storage Stats:**\n"
-        
-        total = 0
-        if not stats:
-            text += "_No media vaulted yet._\n"
-        else:
-            for sid, title, count in stats:
-                text += f"📁 `{title}` — `{count}` items\n"
-                total += count
-            
-        text += f"\n📦 **Total Vaulted:** `{total}` items\n\n"
-        text += "Use `/extract [id]` to pull specific media, or use the button below to release logs to a new target."
-        
-        markup = InlineKeyboardMarkup()
-        if stats:
-            markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
-            
-        log_bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
-        
-    @log_bot.message_handler(commands=['extract'])
-    def log_cmd_extract(message):
-        if message.from_user.id != ADMIN_ID: return
-        try:
-            args = message.text.split()
-            if len(args) < 2: 
-                return log_bot.reply_to(message, "💡 **Usage:** `/extract [message_id]`\n\nFind the ID in your collected logs.", parse_mode="Markdown")
-            
-            smid = args[1]
-            with db_conn() as conn:
-                c = conn.cursor()
-                # Ensure we only fetch files vaulted in THIS specific bot's chat
-                c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s AND log_target_id = %s LIMIT 1", (smid, bot_id))
-                res = c.fetchone()
-            
-            if res:
-                file_id, m_type = res
-                m_type = m_type.lower()
-                
-                log_bot.send_chat_action(message.chat.id, 'upload_document')
-                caption = f"✅ **Extracted from My Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
-                
-                if "photo" in m_type:
-                    log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-                elif "video" in m_type:
-                    log_bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-                else:
-                    log_bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-            else:
-                log_bot.reply_to(message, "❌ No record found in my vault for this ID.")
-        except Exception as e:
-            log_bot.reply_to(message, f"❌ Extraction Error: {e}")
-
-    @log_bot.callback_query_handler(func=lambda call: True)
-    def log_handle_callbacks(call):
-        uid = call.from_user.id
-        if uid != ADMIN_ID: return
-        data = call.data
-        
-        if bot_id not in log_bot_states: log_bot_states[bot_id] = {}
-        if uid not in log_bot_states[bot_id]: log_bot_states[bot_id][uid] = {}
-        
-        if data == "log_send_main":
-            log_bot.answer_callback_query(call.id)
-            stats = get_log_bot_stats(bot_id)
-            markup = InlineKeyboardMarkup(row_width=1)
-            for sid, title, count in stats:
-                markup.add(InlineKeyboardButton(f"📁 {title} ({count})", callback_data=f"log_send_src_{sid}"))
-            markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_dash"))
-            log_bot.edit_message_text("📤 **Select Source Group**\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            
-        elif data == "log_dash":
-            log_bot.answer_callback_query(call.id)
-            # Re-generate start dashboard
-            stats = get_log_bot_stats(bot_id)
-            text = "🤖 **Secondary Main Bot (Vault Manager) Online**\n\n📊 **Vault Storage Stats:**\n"
-            total = 0
-            for sid, title, count in stats:
-                text += f"📁 `{title}` — `{count}` items\n"
-                total += count
-            text += f"\n📦 **Total Vaulted:** `{total}` items\n"
-            markup = InlineKeyboardMarkup()
-            if stats: markup.add(InlineKeyboardButton("📤 Send Log", callback_data="log_send_main"))
-            log_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-        elif data.startswith("log_send_src_"):
-            log_bot.answer_callback_query(call.id)
-            sid = int(data.split("_")[-1])
-            log_bot_states[bot_id][uid]["source_id"] = sid
-            
-            async def show_tgt():
-                markup = await get_chat_selection_markup("log_send_tgt", 0)
-                log_bot.edit_message_text("🎯 **Select Target Chat**\nChoose where to release this media:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(show_tgt(), loop)
-
-        elif data.startswith("log_send_tgt_"):
-            log_bot.answer_callback_query(call.id)
-            parts = data.split("_")
-            if parts[3] == "page":
-                page = int(parts[4])
-                async def update_tgt():
-                    markup = await get_chat_selection_markup("log_send_tgt", page)
-                    if markup: log_bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-                asyncio.run_coroutine_threadsafe(update_tgt(), loop)
-            else:
-                tid = int(parts[3])
-                log_bot_states[bot_id][uid]["target_id"] = tid
-                
-                # Show Settings Menu (Limit & Interval)
-                state = log_bot_states[bot_id][uid]
-                state["limit"] = 100
-                state["interval"] = 3.5
-                
-                def show_settings():
-                    markup = InlineKeyboardMarkup(row_width=2)
-                    # Limit Buttons
-                    markup.row(InlineKeyboardButton("📦 Limit: 50", callback_data="log_set_lim_50"),
-                               InlineKeyboardButton("📦 Limit: 200", callback_data="log_set_lim_200"))
-                    markup.row(InlineKeyboardButton("📦 Limit: ALL", callback_data="log_set_lim_0"))
-                    # Interval Buttons
-                    markup.row(InlineKeyboardButton("⏱️ 1.5s Delay", callback_data="log_set_int_1.5"),
-                               InlineKeyboardButton("⏱️ 3.5s Delay", callback_data="log_set_int_3.5"),
-                               InlineKeyboardButton("⏱️ 5.0s Delay", callback_data="log_set_int_5.0"))
-                    
-                    markup.row(InlineKeyboardButton("🚀 START EXTRACTION", callback_data="log_start_final"))
-                    markup.row(InlineKeyboardButton("🔙 Back", callback_data=f"log_send_src_{state.get('source_id')}"))
-                    
-                    text = (f"⚙️ **Extraction Settings**\n\n"
-                            f"📁 Source: `{state.get('source_id')}`\n"
-                            f"🎯 Target: `{state.get('target_id')}`\n"
-                            f"🔢 Limit: `{state['limit'] if state['limit'] > 0 else 'All'}`\n"
-                            f"⏳ Interval: `{state['interval']}s`\n\n"
-                            f"Select your preferences before starting.")
-                    log_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-                show_settings()
-
-        elif data.startswith("log_set_lim_"):
-            log_bot.answer_callback_query(call.id)
-            log_bot_states[bot_id][uid]["limit"] = int(data.split("_")[-1])
-            # Re-trigger settings menu logic here or simplified:
-            log_bot.send_message(call.message.chat.id, f"✅ Limit set to {log_bot_states[bot_id][uid]['limit'] if log_bot_states[bot_id][uid]['limit'] > 0 else 'All'}")
-
-        elif data.startswith("log_set_int_"):
-            log_bot.answer_callback_query(call.id)
-            log_bot_states[bot_id][uid]["interval"] = float(data.split("_")[-1])
-            log_bot.send_message(call.message.chat.id, f"✅ Interval set to {log_bot_states[bot_id][uid]['interval']}s")
-
-        elif data == "log_start_final":
-            log_bot.answer_callback_query(call.id)
-            state = log_bot_states[bot_id][uid]
-            sid = state.get("source_id")
-            tid = state.get("target_id")
-            lim = state.get("limit", 100)
-            inv = state.get("interval", 3.5)
-            
-            if not (sid and tid):
-                log_bot.send_message(call.message.chat.id, "❌ Error: Selection lost. Please start over.")
-                return
-            
-            log_bot.edit_message_text(f"🚀 **Vault Release Started**\n\nTarget: `{tid}`\nLimit: `{lim}` | Delay: `{inv}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id, lim, inv), loop)
-
-        elif data.startswith("log_stop_rel_"):
-            log_bot.answer_callback_query(call.id)
-            task_key = data.replace("log_stop_", "")
-            running_tasks[task_key] = False
-            log_bot.edit_message_text("🛑 **Extraction Stopping...**", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-
-    @log_bot.message_handler(func=lambda m: True)
-    def log_auto_cleanup(message):
-        """Auto-deletes messages in the Log Bot chat after 15 seconds to keep it clean"""
-        def delete_task():
-            time.sleep(15)
-            try: log_bot.delete_message(message.chat.id, message.message_id)
-            except: pass
-        threading.Thread(target=delete_task, daemon=True).start()
-
-    def run_polling():
-        while True:
+    def start_all(self):
+        logger.info("📡 Initializing Log Bot Fleet...")
+        bots = get_log_bots()
+        for token, username, bot_id in bots:
             try:
-                # SERVER-SIDE CLEANUP
-                try:
-                    log_bot.delete_webhook(drop_pending_updates=True)
-                    time.sleep(2) # Give Telegram time to breathe
-                except: pass
-                
-                logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
-                log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+                self.add_bot(token)
             except Exception as e:
-                logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
-                time.sleep(30)
+                logger.error(f"Failed to start Log Bot {username}: {e}")
+
+    def add_bot(self, token):
+        new_bot = telebot.TeleBot(token)
+        bot_info = new_bot.get_me()
+        bot_id = bot_info.id
+        
+        if bot_id in self.bots:
+            return bot_id
+            
+        self.bots[bot_id] = new_bot
+        self._setup_handlers(new_bot, bot_id)
+        
+        # Start polling in a separate thread
+        def run_polling():
+            while True:
+                try:
+                    logger.info(f"🚀 Log Bot @{bot_info.username} started polling.")
+                    new_bot.delete_webhook(drop_pending_updates=True)
+                    new_bot.infinity_polling(skip_pending=True, timeout=60)
+                except Exception as e:
+                    logger.error(f"Log Bot @{bot_info.username} crashed: {e}")
+                    time.sleep(10)
+        
+        threading.Thread(target=run_polling, daemon=True).start()
+        return bot_id
+
+    def _setup_handlers(self, bot_instance, bot_id):
+        @bot_instance.message_handler(commands=['start'])
+        def cmd_start(message):
+            if message.from_user.id != ADMIN_ID: return
+            count = get_logged_media_stats(bot_id)
+            text = f"🤖 **Log Bot Active**\n\n"
+            text += f"📊 **Vault Stats:**\n"
+            text += f"📦 Total Vaulted: `{count}` items\n\n"
+            text += "I am automatically logging all media forwarded to me by the main userbot."
+            bot_instance.send_message(message.chat.id, text, parse_mode="Markdown")
+
+        @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
+        def handle_logging(message):
+            # This is the core logging logic. When userbot sends/forwards here, we save it.
+            try:
+                m_type = "document"
+                file_id = None
+                caption = message.caption or ""
                 
-    threading.Thread(target=run_polling, daemon=True).start()
+                if message.photo:
+                    m_type = "photo"
+                    file_id = message.photo[-1].file_id
+                elif message.video:
+                    m_type = "video"
+                    file_id = message.video.file_id
+                elif message.document:
+                    m_type = "document"
+                    file_id = message.document.file_id
+                elif message.audio:
+                    m_type = "audio"
+                    file_id = message.audio.file_id
+                elif message.animation:
+                    m_type = "animation"
+                    file_id = message.animation.file_id
+                elif message.sticker:
+                    m_type = "sticker"
+                    file_id = message.sticker.file_id
+                
+                if file_id:
+                    # We need to identify which source chat/msg this came from.
+                    # Usually, we'd encode this in the caption or just log it.
+                    # For now, let's look for a pattern in the caption if the userbot adds it,
+                    # or just log it with 0/0 if unknown.
+                    # The plan says: "extract the file_id, media_type, and caption".
+                    # To map back to source, the userbot should ideally send this info.
+                    
+                    source_chat_id = 0
+                    source_msg_id = 0
+                    
+                    # Check if userbot included source info in caption (e.g. "SID: 123 | MID: 456")
+                    if caption and "SID:" in caption and "MID:" in caption:
+                        try:
+                            parts = caption.split("|")
+                            source_chat_id = int(parts[0].replace("SID:", "").strip())
+                            source_msg_id = int(parts[1].split("\n")[0].replace("MID:", "").strip())
+                            # Clean up the caption for storage
+                            if "\n" in caption:
+                                caption = caption.split("\n", 1)[1]
+                            else:
+                                caption = ""
+                        except: pass
+                    
+                    save_logged_media(bot_id, source_chat_id, source_msg_id, file_id, m_type, caption)
+            except Exception as e:
+                logger.error(f"Logging Error on Bot {bot_id}: {e}")
+
+log_bot_manager = LogBotManager()
 
 # -----------------------------
 # Main Loop
@@ -2772,10 +2500,7 @@ async def main():
 
     # Boot all saved Log Bots
     try:
-        targets = get_log_targets()
-        for row in targets:
-            if len(row) > 4 and row[4]: # bot_token
-                setup_log_bot(row[4])
+        log_bot_manager.start_all()
     except Exception as e:
         logger.error(f"Error booting log bots: {e}")
 
@@ -2800,13 +2525,14 @@ async def main():
     def run_polling():
         while True:
             try:
-                # SERVER-SIDE CLEANUP
+                logger.info("🚀 Starting Admin Bot polling...")
+                # SERVER-SIDE CLEANUP: Flush the getUpdates queue before starting
                 try:
                     bot.delete_webhook(drop_pending_updates=True)
-                    time.sleep(2)
+                    bot.get_updates(offset=-1, timeout=1)
                 except: pass
                 
-                logger.info("🚀 Starting Admin Bot polling...")
+                time.sleep(15) # Longer delay for Render environment stability
                 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
                 logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
