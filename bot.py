@@ -704,42 +704,52 @@ def stop_task(task_key):
         return True
     return False
 
-async def run_vault_release(bot_instance, chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None):
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None):
     """Releases vaulted media using the Userbot for forwarding."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
-        bot_instance.send_message(chat_id, "⚠️ This release task is already running!")
+        sender_bot.send_message(admin_chat_id, "⚠️ This release task is already running!")
         return
 
     running_tasks[task_key] = True
-    status_msg = bot_instance.send_message(chat_id, "🚀 **Initializing Engine...**\nStarting message transfer via Userbot engine...", parse_mode="Markdown")
     
     try:
         # Get items to release
-        items = get_vaulted_media_for_source(source_id, bot_id=log_target_id, limit=limit)
+        items = get_vaulted_media_for_source(source_id, bot_id=log_target_id)
         if not items:
-            bot_instance.send_message(chat_id, "❌ No vaulted items found for this source.")
+            sender_bot.send_message(admin_chat_id, "❌ No vaulted items found for this source.")
             return
 
-        total = len(items)
+        # Apply the limit if one was provided
+        if limit and isinstance(limit, int):
+            items = items[:limit]
+
+        total_to_send = len(items)
         success = 0
+        failed = 0
         
         # Stop button markup
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
+        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Starting batch transfer...**\nProcessing `{total_to_send}` items via Log Bot engine.", reply_markup=stop_markup, parse_mode="Markdown")
 
         for i, item in enumerate(items):
             if task_key not in running_tasks:
-                bot_instance.send_message(chat_id, "🛑 **Release Stopped** by user.")
+                sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
                 
-            source_msg_id, file_id, m_type, caption, log_msg_id, l_bot_id = item
+            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id = item
             
             try:
                 # 1. Forward from Log Bot using Userbot
-                if log_msg_id is None or l_bot_id is None:
+                if log_msg_id is None or bot_id is None:
                     raise ValueError("Missing logging IDs for Userbot forwarding")
                 
-                await userbot.forward_messages(int(target_id), int(log_msg_id), int(l_bot_id))
+                log_bot_peer = await userbot.get_input_entity(int(bot_id))
+                await userbot.forward_messages(
+                    entity=int(target_id),
+                    messages=int(log_msg_id),
+                    from_peer=log_bot_peer
+                )
                 success += 1
             except Exception as e:
                 logger.error(f"Vault Release item error (Userbot): {e}")
@@ -747,28 +757,31 @@ async def run_vault_release(bot_instance, chat_id, source_id, target_id, interva
                 try:
                     if not file_id:
                         logger.warning(f"Skipping item {source_msg_id}: No file_id found.")
+                        failed += 1
                         continue
                         
-                    if m_type == "photo": bot_instance.send_photo(target_id, file_id, caption=caption)
-                    elif m_type == "video": bot_instance.send_video(target_id, file_id, caption=caption)
-                    elif m_type == "document": bot_instance.send_document(target_id, file_id, caption=caption)
-                    elif m_type == "audio": bot_instance.send_audio(target_id, file_id, caption=caption)
-                    elif m_type == "animation": bot_instance.send_animation(target_id, file_id, caption=caption)
-                    elif m_type == "sticker": bot_instance.send_sticker(target_id, file_id)
+                    if m_type == "photo": sender_bot.send_photo(target_id, file_id, caption=caption)
+                    elif m_type == "video": sender_bot.send_video(target_id, file_id, caption=caption)
+                    elif m_type == "document": sender_bot.send_document(target_id, file_id, caption=caption)
+                    elif m_type == "audio": sender_bot.send_audio(target_id, file_id, caption=caption)
+                    elif m_type == "animation": sender_bot.send_animation(target_id, file_id, caption=caption)
+                    elif m_type == "sticker": sender_bot.send_sticker(target_id, file_id)
                     success += 1
                 except Exception as e2:
                     logger.error(f"Vault Release fallback error (Bot API): {e2}")
+                    failed += 1
 
             # Status Update every 5 items
-            if (i + 1) % 5 == 0 or (i + 1) == total:
-                bot_instance.edit_message_text(f"📊 **Release Status:** `{i+1}/{total}`\nSuccess: `{success}`", chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
+            if (i + 1) % 5 == 0 or (i + 1) == total_to_send:
+                try: sender_bot.edit_message_text(f"🚀 **Transferring...**\nProgress: `{i+1}/{total_to_send}`\nSuccess: `{success}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
+                except: pass
 
             await asyncio.sleep(interval)
             
-        bot_instance.send_message(chat_id, f"✅ **Vault Release Complete!**\nTotal: `{total}`\nSuccessful: `{success}`")
+        sender_bot.send_message(admin_chat_id, f"✅ **Batch Transfer Complete**\nSent: `{success}`\nFailed: `{failed}`", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Global Release Error: {e}")
-        bot_instance.send_message(chat_id, f"❌ Engine Error: {e}")
+        sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
 
@@ -3148,12 +3161,17 @@ class LogBotManager:
                     source_cid = login_data[uid]["dump_sid"]
                     admin_states.pop(f"lb_{bot_id}_{uid}", None)
                     
-                    bot_instance.send_message(message.chat.id, f"🚀 **Log Bot starting transfer...**\nTarget: `{target_cid}`\nLimit: `{count}`")
-                    
-                    # Start the background task (using existing run_vault_release with a limit)
-                    # We might need to update run_vault_release to support a limit
+                    # Start the background task
                     asyncio.run_coroutine_threadsafe(
-                        run_vault_release(bot_instance, message.chat.id, source_cid, target_cid, interval=2.0, limit=count), 
+                        run_vault_release(
+                            sender_bot=bot_instance, 
+                            admin_chat_id=message.chat.id, 
+                            source_id=source_cid, 
+                            target_id=target_cid, 
+                            interval=2.0, 
+                            log_target_id=bot_id,
+                            limit=count
+                        ), 
                         loop
                     )
                 except Exception as e:
