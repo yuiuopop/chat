@@ -1022,22 +1022,28 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         vaulted_result = await client.send_message(target, file=media_to_send, message=album_text)
         log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
-        # 4. INDEXING FIX (Targeting core Photo/Document parent)
+        # 4. Final Precision Indexing Fix
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+        
+        # We iterate through the RESULT of the send (the vaulted messages)
         for i, v_msg in enumerate(vaulted_list):
             try:
+                # CRITICAL: Extract the actual Parent Media Object
                 inner = None
-                if isinstance(v_msg.media, types.MessageMediaPhoto): inner = v_msg.media.photo
-                elif isinstance(v_msg.media, types.MessageMediaDocument): inner = v_msg.media.document
+                if isinstance(v_msg.media, types.MessageMediaPhoto):
+                    inner = v_msg.media.photo
+                elif isinstance(v_msg.media, types.MessageMediaDocument):
+                    inner = v_msg.media.document
                 
+                # Verify we have the parent object with access data
                 if inner and hasattr(inner, 'access_hash'):
                     fid = pack_bot_file_id(inner)
-                    # Associate with the original source message ID
+                    # Use the original source message's ID for tracking
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__} for msg {real_sid}")
+                    log_action("vault", "INDEX_SUCCESS", f"Stored msg {real_sid}")
                 else:
-                    # It's a plain text message or non-packable media
+                    # It's a plain text message or non-packable media/thumbnail
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     m_type = type(v_msg.media).__name__ if v_msg.media else "Text"
                     save_media_log(real_sid, log_chat_id, None, m_type, source_topic_title)
