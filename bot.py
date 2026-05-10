@@ -1063,7 +1063,12 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                 
                 # Verify we have the parent object with access data
                 if inner and hasattr(inner, 'access_hash'):
-                    fid = pack_bot_file_id(inner)
+                    fid = None
+                    try:
+                        fid = pack_bot_file_id(inner)
+                    except Exception as pack_err:
+                        log_action("vault", "INDEX_WARNING", f"Could not pack File ID: {pack_err}")
+                        
                     # Use the original source message's ID for tracking
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
@@ -1192,8 +1197,8 @@ def setup_automation_handlers(client: TelegramClient):
                 # to prevent duplicate uploads and blocking of the live mirror flow.
 
             # --- MIRRORING (LIVE FORWARD) ---
-            if not tid or not is_mir:
-                return # Stop here if mirroring is disabled or no target set
+            if not tid:
+                return # Stop here if no target set
             
             dest_topic_id = default_t_topic
             
@@ -1223,11 +1228,21 @@ def setup_automation_handlers(client: TelegramClient):
             final_reply_target = dest_topic_id
             
             # Prevent replying to random messages in non-forum groups
+            is_forum = False
             try:
-                tgt_ent = await client.get_entity(tid)
-                if not getattr(tgt_ent, 'forum', False):
-                    final_reply_target = None
-            except: pass
+                # Need to handle potential missing -100 for groups
+                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+                try:
+                    tgt_ent = await client.get_entity(real_tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+                except Exception:
+                    tgt_ent = await client.get_entity(tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+            except Exception:
+                pass
+            
+            if not is_forum:
+                final_reply_target = None
 
             # --- CAPTION SUPPORT ---
             # Search all messages in the grouping to find the one with the text
