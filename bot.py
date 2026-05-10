@@ -2765,12 +2765,94 @@ class LogBotManager:
             except Exception as e:
                 bot_instance.reply_to(message, f"❌ Error retrieving batch: {e}")
 
+        @bot_instance.message_handler(commands=['grouplist'])
+        def cmd_group_list(message):
+            if message.from_user.id != ADMIN_ID: return
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT DISTINCT m.source_chat_id, p.source_title, COUNT(m.id)
+                    FROM log_media m
+                    LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
+                    WHERE m.bot_id = ?
+                    GROUP BY m.source_chat_id
+                """, (bot_id,))
+                groups = c.fetchall()
+
+            if not groups:
+                bot_instance.send_message(message.chat.id, "📭 No media groups found in the vault.")
+                return
+
+            markup = InlineKeyboardMarkup(row_width=1)
+            text = "📂 **Media Vault Groups**\nSelect a group to see details:\n"
+            for sid, title, count in groups:
+                display_title = title if title and title != "None" else f"Unknown Group ({sid})"
+                markup.add(InlineKeyboardButton(f"📁 {display_title} — {count} items", callback_data=f"v_group_stats_{sid}"))
+            bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+        @bot_instance.message_handler(commands=['getbyid'])
+        def fetch_by_group_id(message):
+            if message.from_user.id != ADMIN_ID: return
+            try:
+                args = message.text.split()
+                if len(args) < 2:
+                    bot_instance.reply_to(message, "❌ Usage: `/getbyid [Group_ID] [Count]`\nExample: `/getbyid -100123 10`")
+                    return
+                group_id = int(args[1])
+                count = int(args[2]) if len(args) > 2 and args[2].isdigit() else 5
+                if count > 50: count = 50
+
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"""
+                        SELECT file_id, media_type, caption, log_msg_id, bot_id 
+                        FROM log_media 
+                        WHERE source_chat_id = {p} AND bot_id = {p}
+                        ORDER BY timestamp DESC LIMIT {p}
+                    """, (group_id, bot_id, count))
+                    results = c.fetchall()
+
+                if not results:
+                    bot_instance.reply_to(message, f"🔍 No media found for group ID `{group_id}`.")
+                    return
+
+                bot_instance.send_message(message.chat.id, f"📥 Sending `{len(results)}` items from the group...")
+                for file_id, m_type, caption, log_msg_id, owner_bot_id in reversed(results):
+                    full_caption = f"🆔 ID: `{log_msg_id}`\n\n{caption if caption else ''}"
+                    try:
+                        if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        else: bot_instance.send_document(message.chat.id, file_id, caption=full_caption, parse_mode="Markdown")
+                        time.sleep(0.7)
+                    except Exception as e:
+                        logger.error(f"Group batch error: {e}")
+            except Exception as e:
+                bot_instance.reply_to(message, f"❌ Error: {e}")
+
         @bot_instance.callback_query_handler(func=lambda call: True)
         def handle_log_bot_callbacks(call):
             if call.from_user.id != ADMIN_ID: return
             data = call.data
             uid = call.from_user.id
             
+            if data.startswith("v_group_stats_"):
+                sid = int(data.split("_")[-1])
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = ?", (sid,))
+                    res = c.fetchone()
+                    title = res[0] if res else "Unknown"
+                    c.execute("SELECT COUNT(*) FROM log_media WHERE source_chat_id = ? AND bot_id = ?", (sid, bot_id))
+                    total = c.fetchone()[0]
+                msg = (f"📊 **Group Statistics**\n\n"
+                       f"🏷 **Title:** `{title}`\n"
+                       f"🆔 **ID:** `{sid}`\n"
+                       f"📦 **Total Media:** `{total}`\n\n"
+                       f"💡 To fetch, use: `/getbyid {sid} 20`")
+                bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                return
+
             if data == "lb_vault_main":
                 bot_instance.answer_callback_query(call.id)
                 stats = get_log_bot_stats(bot_id)
