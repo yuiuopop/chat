@@ -1,4 +1,4 @@
-#gimini
+#giminichat
 import os
 import asyncio
 import threading
