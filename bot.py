@@ -2693,6 +2693,36 @@ class LogBotManager:
             
             bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
+        @bot_instance.message_handler(commands=['get'])
+        def fetch_from_vault(message):
+            if message.from_user.id != ADMIN_ID: return
+            try:
+                args = message.text.split()
+                if len(args) < 2:
+                    bot_instance.reply_to(message, "❌ Please provide a Fetch ID. Example: `/get 12345`")
+                    return
+                fetch_id = args[1]
+                
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    p = get_placeholder()
+                    c.execute(f"SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = {p} AND bot_id = {p}", (fetch_id, bot_id))
+                    res = c.fetchone()
+
+                if res:
+                    file_id, m_type, caption = res
+                    bot_instance.send_chat_action(message.chat.id, 'upload_document')
+                    if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=caption)
+                    elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=caption)
+                    elif m_type == "document": bot_instance.send_document(message.chat.id, file_id, caption=caption)
+                    elif m_type == "audio": bot_instance.send_audio(message.chat.id, file_id, caption=caption)
+                    elif m_type == "animation": bot_instance.send_animation(message.chat.id, file_id, caption=caption)
+                    elif m_type == "sticker": bot_instance.send_sticker(message.chat.id, file_id)
+                else:
+                    bot_instance.reply_to(message, "🔍 No media found in vault with that ID.")
+            except Exception as e:
+                bot_instance.reply_to(message, f"❌ Retrieval error: {e}")
+
         @bot_instance.callback_query_handler(func=lambda call: True)
         def handle_log_bot_callbacks(call):
             if call.from_user.id != ADMIN_ID: return
@@ -2847,7 +2877,12 @@ class LogBotManager:
                         except: pass
                     
                     save_logged_media(bot_id, message.message_id, source_chat_id, source_msg_id, file_id, m_type, caption)
+                    
+                    # If it's a direct upload (no source info), send confirmation with Fetch ID
+                    if source_chat_id == 0 and message.from_user.id == ADMIN_ID:
+                        bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n\n📂 Type: `{m_type}`\n🆔 Fetch ID: `{message.message_id}`\n\nUse `/get {message.message_id}` to retrieve this later.")
             except Exception as e:
+                logger.error(f"Log Bot indexing error: {e}")
                 logger.error(f"Logging Error on Bot {bot_id}: {e}")
 
 log_bot_manager = LogBotManager()
