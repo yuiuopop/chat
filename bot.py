@@ -986,18 +986,17 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
         
         log_action("vault", "STARTING", f"Target: {t_name} ({log_chat_id})")
         
-        # 1. Resolve Target
+        # 1. PEER RESOLUTION
         try:
             target = await client.get_input_entity(log_chat_id)
-            log_action("vault", "PEER_RESOLVED", f"Bot {t_name} found in cache.")
         except Exception:
-            log_action("vault", "CACHE_MISS", f"Bot {log_chat_id} not in cache. Resolving...")
+            log_action("vault", "CACHE_MISS", f"Bot {log_chat_id} resolving globally...")
             await client(functions.messages.GetDialogsRequest(
                 offset_date=None, offset_id=0, offset_peer=types.InputPeerEmpty(), limit=20, hash=0
             ))
             target = await client.get_entity(log_chat_id)
 
-        # 2. Get Source Topic Title (Detection logic unchanged)
+        # 2. SOURCE TOPIC DETECTION
         source_topic_title = None
         first_msg = messages[0]
         if first_msg.reply_to:
@@ -1010,35 +1009,33 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                         break
             except: pass
 
-        # 3. Send to Log Bot
-        log_action("vault", "UPLOADING", f"Sending {len(messages)} items...")
+        # 3. SEND NATIVELY (ALBUM FIX)
         album_text = next((m.message for m in messages if m.message), "")
+        # CRITICAL: Extract the actual .media attribute from each message object
+        media_to_send = [m.media for m in messages if m.media]
         
-        vaulted_result = await client.send_message(
-            target, 
-            file=[m.media for m in messages] if isinstance(messages, list) else messages.media,
-            message=album_text
-        )
+        if not media_to_send:
+            log_action("vault", "SKIP", "No media found to upload")
+            return
+
+        log_action("vault", "UPLOADING", f"Sending {len(media_to_send)} items...")
+        vaulted_result = await client.send_message(target, file=media_to_send, message=album_text)
         log_action("vault", "UPLOAD_COMPLETE", f"Telegram accepted files for {t_name}")
             
-        # 4. Final Precision Indexing Fix
+        # 4. INDEXING FIX (Targeting core Photo/Document parent)
         vaulted_list = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
         for i, v_msg in enumerate(vaulted_list):
             try:
-                # CRITICAL: We reach into the .photo or .document attribute
-                # to get the FULL object required for a valid Bot File ID
                 inner = None
-                if isinstance(v_msg.media, types.MessageMediaPhoto):
-                    inner = v_msg.media.photo 
-                elif isinstance(v_msg.media, types.MessageMediaDocument):
-                    inner = v_msg.media.document
+                if isinstance(v_msg.media, types.MessageMediaPhoto): inner = v_msg.media.photo
+                elif isinstance(v_msg.media, types.MessageMediaDocument): inner = v_msg.media.document
                 
                 if inner and hasattr(inner, 'access_hash'):
                     fid = pack_bot_file_id(inner)
-                    # Match back to original source message ID
+                    # Associate with the original source message ID
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
                     save_media_log(real_sid, log_chat_id, fid, type(v_msg.media).__name__, source_topic_title)
-                    log_action("vault", "INDEX_SUCCESS", f"New ID generated for msg {real_sid}")
+                    log_action("vault", "INDEX_SUCCESS", f"Stored {type(v_msg.media).__name__} for msg {real_sid}")
                 else:
                     # It's a plain text message or non-packable media
                     real_sid = messages[i].id if i < len(messages) else source_msg_id
@@ -1046,7 +1043,7 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
                     save_media_log(real_sid, log_chat_id, None, m_type, source_topic_title)
                     log_action("vault", "INDEX_SUCCESS", f"Stored {m_type} for msg {real_sid}")
             except Exception as e:
-                logger.error(f"⚠️ Indexing failed: {e}")
+                log_action("vault", "INDEX_ERROR", f"Item {i} failed: {e}")
                 
         # --- Session Tracking Logic (Unchanged) ---
         with session_lock:
@@ -2656,13 +2653,13 @@ def setup_log_bot(token):
     def run_polling():
         while True:
             try:
-                logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
-                # Clear updates to avoid 409 Conflict
+                # SERVER-SIDE CLEANUP
                 try:
                     log_bot.delete_webhook(drop_pending_updates=True)
+                    time.sleep(2) # Give Telegram time to breathe
                 except: pass
                 
-                time.sleep(10) # 10s wait to ensure old instance is fully cleared
+                logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
                 log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
                 logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
@@ -2716,14 +2713,13 @@ async def main():
     def run_polling():
         while True:
             try:
-                logger.info("🚀 Starting Admin Bot polling...")
-                # SERVER-SIDE CLEANUP: Flush the getUpdates queue before starting
+                # SERVER-SIDE CLEANUP
                 try:
                     bot.delete_webhook(drop_pending_updates=True)
-                    bot.get_updates(offset=-1, timeout=1)
+                    time.sleep(2)
                 except: pass
                 
-                time.sleep(15) # Longer delay for Render environment stability
+                logger.info("🚀 Starting Admin Bot polling...")
                 bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
                 logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
