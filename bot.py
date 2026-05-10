@@ -113,6 +113,34 @@ def db_conn():
 
 USING_POSTGRES = False
 
+# Session Tracking for Summaries
+# {source_id: {"count": 0, "start": datetime, "last": datetime, "timer": Timer, "titles": set()}}
+vault_sessions = {}
+session_lock = threading.Lock()
+
+def finalize_session(sid):
+    """Sends the collection summary to admin after inactivity"""
+    with session_lock:
+        sess = vault_sessions.pop(sid, None)
+        if not sess: return
+        
+    count = sess["count"]
+    start_str = sess["start"].strftime("%H:%M:%S")
+    end_str = sess["last"].strftime("%H:%M:%S")
+    titles = ", ".join(sess["titles"])
+    
+    summary = (
+        f"📊 **Collection Cycle Complete**\n\n"
+        f"📂 **Sources:** `{titles}`\n"
+        f"📦 **Items Vaulted:** `{count}`\n"
+        f"⏱️ **Duration:** `{start_str}` to `{end_str}`\n"
+        f"✨ *Vault is now idle.*"
+    )
+    try:
+        bot.send_message(ADMIN_ID, summary, parse_mode="Markdown")
+        log_action("session", "FINALIZED", f"Source: {sid} | Items: {count}")
+    except: pass
+
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
 album_cache = {}
@@ -1032,6 +1060,28 @@ async def vault_media(client, messages, log_chat_id, source_msg_id, t_name):
             except Exception as e:
                 log_action("vault", "INDEX_ERROR", str(e))
                 
+        # --- Session Tracking Logic ---
+        with session_lock:
+            sid = first_msg.chat_id
+            now = datetime.now()
+            if sid not in vault_sessions:
+                vault_sessions[sid] = {
+                    "count": 0, "start": now, "last": now, "timer": None, "titles": set()
+                }
+                log_action("session", "STARTED", f"New cycle for {sid}")
+            
+            sess = vault_sessions[sid]
+            sess["count"] += len(messages)
+            sess["last"] = now
+            if t_name: sess["titles"].add(t_name)
+            
+            # Reset the 5-minute timer (300 seconds)
+            if sess["timer"]: sess["timer"].cancel()
+            t = threading.Timer(300, finalize_session, args=[sid])
+            sess["timer"] = t
+            t.start()
+        # -----------------------------
+
         logger.info(f"✅ VAULT SUCCESS: Sent to {t_name} (Topic: {source_topic_title or 'General'})")
     except Exception as e:
         log_action("vault", "CRITICAL_FAILURE", str(e))
@@ -2507,6 +2557,15 @@ def setup_log_bot(token):
                 
                 log_bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nTarget: `{tid}`\nThis bot is now broadcasting its vaulted media...", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
                 asyncio.run_coroutine_threadsafe(run_vault_release(log_bot, call.message.chat.id, sid, tid, bot_id), loop)
+
+    @log_bot.message_handler(func=lambda m: True)
+    def log_auto_cleanup(message):
+        """Auto-deletes messages in the Log Bot chat after 15 seconds to keep it clean"""
+        def delete_task():
+            time.sleep(15)
+            try: log_bot.delete_message(message.chat.id, message.message_id)
+            except: pass
+        threading.Thread(target=delete_task, daemon=True).start()
 
     def run_polling():
         while True:
