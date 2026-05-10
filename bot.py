@@ -2382,8 +2382,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
     running_tasks[task_key] = True
     
     try:
-        raw_id = str(target_id).replace("-100", "").strip("-")
-        target_chat_id = int(f"-100{raw_id}")
+        target_chat_id = int(target_id)
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
