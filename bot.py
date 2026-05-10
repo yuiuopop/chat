@@ -618,6 +618,12 @@ def delete_log_bot(bot_id):
         c.execute(f"DELETE FROM log_bots WHERE bot_id = {p}", (bot_id,))
         c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
 
+def clear_bot_logs(bot_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
+
 def save_logged_media(bot_id, source_chat_id, source_msg_id, file_id, media_type, caption):
     with db_conn() as conn:
         c = conn.cursor()
@@ -2515,12 +2521,117 @@ class LogBotManager:
         @bot_instance.message_handler(commands=['start'])
         def cmd_start(message):
             if message.from_user.id != ADMIN_ID: return
+            
+            # First, send a dummy message to clear any old reply keyboards from previous uses of this bot token
+            msg_to_del = bot_instance.send_message(message.chat.id, "🔄 Connecting...", reply_markup=ReplyKeyboardRemove())
+            try: bot_instance.delete_message(message.chat.id, msg_to_del.message_id)
+            except: pass
+            
             count = get_logged_media_stats(bot_id)
             text = f"🤖 **Log Bot Active**\n\n"
             text += f"📊 **Vault Stats:**\n"
             text += f"📦 Total Vaulted: `{count}` items\n\n"
             text += "I am automatically logging all media forwarded to me by the main userbot."
-            bot_instance.send_message(message.chat.id, text, parse_mode="Markdown")
+            
+            # Try to get the main bot's username to provide a link back
+            main_bot_username = bot.get_me().username
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("📤 Send Log", callback_data="lb_vault_main"),
+                InlineKeyboardButton("📥 Fetch Logs", callback_data="lb_fetch")
+            )
+            markup.add(InlineKeyboardButton("🗑 Clear All Logs", callback_data="lb_clear_confirm"))
+            markup.add(InlineKeyboardButton("🔙 Back to Main Admin Panel", url=f"https://t.me/{main_bot_username}"))
+            
+            bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+        @bot_instance.callback_query_handler(func=lambda call: True)
+        def handle_log_bot_callbacks(call):
+            if call.from_user.id != ADMIN_ID: return
+            data = call.data
+            uid = call.from_user.id
+            
+            if data == "lb_vault_main":
+                bot_instance.answer_callback_query(call.id)
+                stats = get_log_bot_stats(bot_id)
+                if not stats:
+                    bot_instance.send_message(call.message.chat.id, "❌ No vaulted media found for this bot.")
+                    return
+                    
+                markup = InlineKeyboardMarkup(row_width=1)
+                for sid, title, count in stats:
+                    markup.add(InlineKeyboardButton(f"📁 {title} ({count})", callback_data=f"lb_vault_src_{sid}"))
+                markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="lb_cancel"))
+                
+                bot_instance.edit_message_text("🚀 **Select Source Group**\n\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+            elif data.startswith("lb_vault_src_"):
+                bot_instance.answer_callback_query(call.id)
+                sid = int(data.split("_")[-1])
+                login_data[uid] = {"vault_source_id": sid}
+                
+                async def show_tgt():
+                    markup = await get_chat_selection_markup("lb_vault_tgt", 0)
+                    bot_instance.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                asyncio.run_coroutine_threadsafe(show_tgt(), loop)
+                
+            elif data.startswith("lb_vault_tgt_"):
+                bot_instance.answer_callback_query(call.id)
+                parts = data.split("_")
+                if parts[3] == "page":
+                    page = int(parts[4])
+                    async def update_tgt_list():
+                        markup = await get_chat_selection_markup("lb_vault_tgt", page)
+                        if markup:
+                            bot_instance.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                    asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
+                else:
+                    tid = int(parts[3])
+                    sid = login_data.get(uid, {}).get("vault_source_id")
+                    if not sid:
+                        bot_instance.send_message(call.message.chat.id, "❌ Session expired. Please start over.")
+                        return
+                    
+                    login_data.pop(uid, None)
+                    bot_instance.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                    # Pass bot_instance as the sender_bot
+                    asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid), loop)
+                    
+            elif data == "lb_cancel":
+                bot_instance.answer_callback_query(call.id)
+                # Redirect back to start
+                cmd_start(call.message)
+
+            elif data == "lb_fetch":
+                bot_instance.answer_callback_query(call.id, "📂 Generating log file...")
+                media = fetch_logged_media(bot_id)
+                if not media:
+                    bot_instance.send_message(call.message.chat.id, "❌ No logs found.")
+                    return
+                
+                content = f"LOG MEDIA REPORT - BOT ID: {bot_id}\n" + "="*40 + "\n\n"
+                for sid, smid, fid, mtype, cap in media:
+                    content += f"SOURCE: {sid} | MSG: {smid} | TYPE: {mtype}\nFILE_ID: {fid}\n"
+                    if cap: content += f"CAPTION: {cap[:50]}...\n"
+                    content += "-"*20 + "\n"
+                
+                filename = f"log_media_{bot_id}.txt"
+                with open(filename, "w", encoding="utf-8") as f: f.write(content)
+                with open(filename, "rb") as f:
+                    bot_instance.send_document(call.message.chat.id, f, caption=f"📂 Logs for @{bot_instance.get_me().username}")
+                os.remove(filename)
+
+            elif data == "lb_clear_confirm":
+                bot_instance.answer_callback_query(call.id)
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("✅ Yes, Delete Everything", callback_data="lb_clear_do"))
+                markup.add(InlineKeyboardButton("❌ Cancel", callback_data="lb_cancel"))
+                bot_instance.edit_message_text("⚠️ **Wipe All Logs?**\n\nThis will delete all media records for this bot from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+            elif data == "lb_clear_do":
+                clear_bot_logs(bot_id)
+                bot_instance.answer_callback_query(call.id, "💥 Vault Cleared!")
+                cmd_start(call.message)
 
         @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
         def handle_logging(message):
