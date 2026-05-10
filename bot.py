@@ -673,13 +673,19 @@ async def run_vault_release(bot_instance, chat_id, source_id, target_id, interva
             
             try:
                 # 1. Forward from Log Bot using Userbot
-                # Userbot needs to forward message with ID log_msg_id from the chat with Log Bot
-                await userbot.forward_messages(int(target_id), log_msg_id, int(l_bot_id))
+                if log_msg_id is None or l_bot_id is None:
+                    raise ValueError("Missing logging IDs for Userbot forwarding")
+                
+                await userbot.forward_messages(int(target_id), int(log_msg_id), int(l_bot_id))
                 success += 1
             except Exception as e:
-                logger.error(f"Vault Release item error: {e}")
-                # Fallback: Send directly via Bot API if Userbot fails
+                logger.error(f"Vault Release item error (Userbot): {e}")
+                # Fallback: Send directly via Bot API if Userbot fails or data is missing
                 try:
+                    if not file_id:
+                        logger.warning(f"Skipping item {source_msg_id}: No file_id found.")
+                        continue
+                        
                     if m_type == "photo": bot_instance.send_photo(target_id, file_id, caption=caption)
                     elif m_type == "video": bot_instance.send_video(target_id, file_id, caption=caption)
                     elif m_type == "document": bot_instance.send_document(target_id, file_id, caption=caption)
@@ -688,7 +694,7 @@ async def run_vault_release(bot_instance, chat_id, source_id, target_id, interva
                     elif m_type == "sticker": bot_instance.send_sticker(target_id, file_id)
                     success += 1
                 except Exception as e2:
-                    logger.error(f"Vault Release fallback error: {e2}")
+                    logger.error(f"Vault Release fallback error (Bot API): {e2}")
 
             # Status Update every 5 items
             if (i + 1) % 5 == 0 or (i + 1) == total:
