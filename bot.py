@@ -816,7 +816,8 @@ async def get_chat_selection_markup(prefix, page=0):
     if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
     if nav: markup.add(*nav)
     
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
+    cancel_data = "log_dash" if prefix.startswith("log_") else "pairs_main"
+    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=cancel_data))
     return markup
 
 async def get_topic_selection_markup(chat_id, prefix):
@@ -1288,6 +1289,12 @@ def setup_automation_handlers(client: TelegramClient):
                     await asyncio.sleep(4)
                 except Exception as inner_e:
                     err_str = str(inner_e).lower()
+                    
+                    if "reply" in err_str and ("invalid" in err_str or "not found" in err_str):
+                        logger.warning(f"Live Mirror: Invalid reply ID {reply_obj}. Retrying without reply...")
+                        reply_obj = None
+                        continue # Retry immediately
+                        
                     if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
                         logger.info("Live Mirror: Protected chat detected. Falling back to local download...")
                         import os
@@ -1298,21 +1305,31 @@ def setup_automation_handlers(client: TelegramClient):
                                     dl = await client.download_media(m.media)
                                     if dl: downloaded_files.append(dl)
                             if downloaded_files:
-                                if len(downloaded_files) > 1:
-                                    sent_messages = await client.send_message(
-                                        entity=tid, message=album_text, file=downloaded_files,
-                                        reply_to=reply_obj
-                                    )
-                                    if sent_messages and isinstance(sent_messages, list):
-                                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
-                                else:
-                                    sent_msg = await client.send_message(
-                                        entity=tid, message=album_text, file=downloaded_files[0],
-                                        reply_to=reply_obj
-                                    )
-                                    if sent_msg:
-                                        save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                                logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
+                                try:
+                                    if len(downloaded_files) > 1:
+                                        sent_messages = await client.send_message(
+                                            entity=tid, message=album_text, file=downloaded_files,
+                                            reply_to=reply_obj
+                                        )
+                                        if sent_messages and isinstance(sent_messages, list):
+                                            save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                                    else:
+                                        sent_msg = await client.send_message(
+                                            entity=tid, message=album_text, file=downloaded_files[0],
+                                            reply_to=reply_obj
+                                        )
+                                        if sent_msg:
+                                            save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
+                                    logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
+                                except Exception as fallback_e:
+                                    if "reply" in str(fallback_e).lower():
+                                        logger.warning(f"Fallback reply failed, sending without reply.")
+                                        if len(downloaded_files) > 1:
+                                            await client.send_message(entity=tid, message=album_text, file=downloaded_files)
+                                        else:
+                                            await client.send_message(entity=tid, message=album_text, file=downloaded_files[0])
+                                    else:
+                                        logger.error(f"Fallback send failed: {fallback_e}")
                             else:
                                 logger.error("Mirror Fallback: Download failed.")
                         finally:
