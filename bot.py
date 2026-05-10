@@ -816,8 +816,7 @@ async def get_chat_selection_markup(prefix, page=0):
     if end < len(chats): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}_page_{page+1}"))
     if nav: markup.add(*nav)
     
-    cancel_data = "log_dash" if prefix.startswith("log_") else "pairs_main"
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=cancel_data))
+    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="pairs_main"))
     return markup
 
 async def get_topic_selection_markup(chat_id, prefix):
@@ -1254,8 +1253,13 @@ def setup_automation_handlers(client: TelegramClient):
             # --- SEND WITH RETRY LOGIC ---
             retries = 3
             
-            # Use simple integer for reply_to to prevent Telethon type errors
-            reply_obj = int(final_reply_target) if final_reply_target else None
+            # Construct the proper Reply object to prevent ugly reply bubbles in forums
+            reply_obj = None
+            if final_reply_target:
+                reply_obj = InputReplyToMessage(
+                    reply_to_msg_id=int(final_reply_target),
+                    top_msg_id=int(final_reply_target)
+                )
                 
             while retries > 0:
                 try:
@@ -1289,12 +1293,6 @@ def setup_automation_handlers(client: TelegramClient):
                     await asyncio.sleep(4)
                 except Exception as inner_e:
                     err_str = str(inner_e).lower()
-                    
-                    if "reply" in err_str and ("invalid" in err_str or "not found" in err_str):
-                        logger.warning(f"Live Mirror: Invalid reply ID {reply_obj}. Retrying without reply...")
-                        reply_obj = None
-                        continue # Retry immediately
-                        
                     if "protected chat" in err_str or "invalid" in err_str or "restricted" in err_str:
                         logger.info("Live Mirror: Protected chat detected. Falling back to local download...")
                         import os
@@ -1305,31 +1303,21 @@ def setup_automation_handlers(client: TelegramClient):
                                     dl = await client.download_media(m.media)
                                     if dl: downloaded_files.append(dl)
                             if downloaded_files:
-                                try:
-                                    if len(downloaded_files) > 1:
-                                        sent_messages = await client.send_message(
-                                            entity=tid, message=album_text, file=downloaded_files,
-                                            reply_to=reply_obj
-                                        )
-                                        if sent_messages and isinstance(sent_messages, list):
-                                            save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
-                                    else:
-                                        sent_msg = await client.send_message(
-                                            entity=tid, message=album_text, file=downloaded_files[0],
-                                            reply_to=reply_obj
-                                        )
-                                        if sent_msg:
-                                            save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
-                                    logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
-                                except Exception as fallback_e:
-                                    if "reply" in str(fallback_e).lower():
-                                        logger.warning(f"Fallback reply failed, sending without reply.")
-                                        if len(downloaded_files) > 1:
-                                            await client.send_message(entity=tid, message=album_text, file=downloaded_files)
-                                        else:
-                                            await client.send_message(entity=tid, message=album_text, file=downloaded_files[0])
-                                    else:
-                                        logger.error(f"Fallback send failed: {fallback_e}")
+                                if len(downloaded_files) > 1:
+                                    sent_messages = await client.send_message(
+                                        entity=tid, message=album_text, file=downloaded_files,
+                                        reply_to=reply_obj
+                                    )
+                                    if sent_messages and isinstance(sent_messages, list):
+                                        save_message_mapping(sid, first_msg.id, tid, sent_messages[0].id)
+                                else:
+                                    sent_msg = await client.send_message(
+                                        entity=tid, message=album_text, file=downloaded_files[0],
+                                        reply_to=reply_obj
+                                    )
+                                    if sent_msg:
+                                        save_message_mapping(sid, first_msg.id, tid, sent_msg.id)
+                                logger.info(f"🚀 MIRROR FALLBACK SUCCESS: [From: {sid}] -> [To Chat: {tid}]")
                             else:
                                 logger.error("Mirror Fallback: Download failed.")
                         finally:
@@ -2391,13 +2379,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
     running_tasks[task_key] = True
     
     try:
-        def fix_id_for_bot(tid):
-            s = str(tid).strip()
-            if s.startswith("-100") or s.startswith("-"): return int(s)
-            if len(s) >= 10: return int(f"-100{s}")
-            return int(s)
-
-        target_chat_id = fix_id_for_bot(target_id)
+        target_chat_id = int(target_id)
 
         items = get_vaulted_media_for_source(source_id, log_target_id)
         if not items:
@@ -2427,13 +2409,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, log
                 
                 if file_id and str(file_id).startswith("MSG_ID:"):
                     msg_id_val = int(file_id.split(":", 1)[1])
-                    userbot_me = await userbot.get_me()
-                    
-                    # DEBUG LOGGING
-                    if sent == 0:
-                        logger.info(f"DEBUG: Extracting to {target_chat_id} from Userbot DM ({userbot_me.id}) using MSG_ID")
-                    
-                    sender_bot.copy_message(target_chat_id, from_chat_id=userbot_me.id, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
+                    sender_bot.copy_message(target_chat_id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, message_thread_id=dest_topic_id)
                 else:
                     if "photo" in m_type_l:
                         sender_bot.send_photo(target_chat_id, file_id, caption=caption, message_thread_id=dest_topic_id)
@@ -2639,17 +2615,7 @@ def setup_log_bot(token):
                 
                 if file_id and str(file_id).startswith("MSG_ID:"):
                     msg_id_val = int(file_id.split(":", 1)[1])
-                    # Ensure we are copying from the chat between the Log Bot and the Userbot
-                    async def do_copy():
-                        def fix_id_for_bot(tid):
-                            s = str(tid)
-                            if s.startswith("-100") or s.startswith("-"): return int(s)
-                            if len(s) >= 10 and not s.startswith("1"): return int(f"-100{s}")
-                            return int(s)
-                        
-                        ub_me = await userbot.get_me()
-                        log_bot.copy_message(message.chat.id, from_chat_id=ub_me.id, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
-                    asyncio.run_coroutine_threadsafe(do_copy(), loop)
+                    log_bot.copy_message(message.chat.id, from_chat_id=ADMIN_ID, message_id=msg_id_val, caption=caption, parse_mode="Markdown")
                 else:
                     if "photo" in m_type:
                         log_bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
@@ -2791,13 +2757,12 @@ def setup_log_bot(token):
             try:
                 # SERVER-SIDE CLEANUP
                 try:
-                    logger.info(f"🧹 Clearing old Log Bot sessions ({bot_id})...")
                     log_bot.delete_webhook(drop_pending_updates=True)
-                    time.sleep(5) # Increased delay to prevent 409 Conflict
+                    time.sleep(2) # Give Telegram time to breathe
                 except: pass
                 
                 logger.info(f"🚀 Starting Secondary Log Bot polling ({bot_id})...")
-                log_bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+                log_bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
                 logger.error(f"❌ Log Bot Polling crashed: {e}. Restarting in 30s...")
                 time.sleep(30)
