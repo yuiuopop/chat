@@ -237,6 +237,16 @@ def init_db():
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
             except: pass
+
+            # Banned Users Table
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT UNIQUE,
+                    username TEXT UNIQUE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -359,8 +369,57 @@ def init_db():
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
             except: pass
+
+            # Banned Users Table
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id BIGINT UNIQUE,
+                    username TEXT UNIQUE,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
     logger.info("DB initialized")
-    logger.info("DB initialized")
+
+def is_user_banned(user_id, username=None):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            if user_id:
+                c.execute(f"SELECT 1 FROM banned_users WHERE user_id = {p}", (user_id,))
+                if c.fetchone(): return True
+            if username:
+                clean_username = username.lower().replace("@", "")
+                c.execute(f"SELECT 1 FROM banned_users WHERE username = {p}", (clean_username,))
+                if c.fetchone(): return True
+    except: pass
+    return False
+
+def ban_user(user_id=None, username=None):
+    with db_conn() as conn:
+        c = conn.cursor()
+        uname = username.lower().replace("@", "") if username else None
+        if DATABASE_URL:
+            c.execute("INSERT INTO banned_users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (user_id, uname))
+        else:
+            c.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, uname))
+
+def unban_user(user_id=None, username=None):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if user_id:
+            c.execute(f"DELETE FROM banned_users WHERE user_id = {p}", (user_id,))
+        elif username:
+            clean_username = username.lower().replace("@", "")
+            c.execute(f"DELETE FROM banned_users WHERE username = {p}", (clean_username,))
+
+def get_banned_users():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, username FROM banned_users")
+        return c.fetchall()
 
 def get_setting(key, default=None):
     with db_conn() as conn:
@@ -790,6 +849,7 @@ def get_dashboard_markup():
         markup.add(InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
         markup.add(InlineKeyboardButton("📜 Log Bots", callback_data="log_bot_main"))
+        markup.add(InlineKeyboardButton("🚫 Ban List", callback_data="banlist_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
@@ -921,6 +981,18 @@ def user_account_markup():
         InlineKeyboardButton("🤖 Bots", callback_data="user_acc_list_bots_0")
     )
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
+def banlist_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    banned = get_banned_users()
+    for uid, uname in banned:
+        identifier = uid if uid else uname
+        label = f"🚫 {uname if uname else uid}"
+        markup.add(InlineKeyboardButton(label, callback_data=f"unban_confirm_{identifier}"))
+    
+    markup.add(InlineKeyboardButton("➕ Add to Ban List", callback_data="ban_add_start"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
     return markup
 
 async def get_chat_selection_markup(prefix, page=0):
@@ -1217,6 +1289,13 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
+        # --- BAN LIST CHECK ---
+        sender_id = m.sender_id
+        sender_username = getattr(m.sender, 'username', None)
+        if is_user_banned(sender_id, sender_username):
+            logger.info(f"🚫 BLOCKED: Ignored message from banned user {sender_id} (@{sender_username})")
+            return
+
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             
@@ -1490,6 +1569,49 @@ def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
 
+@bot.message_handler(commands=['ban'])
+def cmd_ban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "💡 **Usage:** `/ban [username_or_id]`", parse_mode="Markdown")
+            return
+        
+        target = args[1].replace("@", "")
+        uid, uname = None, None
+        if target.isdigit(): uid = int(target)
+        else: uname = target
+        
+        ban_user(user_id=uid, username=uname)
+        bot.reply_to(message, f"✅ **User Banned:** `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ban Error: {e}")
+
+@bot.message_handler(commands=['unban'])
+def cmd_unban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "💡 **Usage:** `/unban [username_or_id]`", parse_mode="Markdown")
+            return
+        
+        target = args[1].replace("@", "")
+        uid, uname = None, None
+        if target.isdigit(): uid = int(target)
+        else: uname = target
+        
+        unban_user(user_id=uid, username=uname)
+        bot.reply_to(message, f"✅ **User Unbanned:** `{target}`", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Unban Error: {e}")
+
+@bot.message_handler(commands=['banlist'])
+def cmd_ban_list(message):
+    if message.from_user.id != ADMIN_ID: return
+    bot.send_message(message.chat.id, "🚫 **Banned Users**\n\nMessages from these users are ignored by all automated tasks:", reply_markup=banlist_markup(), parse_mode="Markdown")
+
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
     if message.from_user.id != ADMIN_ID:
@@ -1597,6 +1719,32 @@ def handle_callbacks(call):
     elif data == "log_bot_main":
         bot.answer_callback_query(call.id)
         bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
+
+    elif data == "banlist_main":
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
+
+    elif data == "ban_add_start":
+        bot.answer_callback_query(call.id)
+        admin_states[uid] = "awaiting_ban_target"
+        bot.send_message(call.message.chat.id, "🚫 **Add to Ban List**\n\nPlease send the **Username** or **User ID** you want to block.")
+
+    elif data.startswith("unban_confirm_"):
+        target = data.replace("unban_confirm_", "")
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Confirm Unban", callback_data=f"unban_do_{target}"))
+        markup.add(InlineKeyboardButton("❌ Cancel", callback_data="banlist_main"))
+        bot.edit_message_text(f"❓ **Unban User:** `{target}`?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("unban_do_"):
+        target = data.replace("unban_do_", "")
+        bot.answer_callback_query(call.id, "User Unbanned")
+        uid, uname = None, None
+        if target.isdigit(): uid = int(target)
+        else: uname = target
+        unban_user(user_id=uid, username=uname)
+        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
 
     elif data == "log_bot_add_start":
         bot.answer_callback_query(call.id)
@@ -2077,6 +2225,18 @@ def handle_state_inputs(message):
     state = admin_states.get(uid)
     text = message.text.strip()
     
+    # --- Ban List System ---
+    if state == "awaiting_ban_target":
+        target = text.replace("@", "")
+        b_uid, b_uname = None, None
+        if target.isdigit(): b_uid = int(target)
+        else: b_uname = target
+        
+        ban_user(user_id=b_uid, username=b_uname)
+        admin_states.pop(uid, None)
+        bot.reply_to(message, f"✅ **User Banned:** `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "🚫 **Banned Users**", reply_markup=banlist_markup(), parse_mode="Markdown")
+
     # --- Logging System ---
     # --- Log Bot System ---
     if state == "awaiting_log_bot_token":
@@ -2238,7 +2398,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             # Date filter
             if end_date and m.date > end_date: continue
             if start_date and m.date < start_date: break # History is newest to oldest
-            
+
+            # --- BAN LIST CHECK ---
+            sender_id = m.sender_id
+            sender_username = getattr(m.sender, 'username', None)
+            if is_user_banned(sender_id, sender_username):
+                continue
+
             if m.media:
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
@@ -2311,6 +2477,13 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 break
             
             scanned += 1
+            
+            # --- BAN LIST CHECK ---
+            sender_id = m.sender_id
+            sender_username = getattr(m.sender, 'username', None)
+            if is_user_banned(sender_id, sender_username):
+                continue
+
             if m.media:
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
