@@ -69,6 +69,24 @@ async def safe_send(func, *args, retries=3, **kwargs):
             logger.debug(f"🔄 Retry {attempt+1}/{retries} after error: {e}")
             await asyncio.sleep(2)
 
+
+# --- HELPER FOR SAFE MESSAGE EDITS ---
+def safe_edit_text(bot_obj, text, chat_id, message_id, **kwargs):
+    try:
+        return safe_edit_text(bot_obj, text, chat_id, message_id, **kwargs)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return None
+        raise e
+
+def safe_edit_markup(bot_obj, chat_id, message_id, reply_markup=None, **kwargs):
+    try:
+        return safe_edit_markup(bot_obj, chat_id, message_id, reply_markup=reply_markup, **kwargs)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return None
+        raise e
+
 def send_monitor_log(text):
     """Sends background activity directly to the Admin."""
     try:
@@ -676,6 +694,20 @@ def add_log_bot(token, username, bot_id):
                 (token, username, bot_id)
             )
 
+
+def get_bot_storage_id(bot_token, default_id):
+    """Checks if a bot has a registered storage target (group/channel)."""
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            c.execute(f"SELECT target_id FROM log_targets WHERE bot_token = {p} LIMIT 1", (bot_token,))
+            row = c.fetchone()
+            if row:
+                return int(row[0])
+    except: pass
+    return int(default_id)
+
 def get_log_bots():
     with db_conn() as conn:
         c = conn.cursor()
@@ -739,8 +771,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
             # --- EMPTY CONTENT PROTECTION ---
             if not file_id and not (caption or "").strip():
-                logger.warning(f"⚠️ Skipping empty vaulted item {smid}")
-                success += 1 # Count as success to keep moving
+                logger.warning(f"⚠️ Skipping item {smid}: No Content found.")
+                success += 1 
+                continue
+            
+            if not file_id and m_type.lower() != "text":
+                logger.warning(f"⚠️ Skipping item {smid}: Media type {m_type} requires a File ID.")
+                failed += 1
                 continue
 
             
@@ -796,8 +833,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
             except Exception as e:
                 import asyncio
-                if "FloodWait" in str(type(e)):
+                err_desc = str(e).lower()
+                if "floodwait" in err_desc:
                     await asyncio.sleep(60)
+                elif "file_id_invalid" in err_desc:
+                    logger.error(f"❌ Permanent File ID error for msg {smid}. Skipping.")
+                    failed += 1
+                    continue
                 logger.error(f"❌ LOGBOT SEND ERROR: {e}")
                 failed += 1
 
@@ -968,7 +1010,7 @@ def show_pair_view(chat_id, message_id, pid):
             f"Mirror: `{mir_status}`"
         )
         try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
+            safe_edit_text(bot, text, chat_id, message_id, reply_markup=pair_view_markup(pid), parse_mode="Markdown")
         except Exception as e:
             if "message is not modified" in str(e):
                 pass
@@ -1299,8 +1341,10 @@ async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
     if not bots: return
     
     for token, username, bot_id in bots:
+        # Resolve if this bot has a specific storage group, otherwise PM the bot
+        storage_id = get_bot_storage_id(token, bot_id)
         # Run vaulting in background tasks
-        asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(source_msg_id), username))
+        asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(storage_id), int(source_msg_id), username))
 
 async def resolve_source_topic_name(client, chat_id, message):
     """Resolves the title of the forum topic the message belongs to."""
@@ -1402,7 +1446,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
         logger.error(f"Topic Resolver Error: {e}")
         return None
 
-async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
+async def vault_media(client, message, source_chat_id, bot_user_id, storage_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
         # Resolve the actual topic name from the source message
@@ -1411,10 +1455,10 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
         # Resolve the reply-to ID (if any)
         src_reply_id = message.reply_to.reply_to_msg_id if message.reply_to else 0
 
-        target_peer = await resolve_target_id(client, log_chat_id)
+        target_peer = await resolve_target_id(client, storage_id)
         
         # We find or create a topic IN THE LOG BOT'S VAULT matches the source topic
-        vault_topic_id = await resolve_target_topic_id(client, log_chat_id, source_chat_id, src_topic_name)
+        vault_topic_id = await resolve_target_topic_id(client, storage_id, source_chat_id, src_topic_name)
 
         # We embed RID (Reply ID) and TOPIC into the metadata string for the Log Bot to parse
         metadata = f"SID: {source_chat_id} | MID: {source_msg_id} | RID: {src_reply_id} | TOPIC: {src_topic_name}\n"
@@ -1450,7 +1494,7 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             logger.info(f"✅ VAULT: Message {source_msg_id} logged successfully to @{t_name}")
             # Save mapping immediately for internal release engine tracking
             save_logged_media(
-                bot_id=int(log_chat_id),
+                bot_id=int(bot_user_id),
                 log_msg_id=int(vaulted.id),
                 source_chat_id=int(source_chat_id),
                 source_msg_id=int(source_msg_id),
@@ -1591,8 +1635,10 @@ def setup_automation_handlers(client: TelegramClient):
                             continue
 
                     # --- LOGGING & COLLECTION LOGIC (is_mon) ---
-                    if is_mon and m.media:
-                        m_type = type(m.media).__name__
+                    # Logic Change: Only insert if message actually has content
+                    has_content = m.media or (m.message or "").strip()
+                    if is_mon and has_content:
+                        m_type = type(m.media).__name__ if m.media else 'text'
                         with db_conn() as conn:
                             c = conn.cursor()
                             p = get_placeholder()
@@ -1820,7 +1866,7 @@ async def finalize_pair_task(call, uid):
         tid = data["target_id"]
         ttid = data["target_topic_id"]
 
-        bot.edit_message_text("⏳ Resolving pair details...", call.message.chat.id, call.message.message_id)
+        safe_edit_text(bot, "⏳ Resolving pair details...", call.message.chat.id, call.message.message_id)
         
         s_chat = await resolve_target_id(userbot, sid)
         t_chat = await resolve_target_id(userbot, tid)
@@ -1853,7 +1899,7 @@ def handle_clear_mappings_callback(call):
             # Optional: c.execute("DELETE FROM topic_mappings")
             
         bot.answer_callback_query(call.id, "✅ Database Wiped")
-        bot.edit_message_text("✅ **All message mappings have been cleared.**\nYour database is now clean.", call.message.chat.id, call.message.message_id)
+        safe_edit_text(bot, "✅ **All message mappings have been cleared.**\nYour database is now clean.", call.message.chat.id, call.message.message_id)
     except Exception as e:
         bot.send_message(call.message.chat.id, f"❌ Cleanup failed: {e}")
 
@@ -1868,13 +1914,13 @@ def handle_callbacks(call):
     
     if data == "dash_main":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+        safe_edit_text(bot, get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
     elif data == "vault_rel_main":
         bot.answer_callback_query(call.id)
         sources = get_vault_sources()
         if not sources:
-            bot.edit_message_text("❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+            safe_edit_text(bot, "❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
             return
             
         markup = InlineKeyboardMarkup(row_width=1)
@@ -1882,7 +1928,7 @@ def handle_callbacks(call):
             markup.add(InlineKeyboardButton(f"📁 {title}", callback_data=f"vault_src_{sid}"))
         markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
         
-        bot.edit_message_text("🚀 **Vault Release Engine**\n\nSelect the source group you want to release media for:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        safe_edit_text(bot, "🚀 **Vault Release Engine**\n\nSelect the source group you want to release media for:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("vault_src_"):
         bot.answer_callback_query(call.id)
@@ -1891,7 +1937,7 @@ def handle_callbacks(call):
         
         async def show_tgt():
             markup = await get_chat_selection_markup("vault_tgt", 0)
-            bot.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            safe_edit_text(bot, "🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         asyncio.run_coroutine_threadsafe(show_tgt(), loop)
         
     elif data.startswith("vault_tgt_"):
@@ -1902,7 +1948,7 @@ def handle_callbacks(call):
             async def update_tgt_list():
                 markup = await get_chat_selection_markup("vault_tgt", page)
                 if markup:
-                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                    safe_edit_markup(bot, call.message.chat.id, call.message.message_id, reply_markup=markup)
             asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
         else:
             tid = int(parts[2])
@@ -1913,16 +1959,16 @@ def handle_callbacks(call):
             
             # Start background task
             login_data.pop(uid, None)
-            bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+            safe_edit_text(bot, f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(run_vault_release(bot, call.message.chat.id, sid, tid), loop)
 
     elif data == "log_bot_main":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
+        safe_edit_text(bot, "📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
 
     elif data == "banlist_main":
         bot.answer_callback_query(call.id)
-        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
+        safe_edit_text(bot, "🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
 
     elif data == "ban_add_start":
         bot.answer_callback_query(call.id)
@@ -1935,7 +1981,7 @@ def handle_callbacks(call):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("✅ Confirm Unban", callback_data=f"unban_do_{target}"))
         markup.add(InlineKeyboardButton("❌ Cancel", callback_data="banlist_main"))
-        bot.edit_message_text(f"❓ **Unban User:** `{target}`?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        safe_edit_text(bot, f"❓ **Unban User:** `{target}`?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("unban_do_"):
         target = data.replace("unban_do_", "")
@@ -1944,7 +1990,7 @@ def handle_callbacks(call):
         if target.isdigit(): uid = int(target)
         else: uname = target
         unban_user(user_id=uid, username=uname)
-        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
+        safe_edit_text(bot, "🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
 
     elif data == "log_bot_add_start":
         bot.answer_callback_query(call.id)
@@ -1965,7 +2011,7 @@ def handle_callbacks(call):
         text += f"📦 Total Items: `{stats}`\n\n"
         text += "_Click Fetch to download a file containing all logged media IDs._"
         
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=log_bot_view_markup(bot_id), parse_mode="Markdown")
+        safe_edit_text(bot, text, call.message.chat.id, call.message.message_id, reply_markup=log_bot_view_markup(bot_id), parse_mode="Markdown")
 
     elif data.startswith("log_bot_fetch_"):
         bot_id = int(data.split("_")[-1])
@@ -2003,7 +2049,7 @@ def handle_callbacks(call):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"log_bot_delete_do_{bot_id}"))
         markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"log_bot_view_{bot_id}"))
-        bot.edit_message_text(f"⚠️ **Delete Log Bot?**\n\nThis will stop the bot and delete all `{get_logged_media_stats(bot_id)}` logged media records from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        safe_edit_text(bot, f"⚠️ **Delete Log Bot?**\n\nThis will stop the bot and delete all `{get_logged_media_stats(bot_id)}` logged media records from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("log_bot_delete_do_"):
         bot_id = int(data.split("_")[-1])
@@ -2016,13 +2062,13 @@ def handle_callbacks(call):
             except: pass
             
         bot.answer_callback_query(call.id, "Log Bot Removed")
-        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
+        safe_edit_text(bot, "📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
         try:
             markup = pairs_list_markup()
-            bot.edit_message_text("🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            safe_edit_text(bot, "🎯 **Target Pairs**\nSelect a pair to manage collection or release:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Pairs List Error: {e}")
             bot.send_message(call.message.chat.id, f"❌ Error loading pairs: {e}")
@@ -2038,9 +2084,9 @@ def handle_callbacks(call):
                 
                 markup = await get_chat_selection_markup("sel_src", 0)
                 if markup:
-                    bot.edit_message_text("🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                    safe_edit_text(bot, "🎯 **Select Source Chat**\nChoose the group or channel to collect from:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 else:
-                    bot.edit_message_text("❌ No chats found. Make sure your userbot is in at least one group or channel.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+                    safe_edit_text(bot, "❌ No chats found. Make sure your userbot is in at least one group or channel.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
             except Exception as e:
                 logger.error(f"Add Pair Start Error: {e}")
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
@@ -2061,7 +2107,7 @@ def handle_callbacks(call):
         login_data[uid] = {"source_id": sid, "source_topic_id": stid}
         async def show_tgt():
             markup = await get_chat_selection_markup("sel_tgt", 0)
-            bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            safe_edit_text(bot, "🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
         asyncio.run_coroutine_threadsafe(show_tgt(), loop)
 
     elif data.startswith("sel_src_"):
@@ -2072,7 +2118,7 @@ def handle_callbacks(call):
             async def update_src_list():
                 markup = await get_chat_selection_markup("sel_src", page)
                 if markup:
-                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                    safe_edit_markup(bot, call.message.chat.id, call.message.message_id, reply_markup=markup)
             asyncio.run_coroutine_threadsafe(update_src_list(), loop)
         else:
             sid = int(parts[2])
@@ -2083,11 +2129,11 @@ def handle_callbacks(call):
                     
                     if is_forum:
                         markup = await get_topic_selection_markup(sid, "sel_src_topic")
-                        bot.edit_message_text(f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        safe_edit_text(bot, f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a source topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                     else:
                         login_data[uid] = {"source_id": sid, "source_topic_id": None}
                         markup = await get_chat_selection_markup("sel_tgt", 0)
-                        bot.edit_message_text("🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        safe_edit_text(bot, "🎯 **Select Target Chat**\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 except Exception as e:
                     bot.send_message(call.message.chat.id, f"❌ Error: {e}")
             asyncio.run_coroutine_threadsafe(handle_src(), loop)
@@ -2116,7 +2162,7 @@ def handle_callbacks(call):
             async def update_tgt_list():
                 markup = await get_chat_selection_markup("sel_tgt", page)
                 if markup:
-                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                    safe_edit_markup(bot, call.message.chat.id, call.message.message_id, reply_markup=markup)
             asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
         else:
             tid = int(parts[2])
@@ -2127,7 +2173,7 @@ def handle_callbacks(call):
                     
                     if is_forum:
                         markup = await get_topic_selection_markup(tid, "sel_tgt_topic")
-                        bot.edit_message_text(f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a target topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                        safe_edit_text(bot, f"🧵 **『 {getattr(full_chat, 'title', 'Forum')} 』**\nSelect a target topic:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                     else:
                         login_data[uid]["target_id"] = tid
                         login_data[uid]["target_topic_id"] = None
@@ -2231,7 +2277,7 @@ def handle_callbacks(call):
             InlineKeyboardButton("📅 Date Based", callback_data=f"pair_hist_type_date_{pid}")
         )
         markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
-        bot.edit_message_text("📜 **History Scraper**\n\nChoose your scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        safe_edit_text(bot, "📜 **History Scraper**\n\nChoose your scraping mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("pair_hist_type_count_"):
         pid = int(data.split("_")[-1])
@@ -2270,7 +2316,7 @@ def handle_callbacks(call):
             InlineKeyboardButton("⏰ Scheduled (Slow)", callback_data=f"pair_rel_slow_{pid}")
         )
         markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"pair_view_{pid}"))
-        bot.edit_message_text("🚀 **Release Engine**\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        safe_edit_text(bot, "🚀 **Release Engine**\n\nChoose release mode:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("pair_rel_now_"):
         pid = int(data.split("_")[-1])
@@ -2289,7 +2335,7 @@ def handle_callbacks(call):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"pair_delete_do_{pid}"))
         markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"pair_view_{pid}"))
-        bot.edit_message_text("⚠️ Delete this pair and all its collected media history?", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        safe_edit_text(bot, "⚠️ Delete this pair and all its collected media history?", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif data.startswith("pair_delete_do_"):
         pid = int(data.split("_")[-1])
@@ -2318,7 +2364,7 @@ def handle_callbacks(call):
                 c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
         
         bot.answer_callback_query(call.id, "Session Cleared")
-        bot.edit_message_text("✅ **Userbot Logged Out Successfully**\nSession deleted.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        safe_edit_text(bot, "✅ **Userbot Logged Out Successfully**\nSession deleted.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
         bot.send_message(call.message.chat.id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
     elif data == "user_connect_start":
@@ -2383,7 +2429,7 @@ def handle_callbacks(call):
             markup.add(InlineKeyboardButton("🔙 Back to Categories", callback_data="user_acc_main"))
             
             msg = f"👤 **Account Browser:** {category.capitalize()}\nPage {page + 1} | Total: {len(all_dialogs)}"
-            bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            safe_edit_text(bot, msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         asyncio.run_coroutine_threadsafe(run_list(), loop)
 
@@ -2412,7 +2458,7 @@ def handle_callbacks(call):
                 markup = InlineKeyboardMarkup(row_width=1)
                 markup.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"user_acc_main"))
                 
-                bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                safe_edit_text(bot, info, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
             except Exception as e:
                 bot.send_message(call.message.chat.id, f"❌ Error: {e}")
@@ -2629,13 +2675,18 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
             # --- SEND CONTENT ---
             try:
-                # Use send_message instead of forward to keep mapping control
-                sent = await userbot.send_message(
-                    entity=target_chat,
-                    message=m.message or "",
-                    file=m.media,
-                    reply_to=final_reply_to
-                )
+                # Logic Change: Use native forward for history to preserve original file integrity
+                # This handles protected content and stale file_ids much better.
+                sent = None
+                if m.media or (m.message or "").strip():
+                    sent = await userbot.forward_messages(
+                        entity=target_chat,
+                        messages=m.id,
+                        from_peer=source_chat,
+                        as_album=True
+                    )
+                    # Telethon forward returns a list if as_album is True or single message, normalize it
+                    if isinstance(sent, list): sent = sent[0]
 
                 if sent:
                     # IMPORTANT: Save the map so future history messages can reply to this one
@@ -2652,7 +2703,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 logger.error(f"History Send Error: {e}")
 
             if scanned % 10 == 0:
-                try: bot.edit_message_text(f"📜 **History Scrape: `{s_title}`**\n🔄 Scanned: `{scanned}`\n✅ Re-sent: `{collected}`", admin_chat_id, status_msg.message_id)
+                try: safe_edit_text(bot, f"📜 **History Scrape: `{s_title}`**\n🔄 Scanned: `{scanned}`\n✅ Re-sent: `{collected}`", admin_chat_id, status_msg.message_id)
                 except: pass
 
         bot.send_message(admin_chat_id, f"✅ **History Sync Complete!**\nGroup: `{s_title}`\nMessages: `{collected}`\nReply chains preserved.")
@@ -2719,8 +2770,9 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
             if is_user_banned(sender_id, sender_username):
                 continue
 
-            if m.media:
-                m_type = type(m.media).__name__
+            has_content = m.media or (m.message or "").strip()
+            if has_content:
+                m_type = type(m.media).__name__ if m.media else 'text' if m.media else "text"
                 with db_conn() as conn:
                     c = conn.cursor()
                     p = get_placeholder()
@@ -2734,7 +2786,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                         await forward_to_log_bots(userbot, m, sid, m.id)
             
             if scanned % 20 == 0:
-                try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
+                try: safe_edit_text(bot, f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
                 except: pass
             await asyncio.sleep(0.5)
 
@@ -2848,7 +2900,7 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 
                 sent += 1
                 if sent % 5 == 0:
-                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
+                    try: safe_edit_text(bot, f"🚀 Releasing `{s_title}`...\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
                     except: pass
                 await asyncio.sleep(interval)
             except Exception as e:
@@ -3156,7 +3208,7 @@ class LogBotManager:
                    f"🆔 **ID:** `{sid}`\n"
                    f"📦 **Total Media:** `{total}`\n\n"
                    f"💡 Click the button below to send this media into a different group via this Log Bot.")
-            bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            safe_edit_text(bot_instance, msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
         @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_dump_start_"))
         def start_dump_flow(call):
@@ -3242,7 +3294,7 @@ class LogBotManager:
                     markup.add(InlineKeyboardButton(f"📁 {title} ({count})", callback_data=f"lb_vault_src_{sid}"))
                 markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="lb_cancel"))
                 
-                bot_instance.edit_message_text("🚀 **Select Source Group**\n\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                safe_edit_text(bot_instance, "🚀 **Select Source Group**\n\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
             elif data.startswith("lb_vault_src_"):
                 bot_instance.answer_callback_query(call.id)
@@ -3256,10 +3308,10 @@ class LogBotManager:
                         msg = "⚠️ **Userbot Offline**\n\nI cannot fetch your group list because the main userbot is not connected.\n\nPlease go to your **Main Admin Bot** and use the **'Connect Userbot'** button."
                         btn = InlineKeyboardMarkup().add(InlineKeyboardButton("🔌 Connect at Main Bot", url=f"https://t.me/{main_bot_username}"))
                         btn.add(InlineKeyboardButton("🔙 Back", callback_data="lb_vault_main"))
-                        bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=btn, parse_mode="Markdown")
+                        safe_edit_text(bot_instance, msg, call.message.chat.id, call.message.message_id, reply_markup=btn, parse_mode="Markdown")
                         return
                         
-                    bot_instance.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+                    safe_edit_text(bot_instance, "🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 asyncio.run_coroutine_threadsafe(show_tgt(), loop)
                 
             elif data.startswith("lb_vault_tgt_"):
@@ -3270,7 +3322,7 @@ class LogBotManager:
                     async def update_tgt_list():
                         markup = await get_chat_selection_markup("lb_vault_tgt", page)
                         if markup:
-                            bot_instance.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+                            safe_edit_markup(bot_instance, call.message.chat.id, call.message.message_id, reply_markup=markup)
                     asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
                 else:
                     tid = int(parts[3])
@@ -3280,7 +3332,7 @@ class LogBotManager:
                             entity = await resolve_target_id(userbot, tid)
                             if getattr(entity, 'forum', False):
                                 markup = await get_topic_selection_markup(tid, "lb_vault_topic")
-                                bot_instance.edit_message_text(f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+                                safe_edit_text(bot_instance, f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
                             else:
                                 # Standard group
                                 is_dump = "dump_sid" in login_data.get(uid, {})
@@ -3288,12 +3340,12 @@ class LogBotManager:
                                     login_data[uid]["dump_tid"] = tid
                                     login_data[uid]["dump_topic"] = None
                                     admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
-                                    bot_instance.edit_message_text(f"🔢 **How many items?**\nEnter count for group `{tid}`:", call.message.chat.id, call.message.message_id)
+                                    safe_edit_text(bot_instance, f"🔢 **How many items?**\nEnter count for group `{tid}`:", call.message.chat.id, call.message.message_id)
                                 else:
                                     login_data[uid]["vault_target_id"] = tid
                                     login_data[uid]["vault_topic_id"] = None
                                     admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
-                                    bot_instance.edit_message_text("⏳ **Release Interval**\nEnter time (seconds) between messages:", call.message.chat.id, call.message.message_id)
+                                    safe_edit_text(bot_instance, "⏳ **Release Interval**\nEnter time (seconds) between messages:", call.message.chat.id, call.message.message_id)
                         except Exception as e:
                             bot_instance.send_message(call.message.chat.id, f"❌ Error: {e}")
                     asyncio.run_coroutine_threadsafe(handle_dest(), loop)
@@ -3311,12 +3363,12 @@ class LogBotManager:
                     login_data[uid]["dump_tid"] = tid
                     login_data[uid]["dump_topic"] = topic_val
                     admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
-                    bot_instance.edit_message_text(f"🔢 **Topic Set!**\nEnter count for topic `{topic_id}`:", call.message.chat.id, call.message.message_id)
+                    safe_edit_text(bot_instance, f"🔢 **Topic Set!**\nEnter count for topic `{topic_id}`:", call.message.chat.id, call.message.message_id)
                 else:
                     login_data[uid]["vault_target_id"] = tid
                     login_data[uid]["vault_topic_id"] = topic_val
                     admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
-                    bot_instance.edit_message_text(f"⏳ **Topic Set!**\nEnter release interval (seconds):", call.message.chat.id, call.message.message_id)
+                    safe_edit_text(bot_instance, f"⏳ **Topic Set!**\nEnter release interval (seconds):", call.message.chat.id, call.message.message_id)
                     
             elif data == "lb_cancel":
                 bot_instance.answer_callback_query(call.id)
@@ -3339,7 +3391,7 @@ class LogBotManager:
                 # FIX: Convert 0 back to None for the engine
                 topic_val = topic_id if topic_id != 0 else None
                 
-                bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                safe_edit_text(bot_instance, f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
                 asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval, target_topic_id=topic_val, log_target_id=bot_id), loop)
 
         @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
