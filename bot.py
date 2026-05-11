@@ -762,7 +762,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             if s_rid and int(s_rid) > 0:
                 mapped_target_id = get_message_mapping(source_id, s_rid, target_id)
                 if mapped_target_id:
-                    reply_to_message_id = int(mapped_target_id)
+                    try:
+                        # Validate that the target message actually exists before replying
+                        await userbot.get_messages(final_tid, ids=int(mapped_target_id))
+                        reply_to_message_id = int(mapped_target_id)
+                    except:
+                        logger.warning(f"⚠️ Stale reply target {mapped_target_id} not found in {final_tid}. Falling back to topic root.")
+                        reply_to_message_id = None
 
             try:
                 m_type = m_type.lower()
@@ -1343,7 +1349,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
         if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
             cached = topic_cache[target_chat_id][t_name]
             if time.time() - cached["time"] < 600:
-                return cached['id']["id"]
+                return cached['id']
         
         # 2. Use Lock to prevent duplicate creation attempts
         async with topic_creation_lock:
@@ -1351,7 +1357,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
             if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
                 cached = topic_cache[target_chat_id][t_name]
                 if time.time() - cached["time"] < 600:
-                    return cached['id']["id"]
+                    return cached['id']
 
             target_entity = await resolve_target_id(client, target_chat_id)
             if not getattr(target_entity, 'forum', False):
