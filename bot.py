@@ -48,8 +48,26 @@ logger = logging.getLogger("userbot_v2")
 topic_cache = {}
 
 # Background Job Queue for Mirroring
-mirror_queue = asyncio.Queue()
+mirror_queue = asyncio.Queue(maxsize=5000)
+send_semaphore = asyncio.Semaphore(5)
 album_cache = {} # { album_key: {"messages": {msg_id: msg}, "created": time} }
+
+
+async def safe_send(func, *args, retries=3, **kwargs):
+    """Universal retry wrapper for Telegram API calls."""
+    for attempt in range(retries):
+        try:
+            return await func(*args, **kwargs)
+        except errors.FloodWaitError as e:
+            logger.warning(f"⏳ FloodWait: Waiting {e.seconds}s...")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            if "message thread not found" in str(e).lower():
+                raise e # Don't retry topic-specific errors
+            if attempt == retries - 1:
+                raise e
+            logger.debug(f"🔄 Retry {attempt+1}/{retries} after error: {e}")
+            await asyncio.sleep(2)
 
 def send_monitor_log(text):
     """Sends background activity directly to the Admin."""
@@ -104,7 +122,6 @@ USING_POSTGRES = False
 
 # Album Cache for grouping media
 # {grouped_id: [message_objects]}
-album_cache = {}
 
 def get_placeholder(conn=None):
     if DATABASE_URL and USING_POSTGRES:
@@ -719,6 +736,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 break
             
             smid, file_id, m_type, caption, l_mid, b_id, src_topic_name, s_rid = item
+
+            # --- EMPTY CONTENT PROTECTION ---
+            if not file_id and not (caption or "").strip():
+                logger.warning(f"⚠️ Skipping empty vaulted item {smid}")
+                success += 1 # Count as success to keep moving
+                continue
+
             
             # RECONSTRUCT REPLY CHAIN
             thread_id = target_topic_id # Topic/Thread ID
@@ -1319,7 +1343,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
         if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
             cached = topic_cache[target_chat_id][t_name]
             if time.time() - cached["time"] < 600:
-                return cached["id"]
+                return cached['id']["id"]
         
         # 2. Use Lock to prevent duplicate creation attempts
         async with topic_creation_lock:
@@ -1327,7 +1351,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
             if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
                 cached = topic_cache[target_chat_id][t_name]
                 if time.time() - cached["time"] < 600:
-                    return cached["id"]
+                    return cached['id']["id"]
 
             target_entity = await resolve_target_id(client, target_chat_id)
             if not getattr(target_entity, 'forum', False):
@@ -1433,6 +1457,80 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
+async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid, pair_id=None):
+    try:
+        if not messages: return
+        first_msg = messages[0]
+        
+        # 1. Resolve Topic ID (Thread)
+        thread_id = default_t_topic 
+        reply_to_msg_id = None
+        
+        if is_mir:
+            src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
+            resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
+            if resolved_id:
+                thread_id = resolved_id
+
+        # 2. RESOLVE REPLY
+        if first_msg.reply_to_msg_id:
+            mapped_target_id = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+            if mapped_target_id:
+                reply_to_msg_id = int(mapped_target_id)
+
+        # 3. CONSTRUCT REPLY PARAMETER
+        reply_param = thread_id
+        if reply_to_msg_id:
+            reply_param = reply_to_msg_id
+
+        # 3. Construct Send Parameters
+        album_text = next((msg.message for msg in messages if msg.message), "")
+        
+        # 4. SEND
+        sent = await client.send_message(
+            entity=int(tid),
+            message=album_text,
+            file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
+            reply_to=reply_param
+        )
+
+        if sent:
+            # Save the mapping of the message we JUST sent
+            sent_id = sent[0].id if isinstance(sent, list) else sent.id
+            save_message_mapping(sid, first_msg.id, tid, sent_id, pair_id=pair_id)
+            logger.info(f"✅ MIRROR: Sent successfully to {tid}")
+            send_monitor_log(f"✅ Successfully Mirrored to {tid}")
+
+    except Exception as e:
+        import asyncio
+        if "FloodWait" in str(type(e)):
+            await asyncio.sleep(60)
+        if "message thread not found" in str(e).lower():
+            topic_cache.pop(int(tid), None)
+        logger.error(f"❌ MIRROR FATAL ERROR: {e}")
+async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, pair_id=None):
+    """Downloads and re-uploads protected content."""
+    import os
+    downloaded = []
+    try:
+        for m in messages:
+            if m.media:
+                path = await client.download_media(m.media)
+                if path: downloaded.append(path)
+        if downloaded:
+            sent = await client.send_message(
+                entity=int(tid), message=album_text, 
+                file=downloaded if len(downloaded) > 1 else downloaded[0],
+                reply_to=reply_header
+            )
+            if sent:
+                first_id = sent[0].id if isinstance(sent, list) else sent.id
+                save_message_mapping(sid, first_msg.id, tid, first_id, pair_id=pair_id)
+    finally:
+        for p in downloaded:
+            if os.path.exists(p): os.remove(p)
+
+
 def setup_automation_handlers(client: TelegramClient):
     logger.info("⚙️  Setting up Automation Handlers...")
     @client.on(events.NewMessage)
@@ -1457,7 +1555,12 @@ def setup_automation_handlers(client: TelegramClient):
                 def normalize(x):
                     return int(str(x).replace("-100", ""))
 
+                
                 if normalize(sid) == normalize(m.chat_id):
+                    # --- EMPTY MESSAGE PROTECTION ---
+                    if not m.media and not (m.message or "").strip():
+                        continue
+    
                     # --- TOPIC DETECTION ---
                     msg_topic_anchor = None
                     if m.reply_to:
@@ -1505,6 +1608,12 @@ def setup_automation_handlers(client: TelegramClient):
                         continue # Check next pair instead of breaking
 
                     # --- ALBUM / SINGLE MESSAGE LOGIC ---
+                    
+                    # --- OVERLOAD PROTECTION ---
+                    if mirror_queue.full():
+                        logger.warning("⚠️ Mirror queue full. Dropping task.")
+                        return
+                    
                     if m.grouped_id:
                         album_key = f"{pid}_{m.grouped_id}"
                         if album_key not in album_cache:
@@ -1537,79 +1646,6 @@ def setup_automation_handlers(client: TelegramClient):
                     
         except Exception as e:
             logger.error(f"AUTO_HANDLER ERROR: {e}")
-
-    async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid, pair_id=None):
-        try:
-            if not messages: return
-            first_msg = messages[0]
-            
-            # 1. Resolve Topic ID (Thread)
-            thread_id = default_t_topic 
-            reply_to_msg_id = None
-            
-            if is_mir:
-                src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
-                resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
-                if resolved_id:
-                    thread_id = resolved_id
-
-            # 2. RESOLVE REPLY
-            if first_msg.reply_to_msg_id:
-                mapped_target_id = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped_target_id:
-                    reply_to_msg_id = int(mapped_target_id)
-
-            # 3. CONSTRUCT REPLY PARAMETER
-            reply_param = thread_id
-            if reply_to_msg_id:
-                reply_param = reply_to_msg_id
-
-            # 3. Construct Send Parameters
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            
-            # 4. SEND
-            sent = await client.send_message(
-                entity=int(tid),
-                message=album_text,
-                file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
-                reply_to=reply_param
-            )
-
-            if sent:
-                # Save the mapping of the message we JUST sent
-                sent_id = sent[0].id if isinstance(sent, list) else sent.id
-                save_message_mapping(sid, first_msg.id, tid, sent_id, pair_id=pair_id)
-                logger.info(f"✅ MIRROR: Sent successfully to {tid}")
-                send_monitor_log(f"✅ Successfully Mirrored to {tid}")
-
-        except Exception as e:
-            import asyncio
-            if "FloodWait" in str(type(e)):
-                await asyncio.sleep(60)
-            if "message thread not found" in str(e).lower():
-                topic_cache.pop(int(tid), None)
-            logger.error(f"❌ MIRROR FATAL ERROR: {e}")
-    async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, pair_id=None):
-        """Downloads and re-uploads protected content."""
-        import os
-        downloaded = []
-        try:
-            for m in messages:
-                if m.media:
-                    path = await client.download_media(m.media)
-                    if path: downloaded.append(path)
-            if downloaded:
-                sent = await client.send_message(
-                    entity=int(tid), message=album_text, 
-                    file=downloaded if len(downloaded) > 1 else downloaded[0],
-                    reply_to=reply_header
-                )
-                if sent:
-                    first_id = sent[0].id if isinstance(sent, list) else sent.id
-                    save_message_mapping(sid, first_msg.id, tid, first_id, pair_id=pair_id)
-        finally:
-            for p in downloaded:
-                if os.path.exists(p): os.remove(p)
 
 # -----------------------------
 # Bot Handlers
@@ -3430,19 +3466,39 @@ async def main():
             job = await mirror_queue.get()
             try:
                 if job["type"] == "mirror":
-                    await execute_perform_mirror(
-                        userbot, job["tid"], job["messages"], 
-                        job["def_topic"], job["is_mir"], 
-                        job["sid"], pair_id=job["pid"]
-                    )
-                # Add a small delay between jobs to prevent flood
-                await asyncio.sleep(1)
+                    async with send_semaphore:
+                        await safe_send(
+                            execute_perform_mirror,
+                            userbot, job["tid"], job["messages"],
+                            job["def_topic"], job["is_mir"],
+                            job["sid"], pair_id=job["pid"]
+                        )
+                await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Worker Error: {e}")
             finally:
                 mirror_queue.task_done()
 
     asyncio.create_task(mirror_worker())
+
+    async def cache_cleanup():
+        """Prunes expired entries from memory caches every 30 minutes."""
+        while True:
+            await asyncio.sleep(1800)
+            now = time.time()
+            # Cleanup Topic Cache
+            for chat_id in list(topic_cache.keys()):
+                for t_name in list(topic_cache[chat_id].keys()):
+                    if now - topic_cache[chat_id][t_name]["time"] > 3600:
+                        del topic_cache[chat_id][t_name]
+            # Cleanup Album Cache (stale ones)
+            for key in list(album_cache.keys()):
+                if now - album_cache[key]["created"] > 300:
+                    album_cache.pop(key, None)
+            logger.info("🧹 Cache cleanup complete.")
+
+    asyncio.create_task(cache_cleanup())
+
 
     if userbot:
         try:
