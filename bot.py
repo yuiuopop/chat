@@ -698,11 +698,6 @@ def clear_bot_logs(bot_id):
         p = get_placeholder()
         c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
 
-def stop_task(task_key):
-    if task_key in running_tasks:
-        running_tasks.pop(task_key, None)
-        return True
-    return False
 
 async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
     """Releases vaulted media using the Userbot for forwarding."""
@@ -732,7 +727,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
 
         for i, item in enumerate(items):
-            if task_key not in running_tasks:
+            if not running_tasks.get(task_key):
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
                 
