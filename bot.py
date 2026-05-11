@@ -1226,65 +1226,87 @@ async def ensure_userbot():
     
     return True, "Connected"
 
-async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
-    """Sends collected content to all registered log bots."""
-    if not message: return
+async def forward_to_log_bots(client, messages, source_chat_id):
+    """Sends collected content to all registered log bots as a group if it's an album."""
+    if not messages: return
+    if not isinstance(messages, list): messages = [messages]
+    
     bots = get_log_bots()
     if not bots: return
     
     for token, username, bot_id in bots:
         # Run vaulting in background tasks
-        asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(source_msg_id), username))
+        asyncio.create_task(vault_media(client, messages, int(source_chat_id), int(bot_id), username))
 
-async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
-    """Helper to forward to vault and save the permanent File ID"""
+async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
+    """Helper to forward to vault as an album and save permanent File IDs for all parts."""
     try:
-        # RESOLVE ENTITY: Fetch the access hash for the bot
+        if not isinstance(messages, list): messages = [messages]
+        
+        # RESOLVE ENTITY
         try:
             target_peer = await client.get_input_entity(int(log_chat_id))
         except:
-            # If not found, try to 'find' the bot by ID directly (forces session lookup)
             target_peer = await client.get_entity(int(log_chat_id))
 
-        # SEND CONTENT with metadata for Log Bot extraction
-        metadata = f"SID: {source_chat_id} | MID: {source_msg_id}\n"
-        caption_text = metadata + (message.message or "")
+        # Prepare media list with metadata for each part
+        media_group = []
+        for m in messages:
+            metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
+            caption = metadata + (m.message or "")
+            # We use a tuple (file, caption) which send_file handles for albums
+            media_group.append((m.media, caption))
         
+        vaulted_msgs = []
         try:
-            vaulted = await client.send_message(
-                entity=target_peer,
-                file=message.media if message.media else None,
-                message=caption_text
-            )
-            await asyncio.sleep(2)
+            # Send as album if multiple, else single
+            if len(media_group) > 1:
+                vaulted_msgs = await client.send_file(
+                    entity=target_peer,
+                    file=media_group
+                )
+            else:
+                m = messages[0]
+                metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
+                v = await client.send_message(
+                    entity=target_peer,
+                    file=m.media,
+                    message=metadata + (m.message or "")
+                )
+                vaulted_msgs = [v]
+            await asyncio.sleep(1)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
             await asyncio.sleep(fwe.seconds)
         except Exception as e:
             if "protected" in str(e).lower() or "forward" in str(e).lower():
-                logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
-                path = await client.download_media(message)
-                vaulted = await client.send_message(
-                    entity=target_peer,
-                    file=path,
-                    message=caption_text
-                )
-                if path and os.path.exists(path): os.remove(path)
+                logger.info(f"🛡️ VAULT: Protected chat detected. Using direct upload...")
+                # Fallback: send one by one for protected chats to be safe
+                vaulted_msgs = []
+                for m in messages:
+                    metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
+                    path = await client.download_media(m)
+                    v = await client.send_message(entity=target_peer, file=path, message=metadata + (m.message or ""))
+                    vaulted_msgs.append(v)
+                    if path and os.path.exists(path): os.remove(path)
             else:
                 raise e
             
-        if vaulted:
-            logger.info(f"✅ VAULT: Message {source_msg_id} logged successfully to @{t_name}")
-            # Immediately save log_msg_id to prevent NoneType errors in release
-            save_logged_media(
-                bot_id=int(log_chat_id),
-                log_msg_id=int(vaulted.id),
-                source_chat_id=int(source_chat_id),
-                source_msg_id=int(source_msg_id),
-                file_id=None, # Bot API file_id will be filled by the Log Bot's own listener
-                media_type=type(message.media).__name__ if message.media else "text",
-                caption=message.message or ""
-            )
+        if vaulted_msgs:
+            if not isinstance(vaulted_msgs, list): vaulted_msgs = [vaulted_msgs]
+            for i, v in enumerate(vaulted_msgs):
+                if i >= len(messages): break
+                orig_m = messages[i]
+                save_logged_media(
+                    bot_id=int(log_chat_id),
+                    log_msg_id=int(v.id),
+                    source_chat_id=int(source_chat_id),
+                    source_msg_id=int(orig_m.id),
+                    file_id=None,
+                    media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                    caption=orig_m.message or ""
+                )
+            logger.info(f"✅ VAULT: Group of {len(vaulted_msgs)} logged to @{t_name}")
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
@@ -1348,8 +1370,9 @@ def setup_automation_handlers(client: TelegramClient):
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
                     
-                    # Instantly send to log bots in background
-                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id))
+                    # Database record remains instant for snappy UI
+                    # But the Log Bot forwarding is now handled in the grouped logic below
+                    pass
 
                 if not is_live: 
                     # If we matched a pair but live is off, we still break to prevent 
@@ -1360,15 +1383,24 @@ def setup_automation_handlers(client: TelegramClient):
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
+                        # Wait for all parts to arrive
+                        async def delayed_process(gid, t_id, mir_toggle, mon_toggle, s_id, def_topic):
                             await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
-                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic))
+                                # 1. Mirroring to Target Group
+                                if mir_toggle:
+                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                # 2. Vaulting to Log Bots
+                                if mon_toggle:
+                                    await forward_to_log_bots(client, messages, s_id)
+                        asyncio.create_task(delayed_process(m.grouped_id, tid, is_mir, is_mon, sid, t_topic))
                 else:
-                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    # Single message case
+                    if is_mir:
+                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    if is_mon:
+                        await forward_to_log_bots(client, m, sid)
                 
                 # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
