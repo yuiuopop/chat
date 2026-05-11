@@ -58,6 +58,7 @@ def send_monitor_log(text):
 login_data = {}    # { user_id: { state_data } }
 admin_states = {}  # { user_id: "current_state" }
 running_tasks = {} # { task_key: bool }
+topic_creation_lock = asyncio.Lock()
 
 # -----------------------------
 # DB (SQLite/PostgreSQL)
@@ -1342,62 +1343,59 @@ async def resolve_source_topic_name(client, chat_id, message):
 
 async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
     try:
-        target_entity = await resolve_target_id(client, target_chat_id)
-        if not getattr(target_entity, 'forum', False):
-            return None
-
-        if not source_msg_topic_name or source_msg_topic_name == "General":
-            source_entity = await resolve_target_id(client, source_chat_id)
-            source_msg_topic_name = getattr(source_entity, 'title', "Archive")
-
-        # 1. Check Local Cache First (Fastest)
-        if target_chat_id in topic_cache and source_msg_topic_name.lower() in topic_cache[target_chat_id]:
-            return topic_cache[target_chat_id][source_msg_topic_name.lower()]
-
-        # 2. Fetch Topics from Telegram to refresh cache
-        topics = await client(functions.channels.GetForumTopicsRequest(
-            channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
-        ))
+        # Normalize name
+        t_name = (source_msg_topic_name or "General").lower().strip()
         
-        if target_chat_id not in topic_cache:
-            topic_cache[target_chat_id] = {}
+        # 1. Immediate Cache Check
+        if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
+            return topic_cache[target_chat_id][t_name]
+
+        # 2. Use Lock to prevent duplicate creation attempts
+        async with topic_creation_lock:
+            # Check cache again inside lock (Double-Checked Locking)
+            if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
+                return topic_cache[target_chat_id][t_name]
+
+            # Use our aggressive resolver instead of raw get_entity
+            target_entity = await resolve_target_id(client, target_chat_id)
+            if not getattr(target_entity, 'forum', False):
+                return None
             
-        for t in topics.topics:
-            topic_cache[target_chat_id][t.title.lower()] = t.id
-            if t.title.lower() == source_msg_topic_name.lower():
-                return t.id
-        
-        # 3. Create new topic if still not found
-        try:
+            # Fetch existing topics to see if another process just created it
+            topics = await client(functions.channels.GetForumTopicsRequest(
+                channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            ))
+            
+            if target_chat_id not in topic_cache:
+                topic_cache[target_chat_id] = {}
+
+            for t in topics.topics:
+                topic_cache[target_chat_id][t.title.lower().strip()] = t.id
+                if t.title.lower().strip() == t_name:
+                    return t.id
+
+            # 3. Create if truly missing
             logger.info(f"✨ Creating new topic: {source_msg_topic_name}")
             created = await client(functions.channels.CreateForumTopicRequest(
                 channel=target_entity,
                 title=source_msg_topic_name
             ))
             
-            # SAFE WAY to get the ID: 
-            # The ID of a new topic is the ID of the service message created.
-            new_topic_id = None
+            new_id = None
             for update in created.updates:
                 if hasattr(update, 'message') and hasattr(update.message, 'id'):
-                    new_topic_id = update.message.id
+                    new_id = update.message.id
                     break
             
-            if not new_topic_id and created.updates:
-                # Fallback: The ID is usually the first message ID in the updates
-                new_topic_id = created.updates[0].id
+            if not new_id and created.updates:
+                new_id = created.updates[0].id
 
-            # Save to cache immediately
-            if new_topic_id:
-                if target_chat_id not in topic_cache:
-                    topic_cache[target_chat_id] = {}
-                topic_cache[target_chat_id][source_msg_topic_name.lower()] = new_topic_id
-                return new_topic_id
+            if new_id:
+                topic_cache[target_chat_id][t_name] = new_id
+                return new_id
             
             return None
-        except Exception as e:
-            logger.error(f"Failed to create topic: {e}")
-            return None
+
     except Exception as e:
         logger.error(f"Topic Resolver Error: {e}")
         return None
