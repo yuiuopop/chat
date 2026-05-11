@@ -1321,51 +1321,50 @@ async def resolve_source_topic_name(client, chat_id, message):
     return "General"
 
 async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
-    """
-    Logic:
-    - If target is NOT a forum: returns None (sends to general).
-    - If target IS a forum:
-        - Tries to find a topic named 'source_msg_topic_name'.
-        - If not found, creates it.
-        - Returns the topic ID.
-    """
     try:
         target_entity = await client.get_entity(int(target_chat_id))
-        
-        # CASE 1: Target is a normal group
         if not getattr(target_entity, 'forum', False):
             return None
 
-        # CASE 2 & 3: Target is a Forum
-        # If the source didn't have a topic name (Normal Group), use Group Name
         if not source_msg_topic_name or source_msg_topic_name == "General":
             source_entity = await client.get_entity(int(source_chat_id))
             source_msg_topic_name = getattr(source_entity, 'title', "Archive")
 
-        # Search for existing topic by name
-        try:
-            topics = await client(functions.channels.GetForumTopicsRequest(
-                channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
-            ))
-            
-            for t in topics.topics:
-                if t.title.lower() == source_msg_topic_name.lower():
-                    return t.id
-        except: pass
+        # 1. Check Local Cache First (Fastest)
+        if target_chat_id in topic_cache and source_msg_topic_name.lower() in topic_cache[target_chat_id]:
+            return topic_cache[target_chat_id][source_msg_topic_name.lower()]
+
+        # 2. Fetch Topics from Telegram to refresh cache
+        topics = await client(functions.channels.GetForumTopicsRequest(
+            channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+        ))
         
-        # Create new topic if none match
-        try:
-            created = await client(functions.channels.CreateForumTopicRequest(
-                channel=target_entity,
-                title=source_msg_topic_name
-            ))
-            # Correctly extract topic ID from updates
-            for update in created.updates:
-                if isinstance(update, types.UpdateNewForumTopic):
-                    return int(update.topic.id) # Return plain integer
-            return None
-        except:
-            return None
+        if target_chat_id not in topic_cache:
+            topic_cache[target_chat_id] = {}
+            
+        for t in topics.topics:
+            topic_cache[target_chat_id][t.title.lower()] = t.id
+            if t.title.lower() == source_msg_topic_name.lower():
+                return t.id
+        
+        # 3. Create new topic if still not found
+        created = await client(functions.channels.CreateForumTopicRequest(
+            channel=target_entity,
+            title=source_msg_topic_name
+        ))
+        
+        # The Topic ID in Telethon is the ID of the 'service message' (created.updates[0])
+        new_topic_id = None
+        for upd in created.updates:
+            if isinstance(upd, types.UpdateNewForumTopic):
+                new_topic_id = upd.topic.id
+                break
+        
+        if new_topic_id:
+            topic_cache[target_chat_id][source_msg_topic_name.lower()] = new_topic_id
+            return new_topic_id
+            
+        return None
     except Exception as e:
         logger.error(f"Topic Resolver Error: {e}")
         return None
@@ -1523,65 +1522,37 @@ def setup_automation_handlers(client: TelegramClient):
             logger.error(f"AUTO_HANDLER ERROR: {e}")
 
     async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid):
-        """USERBOT MIRROR: Forces content into specific topics using compatible objects."""
         try:
             if not messages: return
             first_msg = messages[0]
             
-            # 1. Resolve Topic (Dynamic Name Matching or Settings Default)
+            # Resolve Topic
             final_topic_id = default_t_topic 
             if is_mir:
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
-                logger.info(f"🔍 MIRROR DEBUG: Source Topic Name is '{src_topic_name}'")
-                
-                # This helper must return an INT
                 resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
-                if resolved_id:
-                    final_topic_id = resolved_id
+                final_topic_id = resolved_id if resolved_id else default_t_topic
 
-            # 2. CONSTRUCT COMPATIBLE REPLY HEADER
-            # We use a direct integer ID. Telethon's send_message handles 
-            # thread logic automatically when reply_to is the topic root.
-            reply_to_header = None
+            # Construct Send parameters
+            params = {
+                "entity": int(tid),
+                "message": next((msg.message for msg in messages if msg.message), ""),
+                "file": [m.media for m in messages] if len(messages) > 1 else first_msg.media,
+            }
+
+            # FORUMS: 'reply_to' should be the Topic ID (Top Message ID)
             if final_topic_id:
-                reply_to_header = int(final_topic_id)
+                params["reply_to"] = int(final_topic_id)
 
-            # 3. Handle sub-replies (mirroring a reply to a previous message)
-            if first_msg.reply_to_msg_id:
-                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped:
-                    reply_to_header = int(mapped)
+            sent = await client.send_message(**params)
 
-            # 4. SEND CONTENT
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            
-            # Use 'comment_to' for thread support if it's a forum
-            try:
-                sent = await client.send_message(
-                    entity=int(tid),
-                    message=album_text,
-                    file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
-                    reply_to=reply_to_header,
-                    comment_to=int(final_topic_id) if final_topic_id else None
-                )
-                if sent:
-                    sent_id = sent[0].id if isinstance(sent, list) else sent.id
-                    save_message_mapping(sid, first_msg.id, tid, sent_id)
-                    logger.info(f"✅ MIRROR SUCCESS: Target {tid} | Topic {final_topic_id}")
-            except Exception as send_err:
-                # Fallback to standard sending if comment_to/reply_to fails
-                logger.warning(f"⚠️ MIRROR: Specialized routing failed, trying fallback: {send_err}")
-                sent = await client.send_message(
-                    entity=int(tid),
-                    message=album_text,
-                    file=[m.media for m in messages] if len(messages) > 1 else first_msg.media
-                )
-                if sent:
-                    sent_id = sent[0].id if isinstance(sent, list) else sent.id
-                    save_message_mapping(sid, first_msg.id, tid, sent_id)
+            if sent:
+                sent_id = sent[0].id if isinstance(sent, list) else sent.id
+                save_message_mapping(sid, first_msg.id, tid, sent_id)
+                logger.info(f"✅ MIRROR: Sent to {tid} | Topic {final_topic_id}")
 
         except Exception as e:
-            logger.error(f"❌ USERBOT MIRROR ERROR: {e}")
+            logger.error(f"❌ MIRROR FATAL ERROR: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
