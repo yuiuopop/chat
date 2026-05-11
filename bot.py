@@ -1523,54 +1523,52 @@ def setup_automation_handlers(client: TelegramClient):
             logger.error(f"AUTO_HANDLER ERROR: {e}")
 
     async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Mirroring Hub with Forum Topic and Fallback support."""
+        """USERBOT MIRROR: Forces content into specific topics using Telethon objects."""
         try:
             if not messages: return
             first_msg = messages[0]
             
-            # --- TOPIC RESOLUTION ---
+            # 1. Resolve Topic (Dynamic or Default)
             final_topic_id = default_t_topic 
-
             if is_mir:
-                # 1. Resolve the name from the source
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
                 logger.info(f"🔍 MIRROR DEBUG: Source Topic Name is '{src_topic_name}'")
                 
-                # 2. Resolve/Create matching topic in target
+                # This helper must return an INT
                 resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
                 if resolved_id:
                     final_topic_id = resolved_id
-            
-            # --- CONSTRUCT REPLY HEADER ---
-            # This is the CRITICAL part for Forums
-            reply_to_payload = None
+
+            # 2. FORCE TOPIC ANCHORING
+            # We use 'reply_to' but with a specific Telethon Class (InputReplyToMessage)
+            reply_header = None
             if final_topic_id:
-                # We wrap the ID in InputReplyToMessage to force Telegram to treat it as a thread anchor
-                reply_to_payload = types.InputReplyToMessage(
+                # CRITICAL: InputReplyToMessage is the Gold Standard for Forums
+                reply_header = types.InputReplyToMessage(
                     reply_to_msg_id=int(final_topic_id),
-                    top_msg_id=int(final_topic_id) # This ensures it stays in the topic
+                    top_msg_id=int(final_topic_id)
                 )
                 logger.info(f"📡 MIRROR DEBUG: Routing to Topic ID {final_topic_id}")
 
-            # If the source message was a specific reply TO someone inside that topic
+            # 3. Handle sub-replies (mirroring a reply to a previous message)
             if first_msg.reply_to_msg_id:
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
                 if mapped:
-                    reply_to_payload = types.InputReplyToMessage(
+                    reply_header = types.InputReplyToMessage(
                         reply_to_msg_id=int(mapped),
                         top_msg_id=int(final_topic_id) if final_topic_id else None
                     )
 
-            # --- SEND CONTENT ---
+            # 4. SEND (Userbot uses 'client', Log Bot uses 'sender_bot')
             album_text = next((msg.message for msg in messages if msg.message), "")
             
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     sent = await client.send_message(
                         entity=int(tid),
                         message=album_text,
                         file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
-                        reply_to=reply_to_payload
+                        reply_to=reply_header
                     )
                     if sent:
                         sent_id = sent[0].id if isinstance(sent, list) else sent.id
@@ -1581,17 +1579,15 @@ def setup_automation_handlers(client: TelegramClient):
                     logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
                     await asyncio.sleep(fwe.seconds)
                 except Exception as e:
-                    err_msg = str(e).lower()
-                    if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
-                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_to_payload)
+                    if "protected" in str(e).lower() or "forward" in str(e).lower():
+                        logger.info("🛡️ MIRROR: Fallback activated for protected content.")
+                        await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
                         break
                     logger.error(f"MIRROR ATTEMPT {attempt+1} FAILED: {e}")
-                    if attempt == 2:
-                        logger.error(f"❌ MIRROR FINAL FAILURE: {e}")
+                    await asyncio.sleep(2)
 
         except Exception as e:
-            logger.error(f"❌ MIRROR CRASH: {e}")
+            logger.error(f"❌ USERBOT TOPIC ERROR: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
