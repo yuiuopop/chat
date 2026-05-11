@@ -197,6 +197,8 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
             except: pass
+            try: c.execute("ALTER TABLE log_media ADD COLUMN IF NOT EXISTS source_topic_name TEXT DEFAULT 'General'")
+            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id SERIAL PRIMARY KEY,
@@ -706,7 +708,7 @@ def clear_bot_logs(bot_id):
 
 def stop_task(task_key):
     if task_key in running_tasks:
-        running_tasks.pop(task_key, None)
+        running_tasks[task_key] = False
         return True
     return False
 
@@ -740,7 +742,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         resolved_topics_cache = {} # Cache for this run to speed up resolution
 
         for i, item in enumerate(items):
-            if task_key not in running_tasks:
+            if not running_tasks.get(task_key):
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
                 
@@ -840,12 +842,6 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
-
-def stop_task(task_key):
-    if task_key in running_tasks:
-        running_tasks[task_key] = False
-        return True
-    return False
 
 def is_task_running(task_key):
     return running_tasks.get(task_key, False)
@@ -1129,76 +1125,6 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
-async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None, icon_emoji_id=None):
-    """
-    Search for a topic by title in target chat. If not found, create it.
-    Uses database mapping first, then topic_cache.
-    """
-    if not topic_title: return None
-    
-    t_chat_id = int(target_chat_id)
-    title_key = topic_title.lower().strip()
-    logger.info(f"TOPIC_SEARCH: Looking for '{topic_title}' (Key: '{title_key}') in {t_chat_id}")
-    
-    # 1) Check Database Mapping (Most Reliable)
-    if source_chat_id and source_topic_id:
-        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
-        if existing_mapping:
-            return existing_mapping
-    
-    # 2) Check Cache
-    if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
-        res = topic_cache[t_chat_id][title_key]
-        if source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-        return res
-    
-    # 3) Fetch Topics from Telegram
-    try:
-        result = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
-            offset_date=0,
-            offset_id=0,
-            offset_topic=0,
-            limit=100
-        ))
-        
-        if t_chat_id not in topic_cache:
-            topic_cache[t_chat_id] = {}
-            
-        for topic in result.topics:
-            topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
-            
-        if title_key in topic_cache[t_chat_id]:
-            res = topic_cache[t_chat_id][title_key]
-            if source_chat_id and source_topic_id:
-                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
-            return res
-            
-        # 4) Create if not found
-        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
-        created = await client(functions.channels.CreateForumTopicRequest(
-            channel=t_chat_id,
-            title=topic_title,
-            icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
-        ))
-        
-        await asyncio.sleep(1)
-        res_after = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
-            offset_date=0, offset_id=0, offset_topic=0, limit=20
-        ))
-        for t in res_after.topics:
-            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
-            
-        final_id = topic_cache[t_chat_id].get(title_key)
-        if final_id and source_chat_id and source_topic_id:
-            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
-            
-        return final_id
-    except Exception as e:
-        logger.error(f"Mirroring Error (get_or_create): {e}")
-        return None
 
 async def start_userbot():
     global userbot
@@ -1472,97 +1398,57 @@ def setup_automation_handlers(client: TelegramClient):
                 break
 
     async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Hub for mirrored sending with native Forum Topic support."""
+        """Unified Hub for live mirroring with Topic support for the Userbot."""
         try:
             if not messages: return
             first_msg = messages[0]
-            dest_topic_id = default_t_topic
             
-            # 1. Resolve Topic Mapping
+            # --- DYNAMIC TOPIC RESOLUTION ---
+            # Default to the manually set pair topic ID
+            final_topic_id = default_t_topic 
+
             if is_mir:
-                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                if source_top:
-                    forum = getattr(first_msg.reply_to, "forum_topic", None)
-                    src_title = getattr(forum, "title", None)
-                    src_icon = None
-                    if not src_title:
-                        try:
-                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                            for t in res.topics:
-                                if t.id == source_top:
-                                    src_title = t.title
-                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                    break
-                        except: pass
-                    
-                    if src_title:
-                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
-                    else:
-                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
+                # 1. Get the topic name from the source message
+                src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
+                
+                # 2. Resolve or Create that topic name in the target chat
+                resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
+                if resolved_id:
+                    final_topic_id = resolved_id
 
-            # 2. Check if Target is a Forum
-            is_forum = False
-            try:
-                # Ensure we have the -100 prefix for entity lookup
-                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-                try:
-                    tgt_ent = await client.get_entity(real_tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-                except:
-                    tgt_ent = await client.get_entity(tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-            except: pass
-
-            # 3. Resolve Reply Header
-            reply_header = None
-            if is_forum:
-                reply_header = int(dest_topic_id) if dest_topic_id else None
-                # If replying to a specific message inside the topic, use mapped ID
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-            else:
-                # Normal Group: Use Message Mapping for Replies
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-
-            # 4. Send Content
+            # --- PREPARE MESSAGE ---
             album_text = next((msg.message for msg in messages if msg.message), "")
-            sent = None
+            real_tid = int(tid)
             
-            for attempt in range(3):
-                try:
-                    sent = await client.send_message(
-                        entity=int(tid), 
-                        message=album_text, 
-                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                        reply_to=reply_header
-                    )
-                    if sent:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                        break # Success!
-                except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
-                    await asyncio.sleep(fwe.seconds)
-                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
-                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
-                        if sent: break # Success via fallback
-                    else:
-                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                        if attempt == 2: # Last attempt
-                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-            
+            # 3. Handle specific message replies within the topic
+            reply_header = final_topic_id
+            if first_msg.reply_to_msg_id:
+                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                if mapped: reply_header = int(mapped)
+
+            # 4. SEND (Using send_message for better Forum reliability)
+            if len(messages) > 1:
+                sent = await client.send_message(
+                    entity=real_tid, 
+                    message=album_text, 
+                    file=[m.media for m in messages],
+                    reply_to=reply_header
+                )
+            else:
+                sent = await client.send_message(
+                    entity=real_tid, 
+                    message=first_msg.message, 
+                    file=first_msg.media,
+                    reply_to=reply_header
+                )
+
+            if sent:
+                sent_id = sent[0].id if isinstance(sent, list) else sent.id
+                save_message_mapping(sid, first_msg.id, tid, sent_id)
+                logger.info(f"✅ USERBOT LIVE: Mirrored to {tid} Topic: {final_topic_id}")
+
         except Exception as e:
-            logger.error(f"Global Mirror Error: {e}")
+            logger.error(f"❌ USERBOT LIVE ERROR: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
