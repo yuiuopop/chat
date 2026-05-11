@@ -1574,13 +1574,13 @@ def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
 
-@bot.message_handler(commands=['ban'])
+@bot.message_handler(commands=['ban', 'block'])
 def cmd_ban_user(message):
     if message.from_user.id != ADMIN_ID: return
     try:
         args = message.text.split()
         if len(args) < 2:
-            bot.reply_to(message, "💡 **Usage:** `/ban [username_or_id]`", parse_mode="Markdown")
+            bot.reply_to(message, "💡 **Usage:** `/ban` or `/block [username_or_id]`", parse_mode="Markdown")
             return
         
         target = args[1].replace("@", "")
@@ -1593,13 +1593,13 @@ def cmd_ban_user(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ban Error: {e}")
 
-@bot.message_handler(commands=['unban'])
+@bot.message_handler(commands=['unban', 'unblock'])
 def cmd_unban_user(message):
     if message.from_user.id != ADMIN_ID: return
     try:
         args = message.text.split()
         if len(args) < 2:
-            bot.reply_to(message, "💡 **Usage:** `/unban [username_or_id]`", parse_mode="Markdown")
+            bot.reply_to(message, "💡 **Usage:** `/unban` or `/unblock [username_or_id]`", parse_mode="Markdown")
             return
         
         target = args[1].replace("@", "")
@@ -1612,7 +1612,7 @@ def cmd_unban_user(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Unban Error: {e}")
 
-@bot.message_handler(commands=['banlist'])
+@bot.message_handler(commands=['banlist', 'blocklist'])
 def cmd_ban_list(message):
     if message.from_user.id != ADMIN_ID: return
     bot.send_message(message.chat.id, "🚫 **Banned Users**\n\nMessages from these users are ignored by all automated tasks:", reply_markup=banlist_markup(), parse_mode="Markdown")
