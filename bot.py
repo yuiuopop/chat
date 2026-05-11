@@ -1600,13 +1600,20 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
 async def resolve_target_id(client: TelegramClient, target_ref):
     try:
+        # 1. Try direct fetch (ID or Username)
         return await client.get_entity(target_ref)
     except Exception as e:
         logger.error(f"Entity Resolve Error: {e}")
-        # Try finding via dialogs if ref is just an ID
-        async for dialog in client.iter_dialogs(limit=200):
-            if str(dialog.id) == str(target_ref):
-                return dialog.entity
+        
+        # 2. Try normalized ID check (stripping -100)
+        try:
+            ref_str = str(target_ref).replace("-100", "")
+            async for dialog in client.iter_dialogs(limit=400):
+                d_id_str = str(dialog.id).replace("-100", "")
+                if d_id_str == ref_str:
+                    return dialog.entity
+        except: pass
+        
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
@@ -1628,10 +1635,14 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
+        # Force peer resolution (Anti PeerIdInvalid)
+        target_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = target_chat.id
+
         # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
         # Use int(s_topic) if it's a valid thread ID, otherwise None for entire chat
         target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
-        async for m in userbot.iter_messages(sid, limit=limit, reply_to=target_topic):
+        async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
@@ -1642,9 +1653,9 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 with db_conn() as conn:
                     c = conn.cursor()
                     if DATABASE_URL:
-                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid, m.id, m_type, m.message or ""))
+                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
                     else:
-                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid, m.id, m_type, m.message or ""))
+                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
                     if c.rowcount > 0: collected += 1
             
             if scanned % 20 == 0:
