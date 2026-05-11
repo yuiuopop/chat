@@ -231,11 +231,14 @@ def init_db():
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
+                    source_topic_name TEXT DEFAULT 'General',
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_name TEXT DEFAULT 'General'")
             except: pass
 
             # Banned Users Table
@@ -363,11 +366,14 @@ def init_db():
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
+                    source_topic_name TEXT DEFAULT 'General',
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_name TEXT DEFAULT 'General'")
             except: pass
 
             # Banned Users Table
@@ -607,7 +613,7 @@ def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.source_topic_name
             FROM log_media m
             WHERE m.source_chat_id = {p}
         """
@@ -731,19 +737,28 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
         status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
 
+        resolved_topics_cache = {} # Cache for this run to speed up resolution
+
         for i, item in enumerate(items):
             if task_key not in running_tasks:
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
                 
-            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id = item
+            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, src_topic_name = item
             
             try:
                 if log_msg_id is None or bot_id is None:
                     continue 
 
-                # FIX: We fetch the message first, then send it with a reply_to attribute.
-                # This is the only way to guarantee it hits the correct Forum Topic.
+                # Resolve Topic Dynamically if not manually overridden
+                final_topic = target_topic_id
+                if not final_topic:
+                    if src_topic_name in resolved_topics_cache:
+                        final_topic = resolved_topics_cache[src_topic_name]
+                    else:
+                        final_topic = await resolve_target_topic_id(userbot, target_id, source_id, src_topic_name)
+                        resolved_topics_cache[src_topic_name] = final_topic
+
                 log_bot_entity = await userbot.get_input_entity(int(bot_id))
                 
                 # Get the message from the log bot
@@ -755,8 +770,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                         entity=int(target_id),
                         message=msg_to_forward.message,
                         file=msg_to_forward.media,
-                        # This specifies the Topic ID
-                        reply_to=target_topic_id if target_topic_id else None 
+                        reply_to=final_topic
                     )
                     success += 1
                 else:
@@ -778,27 +792,29 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
     finally:
         running_tasks.pop(task_key, None)
 
-def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption):
+def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name="General"):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s) 
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
-                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption,
+                   source_topic_name = EXCLUDED.source_topic_name""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name)
             )
         else:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
-                   media_type = excluded.media_type, caption = excluded.caption""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                   media_type = excluded.media_type, caption = excluded.caption,
+                   source_topic_name = excluded.source_topic_name""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name)
             )
 
 def get_logged_media_stats(bot_id):
@@ -1241,6 +1257,79 @@ async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
         # Run vaulting in background tasks
         asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(source_msg_id), username))
 
+async def resolve_source_topic_name(client, chat_id, message):
+    """Resolves the title of the forum topic the message belongs to."""
+    if not message.reply_to:
+        return "General"
+    
+    top_id = getattr(message.reply_to, 'reply_to_top_id', None) or message.reply_to.reply_to_msg_id
+    if not top_id:
+        return "General"
+        
+    try:
+        # Check if the chat is a forum
+        entity = await client.get_entity(int(chat_id))
+        if not getattr(entity, 'forum', False):
+            return "General"
+
+        # Fetch topics and match ID
+        res = await client(functions.channels.GetForumTopicsRequest(
+            channel=entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+        ))
+        for t in res.topics:
+            if t.id == top_id:
+                return t.title
+    except Exception as e:
+        logger.debug(f"Source Topic Resolution Failed: {e}")
+    
+    return "General"
+
+async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
+    """
+    Logic:
+    - If target is NOT a forum: returns None (sends to general).
+    - If target IS a forum:
+        - Tries to find a topic named 'source_msg_topic_name'.
+        - If not found, creates it.
+        - Returns the topic ID.
+    """
+    try:
+        target_entity = await client.get_entity(int(target_chat_id))
+        
+        # CASE 1: Target is a normal group
+        if not getattr(target_entity, 'forum', False):
+            return None
+
+        # CASE 2 & 3: Target is a Forum
+        # If the source didn't have a topic name (Normal Group), use Group Name
+        if not source_msg_topic_name or source_msg_topic_name == "General":
+            source_entity = await client.get_entity(int(source_chat_id))
+            source_msg_topic_name = getattr(source_entity, 'title', "Archive")
+
+        # Search for existing topic by name
+        try:
+            topics = await client(functions.channels.GetForumTopicsRequest(
+                channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            ))
+            
+            for t in topics.topics:
+                if t.title.lower() == source_msg_topic_name.lower():
+                    return t.id
+        except: pass
+        
+        # Create new topic if none match
+        try:
+            created = await client(functions.channels.CreateForumTopicRequest(
+                channel=target_entity,
+                title=source_msg_topic_name
+            ))
+            return created.updates[0].id
+        except:
+            return None
+    except Exception as e:
+        logger.error(f"Topic Resolver Error: {e}")
+        return None
+
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
@@ -1251,8 +1340,11 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             # If not found, try to 'find' the bot by ID directly (forces session lookup)
             target_peer = await client.get_entity(int(log_chat_id))
 
+        # RESOLVE TOPIC NAME
+        src_topic_name = await resolve_source_topic_name(client, source_chat_id, message)
+
         # SEND CONTENT with metadata for Log Bot extraction
-        metadata = f"SID: {source_chat_id} | MID: {source_msg_id}\n"
+        metadata = f"SID: {source_chat_id} | MID: {source_msg_id} | TOPIC: {src_topic_name}\n"
         caption_text = metadata + (message.message or "")
         
         try:
@@ -1288,7 +1380,8 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
                 source_msg_id=int(source_msg_id),
                 file_id=None, # Bot API file_id will be filled by the Log Bot's own listener
                 media_type=type(message.media).__name__ if message.media else "text",
-                caption=message.message or ""
+                caption=message.message or "",
+                source_topic_name=src_topic_name
             )
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
@@ -2961,15 +3054,19 @@ class LogBotManager:
                 
                 if file_id:
                     sid, mid = 0, message.message_id
+                    topic_name = "General"
                     if caption and "SID:" in caption and "MID:" in caption:
                         try:
+                            # SID: ... | MID: ... | TOPIC: ...
                             parts = caption.split("|")
                             sid = int(parts[0].replace("SID:", "").strip())
                             mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
+                            if len(parts) > 2 and "TOPIC:" in parts[2]:
+                                topic_name = parts[2].split("\n")[0].replace("TOPIC:", "").strip()
                             caption = caption.split("\n", 1)[1] if "\n" in caption else ""
                         except: pass
                     
-                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption)
+                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, source_topic_name=topic_name)
                     if sid == 0 and message.from_user.id == ADMIN_ID:
                         bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`\nFetch: `/get {message.message_id}`")
             except Exception as e: logger.error(f"Logging Error: {e}")
