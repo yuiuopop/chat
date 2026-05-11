@@ -64,7 +64,7 @@ def db_conn():
     global USING_POSTGRES
     conn = None
     try:
-        if USING_POSTGRES:
+        if DATABASE_URL:
             try:
                 import psycopg2
                 conn = psycopg2.connect(DATABASE_URL)
