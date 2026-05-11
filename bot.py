@@ -209,7 +209,7 @@ def init_db():
                         file_id TEXT,
                         media_type TEXT,
                         caption TEXT,
-                        source_topic_name TEXT DEFAULT 'General',
+                        source_topic_name TEXT ,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(bot_id, source_chat_id, source_msg_id)
                     )
