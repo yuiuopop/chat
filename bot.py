@@ -704,7 +704,7 @@ def stop_task(task_key):
         return True
     return False
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None):
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
     """Releases vaulted media using the Userbot for forwarding."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
@@ -743,7 +743,12 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     continue 
 
                 log_bot_peer = await userbot.get_input_entity(int(bot_id))
-                await userbot.forward_messages(int(target_id), int(log_msg_id), from_peer=log_bot_peer)
+                await userbot.forward_messages(
+                    entity=int(target_id), 
+                    messages=int(log_msg_id), 
+                    from_peer=log_bot_peer,
+                    top_msg_id=target_topic_id
+                )
                 success += 1
             except Exception as e:
                 logger.error(f"Vault Release item error: {e}")
@@ -2996,19 +3001,53 @@ class LogBotManager:
         def finish_dump_flow(call):
             # Format: lb_vault_tgt_{tid}
             parts = call.data.split("_")
-            if parts[3] == "page": return # Handled by the generic tgt handler if needed
+            if parts[3] == "page": return 
             
             target_chat_id = int(parts[3])
-            source_chat_id = login_data.get(call.from_user.id, {}).get("dump_sid")
-            
-            if not source_chat_id:
-                bot_instance.answer_callback_query(call.id, "❌ Session expired")
-                return
+            uid = call.from_user.id
 
-            login_data[call.from_user.id]["dump_tid"] = target_chat_id
-            admin_states[f"lb_{bot_id}_{call.from_user.id}"] = f"wait_dump_count_{target_chat_id}"
+            async def check_forum():
+                try:
+                    entity = await userbot.get_entity(target_chat_id)
+                    # If it's a forum, show topic selection
+                    if getattr(entity, 'forum', False):
+                        markup = await get_topic_selection_markup(target_chat_id, "lb_vault_topic")
+                        bot_instance.edit_message_text(
+                            f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}` to send media to:",
+                            call.message.chat.id, call.message.message_id, reply_markup=markup
+                        )
+                    else:
+                        # Standard group, proceed to count
+                        if uid not in login_data: login_data[uid] = {}
+                        login_data[uid]["dump_tid"] = target_chat_id
+                        login_data[uid]["dump_topic"] = None
+                        
+                        admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{target_chat_id}"
+                        bot_instance.edit_message_text(
+                            f"🔢 **How many items?**\nEnter the number of media to send to group `{target_chat_id}`:",
+                            call.message.chat.id, call.message.message_id
+                        )
+                except Exception as e:
+                    bot_instance.send_message(call.message.chat.id, f"❌ Error: {e}")
+
+            asyncio.run_coroutine_threadsafe(check_forum(), loop)
+
+        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("lb_vault_topic_"))
+        def handle_vault_topic(call):
+            # Format: lb_vault_topic_{chat_id}_{topic_id}
+            payload = call.data.replace("lb_vault_topic_", "")
+            tid_str, topic_id_str = payload.rsplit("_", 1)
+            target_id = int(tid_str)
+            topic_id = int(topic_id_str)
+            uid = call.from_user.id
+
+            if uid not in login_data: login_data[uid] = {}
+            login_data[uid]["dump_tid"] = target_id
+            login_data[uid]["dump_topic"] = topic_id if topic_id != 0 else None
+            
+            admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{target_id}"
             bot_instance.edit_message_text(
-                f"🔢 **How many items?**\nEnter the number of media to send to target `{target_chat_id}`:",
+                f"🔢 **Topic Selected!**\nEnter the number of media to send to topic ID `{topic_id}`:",
                 call.message.chat.id, call.message.message_id
             )
 
@@ -3146,7 +3185,15 @@ class LogBotManager:
                 try:
                     target_cid = int(state.split("_")[-1])
                     count = int(text)
-                    source_cid = login_data[uid]["dump_sid"]
+                    
+                    user_session = login_data.get(uid)
+                    if not user_session or "dump_sid" not in user_session:
+                        bot_instance.send_message(message.chat.id, "❌ Session expired.")
+                        return
+
+                    source_cid = user_session["dump_sid"]
+                    target_topic = user_session.get("dump_topic") 
+                    
                     admin_states.pop(f"lb_{bot_id}_{uid}", None)
                     
                     # Start the background task
@@ -3158,7 +3205,8 @@ class LogBotManager:
                             target_id=target_cid, 
                             interval=2.0, 
                             log_target_id=bot_id,
-                            limit=count
+                            limit=count,
+                            target_topic_id=target_topic
                         ), 
                         loop
                     )
