@@ -209,7 +209,7 @@ def init_db():
                         file_id TEXT,
                         media_type TEXT,
                         caption TEXT,
-                        source_topic_name TEXT ,
+                        source_topic_name TEXT DEFAULT 'General',
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(bot_id, source_chat_id, source_msg_id)
                     )
@@ -1360,23 +1360,22 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
-        # RESOLVE ENTITY: Fetch the access hash for the bot or peer
-        target_peer = await resolve_target_id(client, log_chat_id)
-
-        # RESOLVE TOPIC NAME
+        # Resolve the actual topic name from the source message
         src_topic_name = await resolve_source_topic_name(client, source_chat_id, message)
         
-        # --- NEW: TOPIC ROUTING FOR VAULT ---
+        # Resolve the reply-to ID (if any)
+        src_reply_id = message.reply_to.reply_to_msg_id if message.reply_to else 0
+
+        target_peer = await resolve_target_id(client, log_chat_id)
+        
         # We find or create a topic IN THE LOG BOT'S VAULT matches the source topic
         vault_topic_id = await resolve_target_topic_id(client, log_chat_id, source_chat_id, src_topic_name)
 
-        # RESOLVE REPLY ID
-        src_reply_id = message.reply_to.reply_to_msg_id if message.reply_to else 0
-
-        # SEND CONTENT with metadata for Log Bot extraction
+        # We embed RID (Reply ID) and TOPIC into the metadata string for the Log Bot to parse
         metadata = f"SID: {source_chat_id} | MID: {source_msg_id} | RID: {src_reply_id} | TOPIC: {src_topic_name}\n"
         caption_text = metadata + (message.message or "")
         
+        vaulted = None
         try:
             vaulted = await client.send_message(
                 entity=target_peer,
@@ -1404,16 +1403,17 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             
         if vaulted:
             logger.info(f"✅ VAULT: Message {source_msg_id} logged successfully to @{t_name}")
-            # Immediately save log_msg_id to prevent NoneType errors in release
+            # Save mapping immediately for internal release engine tracking
             save_logged_media(
                 bot_id=int(log_chat_id),
                 log_msg_id=int(vaulted.id),
                 source_chat_id=int(source_chat_id),
                 source_msg_id=int(source_msg_id),
-                file_id=None, # Bot API file_id will be filled by the Log Bot's own listener
+                file_id=None, # Will be updated by Log Bot's listener
                 media_type=type(message.media).__name__ if message.media else "text",
                 caption=message.message or "",
-                source_topic_name=src_topic_name
+                source_topic_name=src_topic_name,
+                source_reply_to=src_reply_id
             )
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
@@ -3117,7 +3117,8 @@ class LogBotManager:
             try:
                 m_type = "document"
                 file_id = None
-                caption = message.caption or ""
+                original_caption = message.caption or ""
+                
                 if message.photo: m_type, file_id = "photo", message.photo[-1].file_id
                 elif message.video: m_type, file_id = "video", message.video.file_id
                 elif message.document: m_type, file_id = "document", message.document.file_id
@@ -3125,41 +3126,40 @@ class LogBotManager:
                 elif message.animation: m_type, file_id = "animation", message.animation.file_id
                 elif message.sticker: m_type, file_id = "sticker", message.sticker.file_id
                 
-                if file_id:
-                    sid, mid = 0, message.message_id
-                    t_name = "General"
-                    original_caption = caption
-                    
-                    if original_caption and "SID:" in original_caption and "MID:" in original_caption:
-                        try:
-                            # SID: ... | MID: ... | RID: ... | TOPIC: ...
-                            parts = original_caption.split("|")
-                            sid = int(parts[0].replace("SID:", "").strip())
-                            mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
-                            
-                            if len(parts) > 2 and "TOPIC:" in parts[2]:
-                                t_name = parts[2].split("\n")[0].replace("TOPIC:", "").strip()
-                            elif len(parts) > 3 and "TOPIC:" in parts[3]:
-                                t_name = parts[3].split("\n")[0].replace("TOPIC:", "").strip()
-                                
-                            rid = 0
-                            if "RID:" in original_caption:
-                                try: rid = int(original_caption.split("RID:")[1].split("|")[0].strip())
-                                except: pass
+                if not file_id: return
 
-                            # Strip metadata from caption for storage
-                            caption = original_caption.split("\n", 1)[1] if "\n" in original_caption else ""
-                            
-                            save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, t_name, source_reply_to=rid)
-                            bot_instance.reply_to(message, f"✅ Vaulted: `{mid}` from `{sid}` (Reply: `{rid}`)")
-                            return
-                        except Exception as e:
-                            logger.error(f"Metadata Parse Error: {e}")
-                    
-                    # Fallback for direct uploads or failed parsing
-                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, t_name)
-                    if sid == 0 and message.from_user.id == ADMIN_ID:
-                        bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`")
+                if "SID:" in original_caption and "MID:" in original_caption:
+                    try:
+                        # Parsing: SID: ... | MID: ... | RID: ... | TOPIC: ...
+                        parts = original_caption.split("|")
+                        sid = int(parts[0].replace("SID:", "").strip())
+                        mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
+                        
+                        rid = 0
+                        t_name = "General"
+                        if "RID:" in original_caption:
+                            try: rid = int(original_caption.split("RID:")[1].split("|")[0].split("\n")[0].strip())
+                            except: pass
+                        if "TOPIC:" in original_caption:
+                            t_name = original_caption.split("TOPIC:")[1].split("\n")[0].strip()
+
+                        final_caption = original_caption.split("\n", 1)[1] if "\n" in original_caption else ""
+                        
+                        save_logged_media(
+                            bot_id=bot_id, log_msg_id=message.message_id, 
+                            source_chat_id=sid, source_msg_id=mid, 
+                            file_id=file_id, media_type=m_type, caption=final_caption, 
+                            source_topic_name=t_name, source_reply_to=rid
+                        )
+                        bot_instance.reply_to(message, f"✅ Vaulted: `{mid}` from `{sid}`\nTopic: `{t_name}` | Reply: `{rid}`")
+                        return
+                    except Exception as e:
+                        logger.error(f"Metadata Parse Error: {e}")
+
+                # Fallback for manual uploads
+                save_logged_media(bot_id, message.message_id, 0, message.message_id, file_id, m_type, original_caption, "General")
+                if message.from_user.id == ADMIN_ID:
+                    bot_instance.reply_to(message, f"✅ **Saved to Vault (Manual)!**\n🆔 ID: `{message.message_id}`")
             except Exception as e: logger.error(f"Logging Error: {e}")
 
         @bot_instance.callback_query_handler(func=lambda call: True)
