@@ -1296,7 +1296,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
             await asyncio.sleep(fwe.seconds)
             return await vault_media(client, messages, source_chat_id, log_chat_id, t_name) # Retry
         except Exception as e:
-            if "protected" in str(e).lower() or "forward" in str(e).lower():
+            if any(x in str(e).lower() for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
                 logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
                 # Download all if album
                 files = []
@@ -1503,7 +1503,7 @@ def setup_automation_handlers(client: TelegramClient):
                     await asyncio.sleep(2)
                 except Exception as e:
                     err_msg = str(e).lower()
-                    if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
+                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
                         logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
                         sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
                         if sent: break # Success via fallback
@@ -2476,7 +2476,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     if c.rowcount > 0: 
                         collected += 1
                         # Instantly send to log targets
-                        await forward_to_log_bots(userbot, m, sid_resolved, m.id)
+                        await forward_to_log_bots(userbot, [m], sid_resolved)
             
             if limit and collected >= limit: break
             
@@ -2549,7 +2549,7 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                     if c.rowcount > 0: 
                         collected += 1
                         # Instantly send to log targets
-                        await forward_to_log_bots(userbot, m, sid, m.id)
+                        await forward_to_log_bots(userbot, [m], sid)
             
             if scanned % 20 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
