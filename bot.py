@@ -743,11 +743,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     continue 
 
                 log_bot_peer = await userbot.get_input_entity(int(bot_id))
+                
+                # Telethon uses 'comment_to' to specify the Topic ID (thread_id)
                 await userbot.forward_messages(
                     entity=int(target_id), 
                     messages=int(log_msg_id), 
                     from_peer=log_bot_peer,
-                    top_msg_id=target_topic_id
+                    comment_to=target_topic_id
                 )
                 success += 1
             except Exception as e:
@@ -3074,10 +3076,12 @@ class LogBotManager:
                 sid, tid = int(parts[3]), int(parts[4])
                 interval = float(parts[5])
                 topic_id = int(parts[6])
+                
+                # FIX: Convert 0 back to None for the engine
                 topic_val = topic_id if topic_id != 0 else None
                 
                 bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval, target_topic_id=topic_val), loop)
+                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval, target_topic_id=topic_val, log_target_id=bot_id), loop)
 
         @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
         def handle_lb_messages(message):
