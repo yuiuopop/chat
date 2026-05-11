@@ -64,7 +64,7 @@ def db_conn():
     global USING_POSTGRES
     conn = None
     try:
-        if DATABASE_URL:
+        if USING_POSTGRES:
             try:
                 import psycopg2
                 conn = psycopg2.connect(DATABASE_URL)
@@ -107,7 +107,7 @@ def init_db():
             )
         """)
         
-        if DATABASE_URL:
+        if USING_POSTGRES:
             # PostgreSQL
             c.execute("""
                 CREATE TABLE IF NOT EXISTS target_pairs (
@@ -403,7 +403,7 @@ def ban_user(user_id=None, username=None):
     with db_conn() as conn:
         c = conn.cursor()
         uname = username.lower().replace("@", "") if username else None
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute("INSERT INTO banned_users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (user_id, uname))
         else:
             c.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, uname))
@@ -436,7 +436,7 @@ def set_setting(key, value):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 """
                 INSERT INTO settings (key, value) VALUES (%s, %s)
@@ -454,7 +454,7 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
@@ -469,7 +469,7 @@ def save_topic_mapping(s_chat, s_topic, t_chat, t_topic):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 """
                 INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
@@ -505,7 +505,7 @@ def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 """
                 INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
@@ -547,7 +547,7 @@ def add_log_target(target_id, target_type, target_name, bot_token=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 "INSERT INTO log_targets (target_id, target_type, target_name, bot_token) VALUES (%s, %s, %s, %s) ON CONFLICT(target_id) DO UPDATE SET bot_token = EXCLUDED.bot_token",
                 (target_id, target_type, target_name, bot_token)
@@ -568,7 +568,7 @@ def save_media_log(source_chat_id, source_message_id, log_target_id, file_id, me
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 "INSERT INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s, %s) ON CONFLICT(source_chat_id, source_message_id, log_target_id) DO NOTHING",
                 (source_chat_id, source_message_id, log_target_id, file_id, media_type)
@@ -671,7 +671,7 @@ def add_log_bot(token, username, bot_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 "INSERT INTO log_bots (bot_token, bot_username, bot_id) VALUES (%s, %s, %s) ON CONFLICT(bot_token) DO UPDATE SET bot_username = EXCLUDED.bot_username, bot_id = EXCLUDED.bot_id",
                 (token, username, bot_id)
@@ -808,7 +808,7 @@ def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if DATABASE_URL:
+        if USING_POSTGRES:
             c.execute(
                 """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
@@ -1383,7 +1383,7 @@ def setup_automation_handlers(client: TelegramClient):
                     m_type = type(m.media).__name__
                     with db_conn() as conn:
                         c = conn.cursor()
-                        if DATABASE_URL:
+                        if USING_POSTGRES:
                             c.execute(
                                 "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                                 (pid, sid, m.id, m_type, m.message or "")
@@ -2148,7 +2148,7 @@ def handle_callbacks(call):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            if DATABASE_URL:
+            if USING_POSTGRES:
                 c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
             else:
                 c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
@@ -2463,7 +2463,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
                     c = conn.cursor()
-                    if DATABASE_URL:
+                    if USING_POSTGRES:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                             (pair_id, sid_resolved, m.id, m_type, m.message or "")
@@ -2522,10 +2522,14 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
+        # Force peer resolution (Anti PeerIdInvalid)
+        target_chat = await resolve_target_id(userbot, sid)
+        sid_resolved = target_chat.id
+        
         # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
         # Use int(s_topic) if it's a valid thread ID, otherwise None for entire chat
         target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
-        async for m in userbot.iter_messages(sid, limit=limit, reply_to=target_topic):
+        async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
@@ -2542,14 +2546,14 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
                     c = conn.cursor()
-                    if DATABASE_URL:
-                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid, m.id, m_type, m.message or ""))
+                    if USING_POSTGRES:
+                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
                     else:
-                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid, m.id, m_type, m.message or ""))
+                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
                     if c.rowcount > 0: 
                         collected += 1
                         # Instantly send to log targets
-                        await forward_to_log_bots(userbot, [m], sid)
+                        await forward_to_log_bots(userbot, [m], sid_resolved)
             
             if scanned % 20 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
