@@ -1285,28 +1285,39 @@ async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
 async def resolve_source_topic_name(client, chat_id, message):
     """Resolves the title of the forum topic the message belongs to."""
     if not message.reply_to:
+        logger.debug(f"MIRROR: Message has no reply_to header in {chat_id}")
         return "General"
     
     top_id = getattr(message.reply_to, 'reply_to_top_id', None) or message.reply_to.reply_to_msg_id
+    logger.debug(f"MIRROR: Resolved top_id {top_id} for chat {chat_id}")
+    
     if not top_id:
         return "General"
         
     try:
         # Check if the chat is a forum
         entity = await client.get_entity(int(chat_id))
-        if not getattr(entity, 'forum', False):
+        is_forum = getattr(entity, 'forum', False)
+        logger.debug(f"MIRROR: Chat {chat_id} is_forum: {is_forum}")
+        
+        if not is_forum:
             return "General"
 
         # Fetch topics and match ID
+        logger.debug(f"MIRROR: Fetching forum topics for {chat_id}...")
         res = await client(functions.channels.GetForumTopicsRequest(
             channel=entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
         ))
         for t in res.topics:
             if t.id == top_id:
+                logger.info(f"MIRROR: Successfully resolved topic title: '{t.title}'")
                 return t.title
+        
+        logger.warning(f"MIRROR: Topic ID {top_id} not found in topic list for {chat_id}")
     except Exception as e:
-        logger.debug(f"Source Topic Resolution Failed: {e}")
+        logger.error(f"MIRROR: Source Topic Resolution Failed for chat {chat_id}: {e}")
     
+    logger.debug(f"MIRROR: Falling back to 'General' for chat {chat_id}")
     return "General"
 
 async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
@@ -1522,18 +1533,18 @@ def setup_automation_handlers(client: TelegramClient):
             if is_mir and first_msg.reply_to:
                 source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
                 if source_top:
-                    forum = getattr(first_msg.reply_to, "forum_topic", None)
-                    src_title = getattr(forum, "title", None)
+                    src_title = None
                     src_icon = None
-                    if not src_title:
-                        try:
-                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                            for t in res.topics:
-                                if t.id == source_top:
-                                    src_title = t.title
-                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                    break
-                        except: pass
+                    try:
+                        # Direct fetch for source topic info
+                        res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                        for t in res.topics:
+                            if t.id == source_top:
+                                src_title = t.title
+                                src_icon = getattr(t, "icon_emoji_id", None)
+                                break
+                    except Exception as e:
+                        logger.debug(f"MIRROR: Source Topic Info Fetch Failed: {e}")
                     
                     if src_title:
                         logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
@@ -1552,24 +1563,36 @@ def setup_automation_handlers(client: TelegramClient):
                 pass
 
             # 3. Resolve Reply Header
-            reply_header = None
+            reply_to_payload = None
             if is_forum:
-                reply_header = int(dest_topic_id) if dest_topic_id else None
-                # If replying to a specific message inside the topic, use mapped ID
+                topic_id = int(dest_topic_id) if dest_topic_id else None
+                if topic_id:
+                    # Explicitly use InputReplyToMessage for Forum Topics
+                    reply_to_payload = types.InputReplyToMessage(
+                        reply_to_msg_id=topic_id,
+                        top_msg_id=topic_id
+                    )
+                
+                # If replying to a specific message inside the topic
                 if first_msg.reply_to_msg_id:
                     mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
+                    if mapped:
+                        reply_to_payload = types.InputReplyToMessage(
+                            reply_to_msg_id=int(mapped),
+                            top_msg_id=topic_id
+                        )
             else:
-                # Normal Group: Use Message Mapping for Replies
+                # Normal Group: Use standard integer reply
                 if first_msg.reply_to_msg_id:
                     mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
+                    if mapped:
+                        reply_to_payload = int(mapped)
 
             # 4. Send Content
             album_text = next((msg.message for msg in messages if msg.message), "")
             sent = None
             
-            logger.info(f"MIRROR: Sending to {tid} with reply_header: {reply_header}")
+            logger.info(f"MIRROR: Sending to {tid} with reply_header: {reply_to_payload}")
             
             for attempt in range(3):
                 try:
@@ -1577,7 +1600,7 @@ def setup_automation_handlers(client: TelegramClient):
                         entity=int(tid), 
                         message=album_text, 
                         file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                        reply_to=reply_header
+                        reply_to=reply_to_payload
                     )
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
@@ -1593,7 +1616,7 @@ def setup_automation_handlers(client: TelegramClient):
                     err_msg = str(e).lower()
                     if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
                         logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
+                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_to_payload)
                         if sent: break # Success via fallback
                     else:
                         logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
