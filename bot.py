@@ -64,6 +64,8 @@ topic_creation_lock = asyncio.Lock()
 # DB (SQLite/PostgreSQL)
 # -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 DB_PATH = "userbot_v2.db"
 USING_POSTGRES = False
 
@@ -678,8 +680,8 @@ def stop_task(task_key):
         return True
     return False
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
-    """Releases vaulted media with robust ID normalization and error logging."""
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=2.5, limit=None, log_target_id=None, target_topic_id=None):
+    """Releases vaulted media using the Userbot for forwarding with robust rate limiting."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
         sender_bot.send_message(admin_chat_id, "⚠️ Task already running!")
@@ -696,17 +698,16 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
         total = len(items)
         success, failed = 0, 0
-        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Starting Transfer...**\nItems: `{total}`")
+        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`")
 
-        # --- ID NORMALIZATION ---
-        # Ensure target_id is a proper Telegram negative integer
-        raw_tid = str(target_id)
-        if not raw_tid.startswith("-") and len(raw_tid) > 8:
-            final_tid = int(f"-100{raw_tid}")
-        else:
-            final_tid = int(raw_tid)
+        # Robust ID normalization
+        def normalize_tid(x):
+            raw = str(x)
+            if not raw.startswith("-") and len(raw) > 8:
+                return int(f"-100{raw}")
+            return int(raw)
 
-        # Cache for topic resolution
+        final_tid = normalize_tid(target_id)
         resolved_topics_cache = {}
 
         for i, item in enumerate(items):
@@ -714,10 +715,9 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
             
-            # source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, src_topic_name, s_reply_id = item
             smid, file_id, m_type, caption, l_mid, b_id, src_topic_name, s_rid = item
             
-            # Resolve Topic: provided target_topic_id (from UI) or try to resolve by name
+            # Resolve Topic
             thread_id = target_topic_id
             if not thread_id and src_topic_name:
                 if src_topic_name in resolved_topics_cache:
@@ -726,15 +726,14 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     thread_id = await resolve_target_topic_id(userbot, target_id, source_id, src_topic_name)
                     resolved_topics_cache[src_topic_name] = thread_id
 
-            # RECONSTRUCT REPLY CHAIN
-            final_reply_to = thread_id # Default to Topic Root
+            # Reconstruct Reply
+            final_reply_to = thread_id
             if s_rid and int(s_rid) > 0:
                 mapped_target_id = get_message_mapping(source_id, s_rid, target_id)
                 if mapped_target_id:
                     final_reply_to = int(mapped_target_id)
 
             try:
-                # telebot uses message_thread_id for topics
                 m_type = m_type.lower()
                 sent_item = None
                 
@@ -752,28 +751,38 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     sent_item = sender_bot.send_document(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
                 
                 if sent_item:
-                    # Save mapping so future items in this batch can reply to this one
                     save_message_mapping(source_id, smid, target_id, sent_item.message_id, pair_id=None)
                     success += 1
                 else:
                     failed += 1
+
+            except errors.FloodWaitError as e:
+                logger.warning(f"⚠️ Rate limited. Waiting {e.seconds} seconds.")
+                await asyncio.sleep(e.seconds)
+                # Note: We skip the item here to prevent endless loops, but could retry
             except Exception as e:
+                if "message thread not found" in str(e).lower():
+                    logger.error("❌ Topic ID invalid. Resetting cache.")
+                    resolved_topics_cache.pop(src_topic_name, None)
                 logger.error(f"❌ LOGBOT SEND ERROR: {e}")
                 failed += 1
 
             if (i + 1) % 5 == 0 or (i + 1) == total:
                 try: 
                     sender_bot.edit_message_text(
-                        f"📊 **Status:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", 
+                        f"📊 **Progress:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", 
                         admin_chat_id, status_msg.message_id
                     )
                 except: pass
-            await asyncio.sleep(interval)
+            
+            # DYNAMIC INTERVAL: Slow down if success rate is high to prevent flood
+            current_sleep = interval if success % 10 != 0 else interval * 1.5
+            await asyncio.sleep(current_sleep)
 
-        sender_bot.send_message(admin_chat_id, f"✅ **Transfer Complete!**\nSuccess: `{success}`\nFailed: `{failed}`")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete!**\nSuccess: `{success}`\nFailed: `{failed}`")
     except Exception as e:
-        logger.error(f"Global Release Error: {e}")
-        sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
+        logger.error(f"Vault Engine Error: {e}")
+        sender_bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
     finally:
         running_tasks.pop(task_key, None)
 
@@ -1566,7 +1575,13 @@ def setup_automation_handlers(client: TelegramClient):
                 logger.info(f"✅ MIRROR: Sent successfully to {tid}")
                 send_monitor_log(f"✅ Successfully Mirrored to {tid}")
 
+        except errors.FloodWaitError as e:
+            logger.warning(f"⚠️ Flood wait: {e.seconds}s. Waiting...")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
+            if "message thread not found" in str(e).lower():
+                logger.error("❌ Target Topic not found. Clearing cache.")
+                topic_cache.pop(int(tid), None)
             logger.error(f"❌ MIRROR FATAL ERROR: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, pair_id=None):
@@ -3382,16 +3397,22 @@ async def main():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                bot.delete_webhook(drop_pending_updates=True)
-                # Reduced timeout and conflict handling
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                # Ensure no old webhooks are active
+                bot.remove_webhook()
+                # Optimized polling parameters for stability on Render
+                bot.infinity_polling(
+                    skip_pending=True, 
+                    timeout=60, 
+                    long_polling_timeout=30,
+                    logger_level=logging.ERROR 
+                )
             except Exception as e:
                 if "Conflict" in str(e):
-                    logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")
-                    time.sleep(20)
-                else:
-                    logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
+                    logger.warning("⚠️ Conflict: Another instance is running. Waiting 30s...")
                     time.sleep(30)
+                else:
+                    logger.error(f"❌ Polling crashed: {e}. Restarting in 15s...")
+                    time.sleep(15)
     
     polling_thread = threading.Thread(target=run_polling, daemon=True)
     polling_thread.start()
