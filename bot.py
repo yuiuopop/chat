@@ -1399,7 +1399,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
             if time.time() - cached["time"] < 600:
                 return cached['id']
         
-        # 2. Use Lock to prevent duplicate creation attempts
+        # 2. Lock to prevent multiple simultaneous API reads
         async with topic_creation_lock:
             # Check cache again inside lock
             if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
@@ -1411,6 +1411,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
             if not getattr(target_entity, 'forum', False):
                 return None
             
+            # Fetch existing topics from Telegram
             topics = await client(functions.channels.GetForumTopicsRequest(
                 channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
             ))
@@ -1424,26 +1425,10 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
                 if t.title.lower().strip() == t_name:
                     return t.id
 
-            # 3. Create if truly missing
-            logger.info(f"✨ Creating new topic: {source_msg_topic_name}")
-            created = await client(functions.channels.CreateForumTopicRequest(
-                channel=target_entity,
-                title=source_msg_topic_name
-            ))
-            
-            new_id = None
-            for update in created.updates:
-                if hasattr(update, 'message') and hasattr(update.message, 'id'):
-                    new_id = update.message.id
-                    break
-            
-            if not new_id and created.updates:
-                new_id = created.updates[0].id
-
-            if new_id:
-                topic_cache[target_chat_id][t_name] = {"id": new_id, "time": time.time()}
-                return new_id
-            
+            # --- TOPIC CREATION LOGIC REMOVED ---
+            # If the topic was not found among existing topics, we return None.
+            # This causes the message to be sent to the 'General' thread.
+            logger.info(f"ℹ️ Topic '{source_msg_topic_name}' not found in {target_chat_id}. Routing to General.")
             return None
 
     except Exception as e:
