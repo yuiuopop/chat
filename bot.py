@@ -759,22 +759,37 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                         final_topic = await resolve_target_topic_id(userbot, target_id, source_id, src_topic_name)
                         resolved_topics_cache[src_topic_name] = final_topic
 
-                log_bot_entity = await userbot.get_input_entity(int(bot_id))
+
                 
-                # Get the message from the log bot
-                msg_to_forward = await userbot.get_messages(log_bot_entity, ids=int(log_msg_id))
-                
-                if msg_to_forward:
-                    # Use send_message with reply_to to target the topic
-                    await userbot.send_message(
-                        entity=int(target_id),
-                        message=msg_to_forward.message,
-                        file=msg_to_forward.media,
-                        reply_to=final_topic
-                    )
+                # --- SENDING LOGIC ---
+                try:
+                    # Use the Log Bot (sender_bot) for sending since it can handle File IDs perfectly
+                    # final_topic (top_message ID) is exactly what telebot needs as message_thread_id
+                    thread_id = int(final_topic) if final_topic else None
+                    
+                    m_type = m_type.lower()
+                    if "photo" in m_type:
+                        sender_bot.send_photo(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "video" in m_type:
+                        sender_bot.send_video(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "document" in m_type or "file" in m_type:
+                        sender_bot.send_document(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "audio" in m_type:
+                        sender_bot.send_audio(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "animation" in m_type:
+                        sender_bot.send_animation(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "sticker" in m_type:
+                        sender_bot.send_sticker(target_id, file_id, message_thread_id=thread_id)
+                    else:
+                        # Fallback to document
+                        sender_bot.send_document(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                        
                     success += 1
-                else:
+                        
+                except Exception as e:
+                    logger.error(f"Vault Release Send Error: {e}")
                     failed += 1
+
             except Exception as e:
                 logger.error(f"Vault Release item error: {e}")
                 failed += 1
@@ -1177,15 +1192,23 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
         ))
         
-        await asyncio.sleep(1)
-        res_after = await client(functions.channels.GetForumTopicsRequest(
-            channel=t_chat_id,
-            offset_date=0, offset_id=0, offset_topic=0, limit=20
-        ))
-        for t in res_after.topics:
-            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
-            
-        final_id = topic_cache[t_chat_id].get(title_key)
+        final_id = None
+        for update in created.updates:
+            if isinstance(update, types.UpdateNewForumTopic):
+                final_id = update.topic.id
+                break
+        
+        if not final_id:
+            # Fallback: re-fetch
+            await asyncio.sleep(1)
+            res_after = await client(functions.channels.GetForumTopicsRequest(
+                channel=t_chat_id,
+                offset_date=0, offset_id=0, offset_topic=0, limit=50
+            ))
+            for t in res_after.topics:
+                topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
+            final_id = topic_cache[t_chat_id].get(title_key)
+
         if final_id and source_chat_id and source_topic_id:
             save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
             
@@ -1454,16 +1477,21 @@ def setup_automation_handlers(client: TelegramClient):
 
                     # --- ALBUM / SINGLE MESSAGE LOGIC ---
                     if m.grouped_id:
-                        if m.grouped_id not in album_cache:
-                            album_cache[m.grouped_id] = [m]
+                        album_key = f"{pid}_{m.grouped_id}"
+                        if album_key not in album_cache:
+                            album_cache[album_key] = [m]
                             # Wait for all parts
-                            async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
+                            async def delayed_send(key, t_id, mir_toggle, s_id, def_topic):
                                 await asyncio.sleep(5.0) 
-                                messages = album_cache.pop(gid, [])
+                                messages = album_cache.pop(key, [])
                                 if messages:
+                                    logger.info(f"MIRROR: Sending album ({len(messages)} parts) to {t_id}")
                                     await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                            asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic))
+                            asyncio.create_task(delayed_send(album_key, tid, is_mir, sid, t_topic))
+                        else:
+                            album_cache[album_key].append(m)
                     else:
+                        logger.info(f"MIRROR: Sending single message from {sid} to {tid} (Live: {is_live}, Mon: {is_mon})")
                         await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
                     
                     # Removed break to allow multiple pairs for the same source chat.
@@ -1503,15 +1531,12 @@ def setup_automation_handlers(client: TelegramClient):
             # 2. Check if Target is a Forum
             is_forum = False
             try:
-                # Ensure we have the -100 prefix for entity lookup
-                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-                try:
-                    tgt_ent = await client.get_entity(real_tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-                except:
-                    tgt_ent = await client.get_entity(tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-            except: pass
+                tgt_ent = await resolve_target_id(client, tid)
+                is_forum = getattr(tgt_ent, 'forum', False)
+                logger.info(f"MIRROR: Target {tid} is_forum: {is_forum}")
+            except Exception as e:
+                logger.debug(f"MIRROR: Target Forum Check Failed: {e}")
+                pass
 
             # 3. Resolve Reply Header
             reply_header = None
@@ -1530,6 +1555,8 @@ def setup_automation_handlers(client: TelegramClient):
             # 4. Send Content
             album_text = next((msg.message for msg in messages if msg.message), "")
             sent = None
+            
+            logger.info(f"MIRROR: Sending to {tid} with reply_header: {reply_header}")
             
             for attempt in range(3):
                 try:
