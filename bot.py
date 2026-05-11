@@ -719,6 +719,9 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
 
     running_tasks[task_key] = True
     
+    # Ensure userbot is ready for topic management
+    await ensure_userbot()
+    
     try:
         # Get items to release
         items = get_vaulted_media_for_source(source_id, bot_id=log_target_id)
@@ -768,21 +771,26 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     thread_id = int(final_topic) if final_topic else None
                     
                     m_type = m_type.lower()
-                    if "photo" in m_type:
-                        sender_bot.send_photo(target_id, file_id, caption=caption, message_thread_id=thread_id)
-                    elif "video" in m_type:
-                        sender_bot.send_video(target_id, file_id, caption=caption, message_thread_id=thread_id)
-                    elif "document" in m_type or "file" in m_type:
-                        sender_bot.send_document(target_id, file_id, caption=caption, message_thread_id=thread_id)
-                    elif "audio" in m_type:
-                        sender_bot.send_audio(target_id, file_id, caption=caption, message_thread_id=thread_id)
-                    elif "animation" in m_type:
-                        sender_bot.send_animation(target_id, file_id, caption=caption, message_thread_id=thread_id)
-                    elif "sticker" in m_type:
-                        sender_bot.send_sticker(target_id, file_id, message_thread_id=thread_id)
+                    t_id_int = int(str(target_id).replace("-100", ""))
+                    if not str(target_id).startswith("-100") and int(target_id) > 0:
+                        t_id_int = int(target_id)
                     else:
-                        # Fallback to document
-                        sender_bot.send_document(target_id, file_id, caption=caption, message_thread_id=thread_id)
+                        t_id_int = int(target_id) # Telebot handles -100 IDs as negative integers
+                        
+                    if "photo" in m_type:
+                        sender_bot.send_photo(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "video" in m_type:
+                        sender_bot.send_video(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "document" in m_type or "file" in m_type:
+                        sender_bot.send_document(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "audio" in m_type:
+                        sender_bot.send_audio(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "animation" in m_type:
+                        sender_bot.send_animation(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
+                    elif "sticker" in m_type:
+                        sender_bot.send_sticker(t_id_int, file_id, message_thread_id=thread_id)
+                    else:
+                        sender_bot.send_document(t_id_int, file_id, caption=caption, message_thread_id=thread_id)
                         
                     success += 1
                         
@@ -1408,11 +1416,14 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
 def setup_automation_handlers(client: TelegramClient):
+    logger.info("⚙️  Setting up Automation Handlers...")
     @client.on(events.NewMessage)
     async def auto_handler(event):
         try:
             m = event.message
             if not m: return
+            
+            logger.debug(f"HEARTBEAT: New message in {m.chat_id}")
 
             # --- BAN LIST CHECK ---
             sender_id = m.sender_id
@@ -1424,11 +1435,11 @@ def setup_automation_handlers(client: TelegramClient):
             pairs = get_target_pairs()
             for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
                 
-                # Normalize ID matching
-                source_id_str = str(sid).replace("-100", "")
-                msg_id_str = str(m.chat_id).replace("-100", "")
+                # Robust ID normalization
+                def normalize(x):
+                    return int(str(x).replace("-100", ""))
 
-                if int(sid) == int(m.chat_id):
+                if normalize(sid) == normalize(m.chat_id):
                     # --- TOPIC DETECTION ---
                     msg_topic_anchor = None
                     if m.reply_to:
@@ -1495,6 +1506,8 @@ def setup_automation_handlers(client: TelegramClient):
                         await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
                     
                     # Removed break to allow multiple pairs for the same source chat.
+                else:
+                    logger.debug(f"AUTO_HANDLER: Chat ID {m.chat_id} did not match pair source {sid}")
         except Exception as e:
             logger.error(f"AUTO_HANDLER ERROR: {e}")
 
