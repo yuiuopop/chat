@@ -1508,13 +1508,13 @@ def setup_automation_handlers(client: TelegramClient):
                                 messages = album_cache.pop(key, [])
                                 if messages:
                                     logger.info(f"MIRROR: Sending album ({len(messages)} parts) to {t_id}")
-                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                    await execute_perform_mirror(client, t_id, messages, def_topic, mir_toggle, s_id)
                             asyncio.create_task(delayed_send(album_key, tid, is_mir, sid, t_topic))
                         else:
                             album_cache[album_key].append(m)
                     else:
-                        logger.info(f"MIRROR: Sending single message from {sid} to {tid} (Live: {is_live}, Mon: {is_mon})")
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                        logger.info(f"MIRROR: Sending single message from {sid} to {tid}")
+                        await execute_perform_mirror(client, tid, [m], t_topic, is_mir, sid)
                     
                     # Removed break to allow multiple pairs for the same source chat.
                 else:
@@ -1522,109 +1522,76 @@ def setup_automation_handlers(client: TelegramClient):
         except Exception as e:
             logger.error(f"AUTO_HANDLER ERROR: {e}")
 
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Hub for mirrored sending with native Forum Topic support."""
+    async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid):
+        """Unified Mirroring Hub with Forum Topic and Fallback support."""
         try:
             if not messages: return
             first_msg = messages[0]
-            dest_topic_id = default_t_topic
             
-            # 1. Resolve Topic Mapping
-            if is_mir and first_msg.reply_to:
-                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                if source_top:
-                    src_title = None
-                    src_icon = None
-                    try:
-                        # Direct fetch for source topic info
-                        res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                        for t in res.topics:
-                            if t.id == source_top:
-                                src_title = t.title
-                                src_icon = getattr(t, "icon_emoji_id", None)
-                                break
-                    except Exception as e:
-                        logger.debug(f"MIRROR: Source Topic Info Fetch Failed: {e}")
-                    
-                    if src_title:
-                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
-                    else:
-                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
+            # --- TOPIC RESOLUTION ---
+            final_topic_id = default_t_topic 
 
-            # 2. Check if Target is a Forum
-            is_forum = False
-            try:
-                tgt_ent = await resolve_target_id(client, tid)
-                is_forum = getattr(tgt_ent, 'forum', False)
-                logger.info(f"MIRROR: Target {tid} is_forum: {is_forum}")
-            except Exception as e:
-                logger.debug(f"MIRROR: Target Forum Check Failed: {e}")
-                pass
-
-            # 3. Resolve Reply Header
-            reply_to_payload = None
-            if is_forum:
-                topic_id = int(dest_topic_id) if dest_topic_id else None
-                if topic_id:
-                    # Explicitly use InputReplyToMessage for Forum Topics
-                    reply_to_payload = types.InputReplyToMessage(
-                        reply_to_msg_id=topic_id,
-                        top_msg_id=topic_id
-                    )
+            if is_mir:
+                # 1. Resolve the name from the source
+                src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
+                logger.info(f"🔍 MIRROR DEBUG: Source Topic Name is '{src_topic_name}'")
                 
-                # If replying to a specific message inside the topic
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped:
-                        reply_to_payload = types.InputReplyToMessage(
-                            reply_to_msg_id=int(mapped),
-                            top_msg_id=topic_id
-                        )
-            else:
-                # Normal Group: Use standard integer reply
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped:
-                        reply_to_payload = int(mapped)
-
-            # 4. Send Content
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            sent = None
+                # 2. Resolve/Create matching topic in target
+                resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
+                if resolved_id:
+                    final_topic_id = resolved_id
             
-            logger.info(f"MIRROR: Sending to {tid} with reply_header: {reply_to_payload}")
+            # --- CONSTRUCT REPLY HEADER ---
+            # This is the CRITICAL part for Forums
+            reply_to_payload = None
+            if final_topic_id:
+                # We wrap the ID in InputReplyToMessage to force Telegram to treat it as a thread anchor
+                reply_to_payload = types.InputReplyToMessage(
+                    reply_to_msg_id=int(final_topic_id),
+                    top_msg_id=int(final_topic_id) # This ensures it stays in the topic
+                )
+                logger.info(f"📡 MIRROR DEBUG: Routing to Topic ID {final_topic_id}")
+
+            # If the source message was a specific reply TO someone inside that topic
+            if first_msg.reply_to_msg_id:
+                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                if mapped:
+                    reply_to_payload = types.InputReplyToMessage(
+                        reply_to_msg_id=int(mapped),
+                        top_msg_id=int(final_topic_id) if final_topic_id else None
+                    )
+
+            # --- SEND CONTENT ---
+            album_text = next((msg.message for msg in messages if msg.message), "")
             
             for attempt in range(3):
                 try:
                     sent = await client.send_message(
-                        entity=int(tid), 
-                        message=album_text, 
-                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                        entity=int(tid),
+                        message=album_text,
+                        file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
                         reply_to=reply_to_payload
                     )
                     if sent:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                        break # Success!
+                        sent_id = sent[0].id if isinstance(sent, list) else sent.id
+                        save_message_mapping(sid, first_msg.id, tid, sent_id)
+                        logger.info(f"✅ MIRROR SUCCESS: Sent to {tid}")
+                        break
                 except errors.FloodWaitError as fwe:
                     logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
                     await asyncio.sleep(fwe.seconds)
-                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
-                    await asyncio.sleep(2)
                 except Exception as e:
                     err_msg = str(e).lower()
                     if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
                         logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_to_payload)
-                        if sent: break # Success via fallback
-                    else:
-                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                        if attempt == 2: # Last attempt
-                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-            
+                        await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_to_payload)
+                        break
+                    logger.error(f"MIRROR ATTEMPT {attempt+1} FAILED: {e}")
+                    if attempt == 2:
+                        logger.error(f"❌ MIRROR FINAL FAILURE: {e}")
+
         except Exception as e:
-            logger.error(f"Global Mirror Error: {e}")
+            logger.error(f"❌ MIRROR CRASH: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
