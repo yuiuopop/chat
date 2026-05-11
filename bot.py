@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 
 from telethon import TelegramClient, events, functions, types, errors
 from telethon.sessions import StringSession
-from telethon.utils import pack_bot_file_id
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
@@ -30,8 +29,7 @@ load_dotenv()
 # Config
 # -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-bot_fleet = {} # { bot_id: telebot_instance })
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "8080"))
 
 if not BOT_TOKEN:
@@ -46,11 +44,6 @@ logger = logging.getLogger("userbot_v2")
 # Topic Mirroring Cache
 # {target_chat_id: {topic_title.lower(): top_message_id}}
 topic_cache = {}
-
-# Global State Dictionaries
-login_data = {}    # { user_id: { state_data } }
-admin_states = {}  # { user_id: "current_state" }
-running_tasks = {} # { task_key: bool }
 
 # -----------------------------
 # DB (SQLite/PostgreSQL)
@@ -88,14 +81,10 @@ def db_conn():
 
 USING_POSTGRES = False
 
-# Album Cache for grouping media
-# {grouped_id: [message_objects]}
-album_cache = {}
-
 def get_placeholder(conn=None):
-    if DATABASE_URL and USING_POSTGRES:
-        return "%s"
-    return "?"
+    if conn and isinstance(conn, sqlite3.Connection):
+        return "?"
+    return "%s" if DATABASE_URL and USING_POSTGRES else "?"
 
 def init_db():
     with db_conn() as conn:
@@ -107,7 +96,7 @@ def init_db():
             )
         """)
         
-        if USING_POSTGRES:
+        if DATABASE_URL:
             # PostgreSQL
             c.execute("""
                 CREATE TABLE IF NOT EXISTS target_pairs (
@@ -134,10 +123,6 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
             except: pass
             # Update UNIQUE constraint for Postgres
             try:
@@ -178,72 +163,6 @@ def init_db():
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
-            # Migrations for existing tables
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
-            except: pass
-            try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            except: pass
-
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_targets (
-                    id SERIAL PRIMARY KEY,
-                    target_id BIGINT UNIQUE,
-                    target_type TEXT,
-                    target_name TEXT,
-                    bot_token TEXT
-                )
-            """)
-            try: c.execute("ALTER TABLE log_targets ADD CONSTRAINT unique_log_target UNIQUE (target_id)")
-            except: pass
-            try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
-            except: pass
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS media_logs (
-                    id SERIAL PRIMARY KEY,
-                    source_chat_id BIGINT,
-                    source_message_id BIGINT,
-                    log_target_id BIGINT,
-                    file_id TEXT,
-                    media_type TEXT
-                )
-            """)
-            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
-            except: pass
-            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
-            except: pass
-
-            # Log Bot System Tables
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_bots (
-                    id SERIAL PRIMARY KEY,
-                    bot_token TEXT UNIQUE,
-                    bot_username TEXT,
-                    bot_id BIGINT UNIQUE
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_media (
-                    id SERIAL PRIMARY KEY,
-                    bot_id BIGINT,
-                    log_msg_id BIGINT,
-                    source_chat_id BIGINT,
-                    source_msg_id BIGINT,
-                    grouped_id BIGINT,
-                    file_id TEXT,
-                    media_type TEXT,
-                    caption TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(bot_id, source_chat_id, source_msg_id)
-                )
-            """)
-            try: c.execute("ALTER TABLE log_media ADD COLUMN grouped_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-
-            # Banned Users Table
             c.execute("""
                 CREATE TABLE IF NOT EXISTS banned_users (
                     id SERIAL PRIMARY KEY,
@@ -252,6 +171,13 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Migrations for existing tables
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN pair_id INTEGER")
+            except: pass
+            try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            except: pass
         else:
             # SQLite
             c.execute("""
@@ -266,7 +192,6 @@ def init_db():
                     is_monitoring INTEGER DEFAULT 0,
                     is_live INTEGER DEFAULT 0,
                     is_mirror INTEGER DEFAULT 0,
-                    content_filter TEXT DEFAULT 'everything',
                     UNIQUE(source_id, source_topic_id, target_id, target_topic_id)
                 )
             """)
@@ -279,8 +204,6 @@ def init_db():
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_live INTEGER DEFAULT 0")
             except: pass
             try: c.execute("ALTER TABLE target_pairs ADD COLUMN is_mirror INTEGER DEFAULT 0")
-            except: pass
-            try: c.execute("ALTER TABLE target_pairs ADD COLUMN content_filter TEXT DEFAULT 'everything'")
             except: pass
 
             c.execute("""
@@ -316,6 +239,14 @@ def init_db():
                     UNIQUE(source_chat_id, source_message_id)
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT UNIQUE,
+                    username TEXT UNIQUE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             # Migration check
             try: c.execute("ALTER TABLE collected_media ADD COLUMN source_chat_id BIGINT")
             except: pass
@@ -323,111 +254,7 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE collected_media ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
             except: pass
-
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_targets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_id BIGINT UNIQUE,
-                    target_type TEXT,
-                    target_name TEXT,
-                    bot_token TEXT
-                )
-            """)
-            try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
-            except: pass
-            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_log_target_unique ON log_targets(target_id)")
-            except: pass
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS media_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_chat_id BIGINT,
-                    source_message_id BIGINT,
-                    log_target_id BIGINT,
-                    file_id TEXT,
-                    media_type TEXT
-                )
-            """)
-            try: c.execute("ALTER TABLE media_logs ADD COLUMN source_chat_id BIGINT")
-            except: pass
-            try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_media_logs_unique ON media_logs(source_chat_id, source_message_id, log_target_id)")
-            except: pass
-
-            # Log Bot System Tables
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_bots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    bot_token TEXT UNIQUE,
-                    bot_username TEXT,
-                    bot_id BIGINT UNIQUE
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS log_media (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    bot_id BIGINT,
-                    log_msg_id BIGINT,
-                    source_chat_id BIGINT,
-                    source_msg_id BIGINT,
-                    file_id TEXT,
-                    media_type TEXT,
-                    caption TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(bot_id, source_chat_id, source_msg_id)
-                )
-            """)
-            try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-
-            # Banned Users Table
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS banned_users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id BIGINT UNIQUE,
-                    username TEXT UNIQUE,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
     logger.info("DB initialized")
-
-def is_user_banned(user_id, username=None):
-    try:
-        with db_conn() as conn:
-            c = conn.cursor()
-            p = get_placeholder()
-            if user_id:
-                c.execute(f"SELECT 1 FROM banned_users WHERE user_id = {p}", (user_id,))
-                if c.fetchone(): return True
-            if username:
-                clean_username = username.lower().replace("@", "")
-                c.execute(f"SELECT 1 FROM banned_users WHERE username = {p}", (clean_username,))
-                if c.fetchone(): return True
-    except: pass
-    return False
-
-def ban_user(user_id=None, username=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        uname = username.lower().replace("@", "") if username else None
-        if USING_POSTGRES:
-            c.execute("INSERT INTO banned_users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (user_id, uname))
-        else:
-            c.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, uname))
-
-def unban_user(user_id=None, username=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if user_id:
-            c.execute(f"DELETE FROM banned_users WHERE user_id = {p}", (user_id,))
-        elif username:
-            clean_username = username.lower().replace("@", "")
-            c.execute(f"DELETE FROM banned_users WHERE username = {p}", (clean_username,))
-
-def get_banned_users():
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT user_id, username FROM banned_users")
-        return c.fetchall()
 
 def get_setting(key, default=None):
     with db_conn() as conn:
@@ -441,7 +268,7 @@ def set_setting(key, value):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if USING_POSTGRES:
+        if DATABASE_URL:
             c.execute(
                 """
                 INSERT INTO settings (key, value) VALUES (%s, %s)
@@ -459,7 +286,7 @@ def add_target_pair(sid, source_topic_id, tid, target_topic_id, s_title, t_title
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if USING_POSTGRES:
+        if DATABASE_URL:
             c.execute(
                 "INSERT INTO target_pairs (source_id, source_topic_id, target_id, target_topic_id, source_title, target_title) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 (sid, source_topic_id, tid, target_topic_id, s_title, t_title)
@@ -474,7 +301,7 @@ def save_topic_mapping(s_chat, s_topic, t_chat, t_topic):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if USING_POSTGRES:
+        if DATABASE_URL:
             c.execute(
                 """
                 INSERT INTO topic_mappings (source_chat_id, source_topic_id, target_chat_id, target_topic_id)
@@ -510,7 +337,7 @@ def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        if USING_POSTGRES:
+        if DATABASE_URL:
             c.execute(
                 """
                 INSERT INTO message_mappings (source_chat_id, source_msg_id, target_chat_id, target_msg_id)
@@ -531,6 +358,40 @@ def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
                 (s_chat, s_msg, t_chat, t_msg)
             )
 
+
+def is_user_banned(user_id, username=None):
+    try:
+        with db_conn() as conn:
+            c = conn.cursor()
+            p = get_placeholder()
+            if user_id:
+                c.execute(f"SELECT 1 FROM banned_users WHERE user_id = {p}", (user_id,))
+                if c.fetchone(): return True
+            if username:
+                clean_username = username.lower().replace("@", "")
+                c.execute(f"SELECT 1 FROM banned_users WHERE username = {p}", (clean_username,))
+                if c.fetchone(): return True
+    except: pass
+    return False
+
+def ban_user(user_id=None, username=None):
+    with db_conn() as conn:
+        c = conn.cursor()
+        uname = username.lower().replace("@", "") if username else None
+        if DATABASE_URL:
+            c.execute("INSERT INTO banned_users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (user_id, uname))
+        else:
+            c.execute("INSERT OR REPLACE INTO banned_users (user_id, username) VALUES (?, ?)", (user_id, uname))
+
+def unban_user(user_id=None, username=None):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if user_id:
+            c.execute(f"DELETE FROM banned_users WHERE user_id = {p}", (user_id,))
+        if username:
+            uname = username.lower().replace("@", "")
+            c.execute(f"DELETE FROM banned_users WHERE username = {p}", (uname,))
 def get_message_mapping(s_chat, s_msg, t_chat):
     with db_conn() as conn:
         c = conn.cursor()
@@ -542,123 +403,17 @@ def get_message_mapping(s_chat, s_msg, t_chat):
         row = c.fetchone()
         return row[0] if row else None
 
-def get_log_targets():
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT id, target_id, target_type, target_name, bot_token FROM log_targets")
-        return c.fetchall()
-
-def add_log_target(target_id, target_type, target_name, bot_token=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if USING_POSTGRES:
-            c.execute(
-                "INSERT INTO log_targets (target_id, target_type, target_name, bot_token) VALUES (%s, %s, %s, %s) ON CONFLICT(target_id) DO UPDATE SET bot_token = EXCLUDED.bot_token",
-                (target_id, target_type, target_name, bot_token)
-            )
-        else:
-            c.execute(
-                "INSERT INTO log_targets (target_id, target_type, target_name, bot_token) VALUES (?, ?, ?, ?) ON CONFLICT(target_id) DO UPDATE SET bot_token = excluded.bot_token",
-                (target_id, target_type, target_name, bot_token)
-            )
-
-def remove_log_target(row_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"DELETE FROM log_targets WHERE id = {p}", (row_id,))
-
-def save_media_log(source_chat_id, source_message_id, log_target_id, file_id, media_type):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if USING_POSTGRES:
-            c.execute(
-                "INSERT INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (%s, %s, %s, %s, %s) ON CONFLICT(source_chat_id, source_message_id, log_target_id) DO NOTHING",
-                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
-            )
-        else:
-            c.execute(
-                "INSERT OR IGNORE INTO media_logs (source_chat_id, source_message_id, log_target_id, file_id, media_type) VALUES (?, ?, ?, ?, ?)",
-                (source_chat_id, source_message_id, log_target_id, file_id, media_type)
-            )
-
-def get_media_logs(limit=100, media_type=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        query = "SELECT source_message_id, log_target_id, file_id, media_type FROM media_logs"
-        params = []
-        if media_type:
-            query += f" WHERE media_type = {p}"
-            params.append(media_type)
-        query += f" ORDER BY id DESC LIMIT {p}"
-        params.append(limit)
-        c.execute(query, tuple(params))
-        return c.fetchall()
-
-def get_vault_sources():
-    with db_conn() as conn:
-        c = conn.cursor()
-        query = """
-            SELECT DISTINCT p.source_id, p.source_title 
-            FROM target_pairs p
-            JOIN log_media m ON p.source_id = m.source_chat_id
-        """
-        c.execute(query)
-        return c.fetchall()
-
-def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        
-        query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.grouped_id
-            FROM log_media m
-            WHERE m.source_chat_id = {p}
-        """
-        params = [source_id]
-        if bot_id:
-            query += f" AND m.bot_id = {p}"
-            params.append(bot_id)
-            
-        query += " ORDER BY m.source_msg_id ASC"
-        
-        if limit:
-            query += f" LIMIT {p}"
-            params.append(limit)
-            
-        c.execute(query, tuple(params))
-        return c.fetchall()
-
-def get_log_bot_stats(bot_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        query = f"""
-            SELECT p.source_id, p.source_title, COUNT(m.id) as item_count
-            FROM log_media m
-            JOIN target_pairs p ON m.source_chat_id = p.source_id
-            WHERE m.bot_id = {p}
-            GROUP BY p.source_id, p.source_title
-            ORDER BY item_count DESC
-        """
-        c.execute(query, (bot_id,))
-        return c.fetchall()
-
 def get_target_pairs():
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs")
+        c.execute("SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs")
         return c.fetchall()
 
 def get_target_pair(pair_id):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
-        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs WHERE id = {p}", (pair_id,))
+        c.execute(f"SELECT id, source_id, target_id, source_title, target_title, is_monitoring, is_live, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
         return c.fetchone()
 
 def get_pair_stats(pair_id):
@@ -668,183 +423,6 @@ def get_pair_stats(pair_id):
         c.execute(f"SELECT COUNT(*), SUM(CASE WHEN released = 0 THEN 1 ELSE 0 END) FROM collected_media WHERE pair_id = {p}", (pair_id,))
         row = c.fetchone()
         return {"total": row[0] or 0, "pending": row[1] or 0}
-
-# -----------------------------
-# Log Bot Helpers
-# -----------------------------
-def add_log_bot(token, username, bot_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if USING_POSTGRES:
-            c.execute(
-                "INSERT INTO log_bots (bot_token, bot_username, bot_id) VALUES (%s, %s, %s) ON CONFLICT(bot_token) DO UPDATE SET bot_username = EXCLUDED.bot_username, bot_id = EXCLUDED.bot_id",
-                (token, username, bot_id)
-            )
-        else:
-            c.execute(
-                "INSERT INTO log_bots (bot_token, bot_username, bot_id) VALUES (?, ?, ?) ON CONFLICT(bot_token) DO UPDATE SET bot_username = excluded.bot_username, bot_id = excluded.bot_id",
-                (token, username, bot_id)
-            )
-
-def get_log_bots():
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT bot_token, bot_username, bot_id FROM log_bots")
-        return c.fetchall()
-
-def delete_log_bot(bot_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"DELETE FROM log_bots WHERE bot_id = {p}", (bot_id,))
-        c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
-
-def clear_bot_logs(bot_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"DELETE FROM log_media WHERE bot_id = {p}", (bot_id,))
-
-
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
-    """Releases vaulted media using the Userbot for forwarding."""
-    task_key = f"vault_rel_{source_id}_{target_id}"
-    if task_key in running_tasks:
-        sender_bot.send_message(admin_chat_id, "⚠️ This release task is already running!")
-        return
-
-    running_tasks[task_key] = True
-    
-    try:
-        # Get items to release
-        items = get_vaulted_media_for_source(source_id, bot_id=log_target_id)
-        if not items:
-            sender_bot.send_message(admin_chat_id, "❌ No vaulted items found for this source.")
-            return
-
-        # Apply the limit logic
-        if limit and isinstance(limit, int):
-            items = items[:limit]
-
-        total = len(items)
-        success = 0
-        failed = 0
-        
-        stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
-
-        # Grouping items by grouped_id or source_msg_id
-        grouped_items = []
-        last_gid = None
-        current_group = []
-        
-        for item in items:
-            # item = (source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, grouped_id)
-            gid = item[6] # grouped_id
-            if gid and gid == last_gid:
-                current_group.append(item)
-            else:
-                if current_group:
-                    grouped_items.append(current_group)
-                current_group = [item]
-                last_gid = gid
-        if current_group:
-            grouped_items.append(current_group)
-            
-        total_groups = len(grouped_items)
-        
-        for i, group in enumerate(grouped_items):
-            if not running_tasks.get(task_key):
-                sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
-                break
-            
-            try:
-                # Process the group (might be 1 or multiple messages)
-                first_item = group[0]
-                bot_id = first_item[5]
-                log_msg_ids = [int(it[4]) for it in group]
-                captions = [it[3] for it in group]
-                
-                log_bot_entity = await userbot.get_input_entity(int(bot_id))
-                
-                # Fetch all messages in the group from the log bot
-                msgs_to_forward = await userbot.get_messages(log_bot_entity, ids=log_msg_ids)
-                if not isinstance(msgs_to_forward, list):
-                    msgs_to_forward = [msgs_to_forward] if msgs_to_forward else []
-                
-                if msgs_to_forward:
-                    # Filter out None/Failed fetches
-                    msgs_to_forward = [m for m in msgs_to_forward if m]
-                    
-                    if msgs_to_forward:
-                        # Use the first available caption for the album
-                        main_caption = next((c for c in captions if c), "")
-                        
-                        await userbot.send_message(
-                            entity=int(target_id),
-                            message=main_caption,
-                            file=[m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media,
-                            reply_to=target_topic_id if target_topic_id else None 
-                        )
-                        success += len(msgs_to_forward)
-                    else:
-                        failed += len(group)
-                else:
-                    failed += len(group)
-            except Exception as e:
-                logger.error(f"Vault Release group error: {e}")
-                failed += len(group)
-
-            if (i + 1) % 5 == 0 or (i + 1) == total_groups:
-                try: sender_bot.edit_message_text(f"📊 **Status:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
-                except: pass
-
-            await asyncio.sleep(interval)
-            
-        sender_bot.send_message(admin_chat_id, f"✅ **Transfer Complete!**\nTotal: `{total}`\nSuccessful: `{success}`")
-    except Exception as e:
-        logger.error(f"Global Release Error: {e}")
-        sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
-    finally:
-        running_tasks.pop(task_key, None)
-
-def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        if USING_POSTGRES:
-            c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
-                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
-                   log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
-                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption, grouped_id = EXCLUDED.grouped_id""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
-            )
-        else:
-            c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
-                   log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
-                   media_type = excluded.media_type, caption = excluded.caption, grouped_id = excluded.grouped_id""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
-            )
-
-def get_logged_media_stats(bot_id):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"SELECT COUNT(*) FROM log_media WHERE bot_id = {p}", (bot_id,))
-        return c.fetchone()[0] or 0
-
-def fetch_logged_media(bot_id, limit=1000):
-    with db_conn() as conn:
-        c = conn.cursor()
-        p = get_placeholder()
-        c.execute(f"SELECT source_chat_id, source_msg_id, file_id, media_type, caption FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, limit))
-        return c.fetchall()
 
 # -----------------------------
 # Global State
@@ -887,39 +465,16 @@ def get_dashboard_markup():
     
     if is_online:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
-        markup.add(InlineKeyboardButton("🚀 Release from Vault", callback_data="vault_rel_main"))
         markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
-        markup.add(InlineKeyboardButton("📜 Log Bots", callback_data="log_bot_main"))
-        markup.add(InlineKeyboardButton("🚫 Ban List", callback_data="banlist_main"))
     else:
         markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
     return markup
 
-def log_bot_list_markup():
-    markup = InlineKeyboardMarkup(row_width=1)
-    bots = get_log_bots()
-    for token, username, bot_id in bots:
-        stats = get_logged_media_stats(bot_id)
-        markup.add(InlineKeyboardButton(f"🤖 @{username} ({stats})", callback_data=f"log_bot_view_{bot_id}"))
-    
-    markup.add(InlineKeyboardButton("➕ Add Log Bot", callback_data="log_bot_add_start"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
-    return markup
-
-def log_bot_view_markup(bot_id):
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("📥 Fetch Logs", callback_data=f"log_bot_fetch_{bot_id}"),
-        InlineKeyboardButton("🗑 Remove", callback_data=f"log_bot_delete_confirm_{bot_id}")
-    )
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="log_bot_main"))
-    return markup
-
 def pairs_list_markup():
     markup = InlineKeyboardMarkup(row_width=1)
     pairs = get_target_pairs()
-    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter in pairs:
+    for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
         stats = get_pair_stats(pid)
         mon_status = "👁️" if is_mon else ""
         live_status = "⚡" if is_live else ""
@@ -939,7 +494,7 @@ def show_pair_view(chat_id, message_id, pid):
             bot.send_message(chat_id, f"❌ Pair not found (ID: {pid}). It may have been deleted.")
             return
             
-        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter = row
+        pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = row
         stats = get_pair_stats(pid)
         mon_status = "🟢 Running" if is_mon else "🔴 Stopped"
         live_status = "🟢 Running" if is_live else "🔴 Stopped"
@@ -974,7 +529,7 @@ def pair_view_markup(pair_id):
     pair = get_target_pair(pair_id)
     if not pair: return InlineKeyboardMarkup()
     
-    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, c_filter = pair
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic = pair
     markup = InlineKeyboardMarkup(row_width=2)
     
     mon_btn = "🛑 Stop Monitor" if is_mon else "👁️ Monitor"
@@ -986,12 +541,6 @@ def pair_view_markup(pair_id):
         InlineKeyboardButton(live_btn, callback_data=f"pair_toggle_live_{pair_id}")
     )
     markup.add(InlineKeyboardButton(mir_btn, callback_data=f"pair_toggle_mir_{pair_id}"))
-    
-    # Content Filter Button
-    cf = pair[10] or "everything"
-    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
-    cf_text = cf_map.get(cf, "🔄 All Content")
-    markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_toggle_filter_{pair_id}"))
     
     # Check if a manual task is running
     is_hist = is_task_running(f"hist_{pair_id}")
@@ -1024,18 +573,6 @@ def user_account_markup():
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
-def banlist_markup():
-    markup = InlineKeyboardMarkup(row_width=1)
-    banned = get_banned_users()
-    for uid, uname in banned:
-        identifier = uid if uid else uname
-        label = f"🚫 {uname if uname else uid}"
-        markup.add(InlineKeyboardButton(label, callback_data=f"unban_confirm_{identifier}"))
-    
-    markup.add(InlineKeyboardButton("➕ Add to Ban List", callback_data="ban_add_start"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
-    return markup
-
 async def get_chat_selection_markup(prefix, page=0):
     markup = InlineKeyboardMarkup(row_width=1)
     if not userbot or not userbot.is_connected():
@@ -1054,10 +591,6 @@ async def get_chat_selection_markup(prefix, page=0):
     end = start + 10
     page_items = chats[start:end]
     
-    if not page_items:
-        markup.add(InlineKeyboardButton("❌ No Groups Found", callback_data="none"))
-        return markup
-        
     for dialog in page_items:
         chat = dialog.entity
         is_forum = getattr(chat, "forum", False)
@@ -1144,7 +677,7 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
-async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None, icon_emoji_id=None):
+async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None):
     """
     Search for a topic by title in target chat. If not found, create it.
     Uses database mapping first, then topic_cache.
@@ -1153,7 +686,6 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
     
     t_chat_id = int(target_chat_id)
     title_key = topic_title.lower().strip()
-    logger.info(f"TOPIC_SEARCH: Looking for '{topic_title}' (Key: '{title_key}') in {t_chat_id}")
     
     # 1) Check Database Mapping (Most Reliable)
     if source_chat_id and source_topic_id:
@@ -1191,11 +723,10 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             return res
             
         # 4) Create if not found
-        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
+        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id}")
         created = await client(functions.channels.CreateForumTopicRequest(
             channel=t_chat_id,
-            title=topic_title,
-            icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
+            title=topic_title
         ))
         
         await asyncio.sleep(1)
@@ -1211,6 +742,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
             
         return final_id
+        
     except Exception as e:
         logger.error(f"Mirroring Error (get_or_create): {e}")
         return None
@@ -1262,88 +794,36 @@ async def ensure_userbot():
     
     return True, "Connected"
 
-async def forward_to_log_bots(client, messages, source_chat_id):
-    """Sends collected content (single or album) to all registered log bots."""
-    if not messages: return
-    bots = get_log_bots()
-    if not bots: return
-    
-    for token, username, bot_id in bots:
-        # Run vaulting in background tasks
-        asyncio.create_task(vault_media(client, messages, int(source_chat_id), int(bot_id), username))
-
-async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
-    """Helper to forward to vault and save the permanent File IDs (handles albums)"""
+async def execute_fallback(client, source_id, target_id, message_obj, reply_header):
+    """Downloads and re-uploads restricted content."""
+    import os
+    path = None
     try:
-        if not messages: return
-        first_msg = messages[0]
-        
-        # RESOLVE ENTITY
-        try:
-            target_peer = await client.get_input_entity(int(log_chat_id))
-        except:
-            target_peer = await client.get_entity(int(log_chat_id))
-
-        # Metadata for Log Bot extraction (only on the first message of album if multiple)
-        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
-        caption_text = metadata + (first_msg.message or "")
-        
-        try:
-            # Send as album if multiple messages
-            vaulted_result = await client.send_message(
-                entity=target_peer,
-                file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                message=caption_text
+        path = await client.download_media(message_obj)
+        if path:
+            sent = await client.send_message(
+                entity=target_id,
+                message=message_obj.message or "",
+                file=path,
+                reply_to=reply_header
             )
-            await asyncio.sleep(2)
-        except errors.FloodWaitError as fwe:
-            logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
-            await asyncio.sleep(fwe.seconds)
-            return await vault_media(client, messages, source_chat_id, log_chat_id, t_name) # Retry
-        except Exception as e:
-            if any(x in str(e).lower() for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
-                logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
-                # Download all if album
-                files = []
-                for m in messages:
-                    p = await client.download_media(m)
-                    if p: files.append(p)
-                
-                vaulted_result = await client.send_message(
-                    entity=target_peer,
-                    file=files if len(files) > 1 else files[0] if files else None,
-                    message=caption_text
-                )
-                for p in files:
-                    if os.path.exists(p): os.remove(p)
-            else:
-                raise e
-            
-        if vaulted_result:
-            # vaulted_result is a list if it was an album, or a single Message object
-            v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-            
-            for i, v_m in enumerate(v_msgs):
-                orig_m = messages[i]
-                logger.info(f"✅ VAULT: Message {orig_m.id} logged to @{t_name} -> Log ID: {v_m.id}")
-                save_logged_media(
-                    bot_id=int(log_chat_id),
-                    log_msg_id=int(v_m.id),
-                    source_chat_id=int(source_chat_id),
-                    source_msg_id=int(orig_m.id),
-                    file_id=None,
-                    media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                    caption=orig_m.message or "",
-                    grouped_id=orig_m.grouped_id
-                )
+            return sent
     except Exception as e:
-        logger.error(f"VAULT ERROR for @{t_name}: {e}")
+        import logging
+        logging.error(f"Fallback Failed: {e}")
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+    return None
 
 def setup_automation_handlers(client: TelegramClient):
     @client.on(events.NewMessage)
     async def auto_handler(event):
         m = event.message
         if not m: return
+        
+        # DEBUG: This helps verify if the ID matching is the problem
+        # print(f"DEBUG: Msg Chat ID: {m.chat_id}")
 
         # --- BAN LIST CHECK ---
         sender_id = m.sender_id
@@ -1353,9 +833,9 @@ def setup_automation_handlers(client: TelegramClient):
             return
 
         pairs = get_target_pairs()
-        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
+        for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic in pairs:
             
-            # Normalize ID matching
+            # IMPROVED ID MATCHING: Use string containment or normalize both to absolute strings
             source_id_str = str(sid).replace("-100", "")
             msg_id_str = str(m.chat_id).replace("-100", "")
 
@@ -1363,182 +843,87 @@ def setup_automation_handlers(client: TelegramClient):
                 # --- TOPIC DETECTION ---
                 msg_topic_anchor = None
                 if m.reply_to:
+                    # Logic: reply_to_top_id is the topic. If None, reply_to_msg_id is the topic.
                     msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
                 
                 if not msg_topic_anchor and getattr(m, 'forum_topic', False):
                     msg_topic_anchor = m.id
-                
-                if not msg_topic_anchor and m.reply_to_msg_id:
-                    msg_topic_anchor = m.reply_to_msg_id
 
-                # --- CONTENT FILTERING ---
-                cf = cf or "everything"
-                if cf == "media" and not m.media:
-                    continue
-                if cf == "text" and m.media:
-                    continue
-
-                # Specific topic filtering
-                if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
+                # Filter: If the pair configuration targets a specific topic
+                if s_topic not in [None, 0, "0", 0]:
                     if str(msg_topic_anchor) != str(s_topic):
                         continue
 
-                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
+                # 1) Monitor logic
                 if is_mon and m.media:
                     m_type = type(m.media).__name__
                     with db_conn() as conn:
-                        c = conn.cursor()
-                        if USING_POSTGRES:
-                            c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
+                        db_c = conn.cursor()
+                        if DATABASE_URL:
+                            db_c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pid, sid, m.id, m_type, m.message or ""))
                         else:
-                            c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-
-                # --- ALBUM / SINGLE MESSAGE LOGIC ---
-                if m.grouped_id:
-                    if m.grouped_id not in album_cache:
-                        album_cache[m.grouped_id] = [m]
-                        # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring, live_forward):
-                            await asyncio.sleep(5.0) 
-                            messages = album_cache.pop(gid, [])
-                            if messages:
-                                if live_forward:
-                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                                if is_monitoring:
-                                    # Send the entire album to log bots (Vaulting)
-                                    asyncio.create_task(forward_to_log_bots(client, messages, s_id))
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon, is_live))
-                    else:
-                        album_cache[m.grouped_id].append(m)
-                else:
-                    if is_live:
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
-                    if is_mon:
-                        asyncio.create_task(forward_to_log_bots(client, [m], sid))
+                            db_c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pid, sid, m.id, m_type, m.message or ""))
                 
-                # CRITICAL: Break the pair loop once the message is handled to prevent duplication
-                break
-
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Hub for mirrored sending with native Forum Topic support."""
-        try:
-            if not messages: return
-            first_msg = messages[0]
-            dest_topic_id = default_t_topic
-            
-            # 1. Resolve Topic Mapping
-            if is_mir:
-                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                if source_top:
-                    forum = getattr(first_msg.reply_to, "forum_topic", None)
-                    src_title = getattr(forum, "title", None)
-                    src_icon = None
-                    if not src_title:
-                        try:
-                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
-                            for t in res.topics:
-                                if t.id == source_top:
-                                    src_title = t.title
-                                    src_icon = getattr(t, "icon_emoji_id", None)
-                                    break
-                        except: pass
+                # 2) Live Forward / Mirror
+                if is_live:
+                    dest_topic_id = t_topic
                     
-                    if src_title:
-                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
-                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
-                    else:
-                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
+                    if is_mir:
+                        try:
+                            # Dynamic Mirroring: Map source topic to target topic
+                            source_top = msg_topic_anchor
+                            if source_top:
+                                # Get Title
+                                src_title = None
+                                forum = getattr(m.reply_to, "forum_topic", None) if m.reply_to else None
+                                if forum: src_title = getattr(forum, "title", None)
+                                
+                                if not src_title:
+                                    # Fallback fetch title
+                                    res = await client(functions.channels.GetForumTopicsRequest(channel=m.chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                                    for t in res.topics:
+                                        if source_top in [t.id, t.top_message]:
+                                            src_title = t.title
+                                            break
+                                
+                                if src_title:
+                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, source_chat_id=sid, source_topic_id=source_top)
+                        except Exception as me:
+                            logger.error(f"Mirroring Logic Error: {me}")
 
-            # 2. Check if Target is a Forum
-            is_forum = False
-            try:
-                # Ensure we have the -100 prefix for entity lookup
-                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
-                try:
-                    tgt_ent = await client.get_entity(real_tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-                except:
-                    tgt_ent = await client.get_entity(tid)
-                    is_forum = getattr(tgt_ent, 'forum', False)
-            except: pass
+                    try:
+                        # Resolve mapping for nested replies
+                        reply_to_mapped = None
+                        if getattr(m, "reply_to_msg_id", None):
+                            reply_to_mapped = get_message_mapping(sid, m.reply_to_msg_id, tid)
+                        
+                        # THE KEY FIX: Using the simplified 'reply_to' integer parameter
+                        # Telethon handles the Forum routing automatically if you pass the TOPmsg ID
+                        # to a Forum-enabled chat.
+                        
+                        # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
+                        final_reply_target = reply_to_mapped if reply_to_mapped else dest_topic_id
 
-            # 3. Resolve Reply Header
-            reply_header = None
-            if is_forum:
-                reply_header = int(dest_topic_id) if dest_topic_id else None
-                # If replying to a specific message inside the topic, use mapped ID
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-            else:
-                # Normal Group: Use Message Mapping for Replies
-                if first_msg.reply_to_msg_id:
-                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                    if mapped: reply_header = int(mapped)
-
-            # 4. Send Content
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            sent = None
-            
-            for attempt in range(3):
-                try:
-                    sent = await client.send_message(
-                        entity=int(tid), 
-                        message=album_text, 
-                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                        reply_to=reply_header
-                    )
-                    if sent:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                        break # Success!
-                except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
-                    await asyncio.sleep(fwe.seconds)
-                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
-                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
-                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
-                        if sent: break # Success via fallback
-                    else:
-                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                        if attempt == 2: # Last attempt
-                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-            
-        except Exception as e:
-            logger.error(f"Global Mirror Error: {e}")
-
-    async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
-        """Downloads and re-uploads protected content."""
-        import os
-        downloaded = []
-        try:
-            for m in messages:
-                if m.media:
-                    path = await client.download_media(m.media)
-                    if path: downloaded.append(path)
-            if downloaded:
-                sent = await client.send_message(
-                    entity=int(tid), message=album_text, 
-                    file=downloaded if len(downloaded) > 1 else downloaded[0],
-                    reply_to=reply_header
-                )
-                if sent:
-                    first_id = sent[0].id if isinstance(sent, list) else sent.id
-                    save_message_mapping(sid, first_msg.id, tid, first_id)
-        finally:
-            for p in downloaded:
-                if os.path.exists(p): os.remove(p)
+                        try:
+                            sent_msg = await client.send_message(
+                                entity=tid,
+                                message=m.message or "",
+                                file=m.media if m.media else None,
+                                reply_to=int(final_reply_target) if final_reply_target else None
+                            )
+                        except Exception as e:
+                            err_msg = str(e).lower()
+                            if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
+                                logger.info("🛡️ MIRROR: Restricted content detected. Using fallback...")
+                                sent_msg = await execute_fallback(client, sid, tid, m, int(final_reply_target) if final_reply_target else None)
+                            else:
+                                raise e
+                        
+                        if sent_msg:
+                            save_message_mapping(sid, m.id, tid, sent_msg.id)
+                            
+                    except Exception as e:
+                        logger.error(f"Live Forward Send Error: {e}")
 
 # -----------------------------
 # Bot Handlers
@@ -1588,86 +973,10 @@ def cmd_list(message):
 
     asyncio.run_coroutine_threadsafe(fetch_and_list(), loop)
     
-@bot.message_handler(commands=['extract'])
-def cmd_extract_media(message):
-    """Retrieves media from your Vault using source message ID"""
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        args = message.text.split()
-        if len(args) < 2: 
-            return bot.reply_to(message, "💡 **Usage:** `/extract [message_id]`\n\nFind the ID in your collected logs.", parse_mode="Markdown")
-        
-        smid = args[1]
-        with db_conn() as conn:
-            c = conn.cursor()
-            c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s LIMIT 1", (smid,))
-            res = c.fetchone()
-        
-        if res:
-            file_id, m_type = res
-            m_type = m_type.lower()
-            
-            bot.send_chat_action(message.chat.id, 'upload_document')
-            caption = f"✅ **Extracted from Vault**\n\n🆔 Source ID: `{smid}`\n📂 Type: `{m_type}`"
-            
-            if "photo" in m_type:
-                bot.send_photo(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-            elif "video" in m_type:
-                bot.send_video(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-            else:
-                bot.send_document(message.chat.id, file_id, caption=caption, parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "❌ No record found in the vault for this ID.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Extraction Error: {e}")
-
 @bot.message_handler(commands=['ping'])
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 **Pong!**\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
-
-@bot.message_handler(commands=['ban', 'block'])
-def cmd_ban_user(message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "💡 **Usage:** `/ban` or `/block [username_or_id]`", parse_mode="Markdown")
-            return
-        
-        target = args[1].replace("@", "")
-        uid, uname = None, None
-        if target.isdigit(): uid = int(target)
-        else: uname = target
-        
-        ban_user(user_id=uid, username=uname)
-        bot.reply_to(message, f"✅ **User Banned:** `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ban Error: {e}")
-
-@bot.message_handler(commands=['unban', 'unblock'])
-def cmd_unban_user(message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "💡 **Usage:** `/unban` or `/unblock [username_or_id]`", parse_mode="Markdown")
-            return
-        
-        target = args[1].replace("@", "")
-        uid, uname = None, None
-        if target.isdigit(): uid = int(target)
-        else: uname = target
-        
-        unban_user(user_id=uid, username=uname)
-        bot.reply_to(message, f"✅ **User Unbanned:** `{target}`", parse_mode="Markdown")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Unban Error: {e}")
-
-@bot.message_handler(commands=['banlist', 'blocklist'])
-def cmd_ban_list(message):
-    if message.from_user.id != ADMIN_ID: return
-    bot.send_message(message.chat.id, "🚫 **Banned Users**\n\nMessages from these users are ignored by all automated tasks:", reply_markup=banlist_markup(), parse_mode="Markdown")
 
 @bot.message_handler(commands=["logout"])
 def cmd_logout(message):
@@ -1726,154 +1035,6 @@ def handle_callbacks(call):
     if data == "dash_main":
         bot.answer_callback_query(call.id)
         bot.edit_message_text(get_dashboard_text(), call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup(), parse_mode="Markdown")
-
-    elif data == "vault_rel_main":
-        bot.answer_callback_query(call.id)
-        sources = get_vault_sources()
-        if not sources:
-            bot.edit_message_text("❌ No vaulted media found. Make sure you have collected media and set up a Log Target.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
-            return
-            
-        markup = InlineKeyboardMarkup(row_width=1)
-        for sid, title in sources:
-            markup.add(InlineKeyboardButton(f"📁 {title}", callback_data=f"vault_src_{sid}"))
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="dash_main"))
-        
-        bot.edit_message_text("🚀 **Vault Release Engine**\n\nSelect the source group you want to release media for:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-    elif data.startswith("vault_src_"):
-        bot.answer_callback_query(call.id)
-        sid = int(data.split("_")[-1])
-        login_data[uid] = {"vault_source_id": sid}
-        
-        async def show_tgt():
-            markup = await get_chat_selection_markup("vault_tgt", 0)
-            bot.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        asyncio.run_coroutine_threadsafe(show_tgt(), loop)
-        
-    elif data.startswith("vault_tgt_"):
-        bot.answer_callback_query(call.id)
-        parts = data.split("_")
-        if parts[2] == "page":
-            page = int(parts[3])
-            async def update_tgt_list():
-                markup = await get_chat_selection_markup("vault_tgt", page)
-                if markup:
-                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-            asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
-        else:
-            tid = int(parts[2])
-            sid = login_data.get(uid, {}).get("vault_source_id")
-            if not sid:
-                bot.send_message(call.message.chat.id, "❌ Session expired. Please start over.")
-                return
-            
-            # Start background task
-            login_data.pop(uid, None)
-            bot.edit_message_text(f"🚀 **Starting Vault Release**\n\nDistributing media to target: `{tid}`\nThis may take some time due to Telegram rate limits.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-            asyncio.run_coroutine_threadsafe(run_vault_release(bot, call.message.chat.id, sid, tid), loop)
-
-    elif data == "log_bot_main":
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
-
-    elif data == "banlist_main":
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
-
-    elif data == "ban_add_start":
-        bot.answer_callback_query(call.id)
-        admin_states[uid] = "awaiting_ban_target"
-        bot.send_message(call.message.chat.id, "🚫 **Add to Ban List**\n\nPlease send the **Username** or **User ID** you want to block.")
-
-    elif data.startswith("unban_confirm_"):
-        target = data.replace("unban_confirm_", "")
-        bot.answer_callback_query(call.id)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("✅ Confirm Unban", callback_data=f"unban_do_{target}"))
-        markup.add(InlineKeyboardButton("❌ Cancel", callback_data="banlist_main"))
-        bot.edit_message_text(f"❓ **Unban User:** `{target}`?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-    elif data.startswith("unban_do_"):
-        target = data.replace("unban_do_", "")
-        bot.answer_callback_query(call.id, "User Unbanned")
-        uid, uname = None, None
-        if target.isdigit(): uid = int(target)
-        else: uname = target
-        unban_user(user_id=uid, username=uname)
-        bot.edit_message_text("🚫 **Banned Users List**\n\nSelect a user to unban or add a new one:", call.message.chat.id, call.message.message_id, reply_markup=banlist_markup(), parse_mode="Markdown")
-
-    elif data == "log_bot_add_start":
-        bot.answer_callback_query(call.id)
-        admin_states[uid] = "awaiting_log_bot_token"
-        bot.send_message(call.message.chat.id, "📜 **Add Log Bot**\nPlease send the **Bot Token** of your backup bot.\n\n_Note: You must create this bot via @BotFather._")
-
-    elif data.startswith("log_bot_view_"):
-        bot_id = int(data.split("_")[-1])
-        bot.answer_callback_query(call.id)
-        stats = get_logged_media_stats(bot_id)
-        
-        # Find username
-        bots = get_log_bots()
-        username = next((b[1] for b in bots if b[2] == bot_id), "Unknown")
-        
-        text = f"🤖 **Log Bot:** @{username}\n\n"
-        text += f"📊 **Stats:**\n"
-        text += f"📦 Total Items: `{stats}`\n\n"
-        text += "_Click Fetch to download a file containing all logged media IDs._"
-        
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=log_bot_view_markup(bot_id), parse_mode="Markdown")
-
-    elif data.startswith("log_bot_fetch_"):
-        bot_id = int(data.split("_")[-1])
-        bot.answer_callback_query(call.id, "📂 Generating log file...")
-        
-        media = fetch_logged_media(bot_id)
-        if not media:
-            bot.send_message(call.message.chat.id, "❌ No logs found for this bot.")
-            return
-            
-        file_content = f"LOG MEDIA REPORT - BOT ID: {bot_id}\n"
-        file_content += "="*40 + "\n\n"
-        for sid, smid, fid, mtype, cap in media:
-            file_content += f"SOURCE: {sid} | MSG: {smid} | TYPE: {mtype}\n"
-            file_content += f"FILE_ID: {fid}\n"
-            if cap: file_content += f"CAPTION: {cap[:50]}...\n"
-            file_content += "-"*20 + "\n"
-            
-        filename = f"log_media_{bot_id}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(file_content)
-            
-        # Find username
-        bots = get_log_bots()
-        username = next((b[1] for b in bots if b[2] == bot_id), str(bot_id))
-        
-        with open(filename, "rb") as f:
-            bot.send_document(call.message.chat.id, f, caption=f"📂 Media Logs for @{username}")
-        
-        try: os.remove(filename)
-        except: pass
-
-    elif data.startswith("log_bot_delete_confirm_"):
-        bot_id = int(data.split("_")[-1])
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("✅ Confirm Delete", callback_data=f"log_bot_delete_do_{bot_id}"))
-        markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"log_bot_view_{bot_id}"))
-        bot.edit_message_text(f"⚠️ **Delete Log Bot?**\n\nThis will stop the bot and delete all `{get_logged_media_stats(bot_id)}` logged media records from the database. This cannot be undone!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-    elif data.startswith("log_bot_delete_do_"):
-        bot_id = int(data.split("_")[-1])
-        delete_log_bot(bot_id)
-        # Remove from fleet
-        if bot_id in log_bot_manager.bots:
-            try:
-                log_bot_manager.bots[bot_id].stop_polling()
-                del log_bot_manager.bots[bot_id]
-            except: pass
-            
-        bot.answer_callback_query(call.id, "Log Bot Removed")
-        bot.edit_message_text("📜 **Log Bot System**\nManage your backup bots and storage:", call.message.chat.id, call.message.message_id, reply_markup=log_bot_list_markup(), parse_mode="Markdown")
 
     elif data == "pairs_main":
         bot.answer_callback_query(call.id)
@@ -2032,21 +1193,6 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, f"Mirror Mode {'Enabled' if new_val else 'Disabled'}")
         show_pair_view(call.message.chat.id, call.message.message_id, pid)
 
-    elif data.startswith("pair_toggle_filter_"):
-        pid = int(data.split("_")[-1])
-        pair = get_target_pair(pid)
-        if not pair: return
-        current = pair[10] or "everything"
-        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
-        
-        with db_conn() as conn:
-            c = conn.cursor()
-            p = get_placeholder()
-            c.execute(f"UPDATE target_pairs SET content_filter = {p} WHERE id = {p}", (next_filter, pid))
-        
-        bot.answer_callback_query(call.id, f"🎯 Filter: {next_filter.title()}")
-        show_pair_view(call.message.chat.id, call.message.message_id, pid)
-
     elif data.startswith("pair_toggle_live_"):
         pid = int(data.split("_")[-1])
         row = get_target_pair(pid)
@@ -2151,7 +1297,7 @@ def handle_callbacks(call):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            if USING_POSTGRES:
+            if DATABASE_URL:
                 c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
             else:
                 c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
@@ -2282,42 +1428,8 @@ def handle_state_inputs(message):
     state = admin_states.get(uid)
     text = message.text.strip()
     
-    # --- Ban List System ---
-    if state == "awaiting_ban_target":
-        target = text.replace("@", "")
-        b_uid, b_uname = None, None
-        if target.isdigit(): b_uid = int(target)
-        else: b_uname = target
-        
-        ban_user(user_id=b_uid, username=b_uname)
-        admin_states.pop(uid, None)
-        bot.reply_to(message, f"✅ **User Banned:** `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
-        bot.send_message(message.chat.id, "🚫 **Banned Users**", reply_markup=banlist_markup(), parse_mode="Markdown")
-
-    # --- Logging System ---
-    # --- Log Bot System ---
-    if state == "awaiting_log_bot_token":
-        token = text
-        admin_states.pop(uid, None)
-        bot.send_message(message.chat.id, "⏳ Verifying Log Bot Token...")
-        
-        try:
-            temp_bot = telebot.TeleBot(token)
-            bot_info = temp_bot.get_me()
-            
-            # Save to DB
-            add_log_bot(token, bot_info.username, bot_info.id)
-            
-            # Start in fleet
-            log_bot_manager.add_bot(token)
-            
-            bot.send_message(message.chat.id, f"✅ **Log Bot Added!**\nUsername: @{bot_info.username}\nID: `{bot_info.id}`", parse_mode="Markdown")
-            bot.send_message(message.chat.id, "📜 **Log Bot System**", reply_markup=log_bot_list_markup(), parse_mode="Markdown")
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Failed to verify Bot Token: {e}")
-            
     # --- Login Flow ---
-    elif state == "awaiting_api_id":
+    if state == "awaiting_api_id":
         if not text.isdigit():
             bot.reply_to(message, "Invalid API ID. Please send a numeric ID.")
             return
@@ -2455,18 +1567,12 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             # Date filter
             if end_date and m.date > end_date: continue
             if start_date and m.date < start_date: break # History is newest to oldest
-
-            # --- BAN LIST CHECK ---
-            sender_id = m.sender_id
-            sender_username = getattr(m.sender, 'username', None)
-            if is_user_banned(sender_id, sender_username):
-                continue
-
+            
             if m.media:
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
                     c = conn.cursor()
-                    if USING_POSTGRES:
+                    if DATABASE_URL:
                         c.execute(
                             "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                             (pair_id, sid_resolved, m.id, m_type, m.message or "")
@@ -2476,10 +1582,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                             (pair_id, sid_resolved, m.id, m_type, m.message or "")
                         )
-                    if c.rowcount > 0: 
-                        collected += 1
-                        # Instantly send to log targets
-                        await forward_to_log_bots(userbot, [m], sid_resolved)
+                    if c.rowcount > 0: collected += 1
             
             if limit and collected >= limit: break
             
@@ -2525,38 +1628,24 @@ async def run_collection(admin_chat_id, pair_id, limit=300):
     status_msg = bot.send_message(admin_chat_id, f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `0`\n📥 New items: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
-        # Force peer resolution (Anti PeerIdInvalid)
-        target_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = target_chat.id
-        
         # Telethon iter_messages is powerful and supports reply_to (topic) filtering natively
         # Use int(s_topic) if it's a valid thread ID, otherwise None for entire chat
         target_topic = int(s_topic) if s_topic and str(s_topic) != "0" else None
-        async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic):
+        async for m in userbot.iter_messages(sid, limit=limit, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
                 break
             
             scanned += 1
-            
-            # --- BAN LIST CHECK ---
-            sender_id = m.sender_id
-            sender_username = getattr(m.sender, 'username', None)
-            if is_user_banned(sender_id, sender_username):
-                continue
-
             if m.media:
                 m_type = type(m.media).__name__
                 with db_conn() as conn:
                     c = conn.cursor()
-                    if USING_POSTGRES:
-                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
+                    if DATABASE_URL:
+                        c.execute("INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", (pair_id, sid, m.id, m_type, m.message or ""))
                     else:
-                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid_resolved, m.id, m_type, m.message or ""))
-                    if c.rowcount > 0: 
-                        collected += 1
-                        # Instantly send to log targets
-                        await forward_to_log_bots(userbot, [m], sid_resolved)
+                        c.execute("INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)", (pair_id, sid, m.id, m_type, m.message or ""))
+                    if c.rowcount > 0: collected += 1
             
             if scanned % 20 == 0:
                 try: bot.edit_message_text(f"📥 **Collection: `{s_title}`**\n\n🔍 Scanned: `{scanned}`\n📥 New items: `{collected}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -2582,11 +1671,11 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT source_id, target_id, source_title, is_mirror, source_topic_id, target_topic_id, content_filter FROM target_pairs WHERE id = {p}", (pair_id,))
+            c.execute(f"SELECT source_id, target_id, source_title, is_mirror, source_topic_id, target_topic_id FROM target_pairs WHERE id = {p}", (pair_id,))
             row = c.fetchone()
         
         if not row: return
-        sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic, cf = row
+        sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic = row
     
         try:
             # Pre-resolve entities to warm up Telethon cache and ensure access
@@ -2618,22 +1707,6 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 msg = await userbot.get_messages(sid_ref, ids=smid)
                 if not msg: continue
 
-                # --- CONTENT FILTERING ---
-                cf = cf or "everything"
-                if cf == "media" and not msg.media:
-                    # Mark as released so we don't try again
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-                    continue
-                if cf == "text" and msg.media:
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-                    continue
-
                 target_topic_anchor = t_topic
                 
                 # Handle Mirroring ID detection for release
@@ -2657,12 +1730,20 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
                 # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
                 final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
 
-                sent_msg = await userbot.send_message(
-                    entity=target_chat,
-                    message=msg.message or "",
-                    file=msg.media,
-                    reply_to=int(final_reply_target) if final_reply_target else None
-                )
+                try:
+                    sent_msg = await userbot.send_message(
+                        entity=target_chat,
+                        message=msg.message or "",
+                        file=msg.media,
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference"]):
+                        logger.info("🛡️ RELEASE: Restricted content detected. Using fallback...")
+                        sent_msg = await execute_fallback(userbot, sid_ref, target_chat, msg, int(final_reply_target) if final_reply_target else None)
+                    else:
+                        raise e
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
@@ -2686,10 +1767,65 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-
 # -----------------------------
 # Watchdog
 # -----------------------------
+
+# --- BAN / UNBAN / BLOCK COMMANDS ---
+@bot.message_handler(commands=['ban', 'block'])
+def cmd_ban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    text = message.text.split()
+    if len(text) < 2:
+        bot.reply_to(message, "❌ Usage: `/ban @username` or `/ban 12345678`", parse_mode="Markdown")
+        return
+    
+    target = text[1]
+    if target.isdigit():
+        ban_user(user_id=int(target))
+        bot.reply_to(message, f"🚫 User ID `{target}` has been banned.", parse_mode="Markdown")
+    else:
+        ban_user(username=target)
+        bot.reply_to(message, f"🚫 User `{target}` has been banned.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['unban', 'unblock'])
+def cmd_unban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    text = message.text.split()
+    if len(text) < 2:
+        bot.reply_to(message, "❌ Usage: `/unban @username` or `/unban 12345678`", parse_mode="Markdown")
+        return
+    
+    target = text[1]
+    if target.isdigit():
+        unban_user(user_id=int(target))
+        bot.reply_to(message, f"✅ User ID `{target}` has been unbanned.", parse_mode="Markdown")
+    else:
+        unban_user(username=target)
+        bot.reply_to(message, f"✅ User `{target}` has been unbanned.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['banlist', 'blocklist'])
+def cmd_banlist(message):
+    if message.from_user.id != ADMIN_ID: return
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, username FROM banned_users ORDER BY id DESC")
+        rows = c.fetchall()
+    
+    if not rows:
+        bot.reply_to(message, "📜 **Ban List is empty.**", parse_mode="Markdown")
+        return
+    
+    text = "🚫 **Banned Users List:**\n\n"
+    for uid, uname in rows:
+        text += f"• `{uid or 'N/A'}` | `@{uname or 'N/A'}`\n"
+    
+    if len(text) > 4000:
+        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for p in parts: bot.send_message(message.chat.id, p, parse_mode="Markdown")
+    else:
+        bot.reply_to(message, text, parse_mode="Markdown")
+
 async def userbot_watchdog():
     """
     Periodically check if the userbot session is still valid.
@@ -2702,17 +1838,16 @@ async def userbot_watchdog():
                 await userbot.get_me()
             except Exception as e:
                 err_msg = str(e).lower()
-                if "deactivated" in err_msg or "authorized" in err_msg or "simultaneous" in err_msg or "ip address" in err_msg:
-                    logger.warning(f"WATCHDOG: Userbot session invalid or conflict: {e}")
+                if "deactivated" in err_msg or "authorized" in err_msg:
+                    logger.warning(f"WATCHDOG: Userbot session invalid: {e}")
                     try: await userbot.disconnect()
                     except: pass
                     userbot = None
                     
-                    # Clear session from DB to force re-login
+                    # Clear session from DB
                     with db_conn() as conn:
                         c = conn.cursor()
                         c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
-                    logger.info("WATCHDOG: Session cleared from DB due to conflict/invalidation.")
                     
                     bot.send_message(ADMIN_ID, f"⚠️ **USERBOT SESSION EXPIRED/BANNED**\n\nThe account has been deactivated or unauthorized. Session has been cleared.\nError: `{e}`", parse_mode="Markdown")
                 else:
@@ -2803,407 +1938,6 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 # -----------------------------
-# Log Bot System (Fleet Manager)
-# -----------------------------
-class LogBotManager:
-    def __init__(self):
-        self.bots = {} # { bot_id: telebot_instance }
-        self.states = {} # { bot_id: { user_id: { state_data } } }
-
-    def start_all(self):
-        logger.info("📡 Initializing Log Bot Fleet...")
-        bots = get_log_bots()
-        for token, username, bot_id in bots:
-            try:
-                self.add_bot(token)
-            except Exception as e:
-                logger.error(f"Failed to start Log Bot {username}: {e}")
-
-    def add_bot(self, token):
-        new_bot = telebot.TeleBot(token)
-        bot_info = new_bot.get_me()
-        bot_id = bot_info.id
-        
-        if bot_id in self.bots:
-            return bot_id
-            
-        self.bots[bot_id] = new_bot
-        self._setup_handlers(new_bot, bot_id)
-        
-        # Start polling in a separate thread
-        def run_polling():
-            while True:
-                try:
-                    logger.info(f"🚀 Log Bot @{bot_info.username} started polling.")
-                    new_bot.delete_webhook(drop_pending_updates=True)
-                    # Use a shorter timeout and skip pending to reduce conflict duration
-                    new_bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-                except Exception as e:
-                    if "Conflict" in str(e):
-                        logger.warning(f"⚠️ Log Bot @{bot_info.username} conflict. Retrying in 15s...")
-                        time.sleep(15)
-                    else:
-                        logger.error(f"Log Bot @{bot_info.username} crashed: {e}")
-                        time.sleep(10)
-        
-        threading.Thread(target=run_polling, daemon=True).start()
-        return bot_id
-
-    def _setup_handlers(self, bot_instance, bot_id):
-        @bot_instance.message_handler(commands=['start'])
-        def cmd_start(message):
-            if message.from_user.id != ADMIN_ID: return
-            count = get_logged_media_stats(bot_id)
-            text = (f"🤖 **Vault Manager Online**\n\n"
-                    f"📊 **Storage Stats:**\n"
-                    f"📦 Total Vaulted: `{count}` items\n\n"
-                    f"Use /grouplist to see categorized media.")
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("📤 Send Log", callback_data="lb_vault_main"))
-            bot_instance.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
-
-        @bot_instance.message_handler(commands=['get'])
-        def fetch_from_vault(message):
-            if message.from_user.id != ADMIN_ID: return
-            try:
-                args = message.text.split()
-                if len(args) < 2:
-                    bot_instance.reply_to(message, "❌ Usage: `/get [Fetch_ID]`")
-                    return
-                fetch_id = args[1]
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    # Use %s for PostgreSQL
-                    c.execute("SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = %s AND bot_id = %s", (fetch_id, bot_id))
-                    res = c.fetchone()
-                if res:
-                    file_id, m_type, caption = res
-                    bot_instance.send_chat_action(message.chat.id, 'upload_document')
-                    if m_type == "photo": bot_instance.send_photo(message.chat.id, file_id, caption=caption)
-                    elif m_type == "video": bot_instance.send_video(message.chat.id, file_id, caption=caption)
-                    else: bot_instance.send_document(message.chat.id, file_id, caption=caption)
-                else:
-                    bot_instance.reply_to(message, "🔍 ID not found in this bot's vault.")
-            except Exception as e:
-                bot_instance.reply_to(message, f"❌ Error: {e}")
-
-        @bot_instance.message_handler(commands=['getcount'])
-        def fetch_recent_batch(message):
-            if message.from_user.id != ADMIN_ID: return
-            try:
-                args = message.text.split()
-                count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
-                if count > 30: count = 30 
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = %s ORDER BY timestamp DESC LIMIT %s", (bot_id, count))
-                    results = c.fetchall()
-                if not results:
-                    bot_instance.reply_to(message, "🔍 Vault empty.")
-                    return
-                for f_id, m_t, cap, l_id in reversed(results):
-                    full_cap = f"🆔 ID: `{l_id}`\n\n{cap or ''}"
-                    if m_t == "photo": bot_instance.send_photo(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                    elif m_t == "video": bot_instance.send_video(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                    else: bot_instance.send_document(message.chat.id, f_id, caption=full_cap, parse_mode="Markdown")
-                    time.sleep(0.5)
-            except Exception as e:
-                bot_instance.reply_to(message, f"❌ Error: {e}")
-
-        @bot_instance.message_handler(commands=['grouplist'])
-        def cmd_group_list(message):
-            if message.from_user.id != ADMIN_ID: return
-            with db_conn() as conn:
-                c = conn.cursor()
-                # Correct GROUP BY for PostgreSQL
-                c.execute("""
-                    SELECT m.source_chat_id, p.source_title, COUNT(m.id)
-                    FROM log_media m
-                    LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
-                    WHERE m.bot_id = %s
-                    GROUP BY m.source_chat_id, p.source_title
-                """, (bot_id,))
-                groups = c.fetchall()
-            if not groups:
-                bot_instance.send_message(message.chat.id, "📭 No media found.")
-                return
-            markup = InlineKeyboardMarkup(row_width=1)
-            for sid, title, cnt in groups:
-                if sid is None or sid == 0: continue
-                markup.add(InlineKeyboardButton(f"📁 {title or 'Direct'} — {cnt}", callback_data=f"v_group_stats_{sid}"))
-            bot_instance.send_message(message.chat.id, "📂 **Vault Groups**", reply_markup=markup, parse_mode="Markdown")
-
-        @bot_instance.message_handler(commands=['getbyid'])
-        def fetch_by_group_id(message):
-            if message.from_user.id != ADMIN_ID: return
-            try:
-                args = message.text.split()
-                if len(args) < 2: return bot_instance.reply_to(message, "❌ `/getbyid [ID] [Count]`")
-                group_id, count = int(args[1]), (int(args[2]) if len(args) > 2 else 5)
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = %s AND bot_id = %s ORDER BY timestamp DESC LIMIT %s", (group_id, bot_id, count))
-                    results = c.fetchall()
-                for f_id, m_t, cap, l_id in reversed(results):
-                    bot_instance.send_photo(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`\n{cap or ''}") if m_t == "photo" else bot_instance.send_document(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`")
-                    time.sleep(0.5)
-            except Exception as e: bot_instance.reply_to(message, f"❌ Error: {e}")
-
-        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_group_stats_"))
-        def handle_group_stats(call):
-            sid = int(call.data.split("_")[-1])
-            with db_conn() as conn:
-                c = conn.cursor()
-                p = get_placeholder(conn)
-                
-                # Use standard string formatting for the query to avoid "end of input" errors
-                # Ensure sid is passed as a tuple (sid,)
-                if USING_POSTGRES:
-                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = %s LIMIT 1", (sid,))
-                else:
-                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = ? LIMIT 1", (sid,))
-                
-                res = c.fetchone()
-                title = res[0] if res else "Unknown Group"
-                
-                # Fetch count for this specific bot
-                c.execute(f"SELECT COUNT(*) FROM log_media WHERE source_chat_id = {p} AND bot_id = {p}", (sid, bot_id))
-                total = c.fetchone()[0]
-
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🚀 Send batch to Group", callback_data=f"v_dump_start_{sid}"))
-            markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="lb_vault_main"))
-
-            msg = (f"📊 **Group Statistics**\n\n"
-                   f"🏷 **Title:** `{title}`\n"
-                   f"🆔 **ID:** `{sid}`\n"
-                   f"📦 **Total Media:** `{total}`\n\n"
-                   f"💡 Click the button below to send this media into a different group via this Log Bot.")
-            bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("v_dump_start_"))
-        def start_dump_flow(call):
-            sid = int(call.data.split("_")[-1])
-            login_data[call.from_user.id] = {"dump_sid": sid}
-            
-            async def get_list():
-                markup = await get_chat_selection_markup("lb_vault_tgt", 0) # Reuse the tgt selection markup
-                if not markup:
-                    bot_instance.answer_callback_query(call.id, "❌ Main Userbot Offline", show_alert=True)
-                    return
-                bot_instance.edit_message_text(
-                    "🎯 **Select Destination**\nWhere should the Log Bot send this media?",
-                    call.message.chat.id, call.message.message_id, reply_markup=markup
-                )
-            asyncio.run_coroutine_threadsafe(get_list(), loop)
-
-        @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
-        def handle_logging(message):
-            try:
-                m_type = "document"
-                file_id = None
-                caption = message.caption or ""
-                if message.photo: m_type, file_id = "photo", message.photo[-1].file_id
-                elif message.video: m_type, file_id = "video", message.video.file_id
-                elif message.document: m_type, file_id = "document", message.document.file_id
-                elif message.audio: m_type, file_id = "audio", message.audio.file_id
-                elif message.animation: m_type, file_id = "animation", message.animation.file_id
-                elif message.sticker: m_type, file_id = "sticker", message.sticker.file_id
-                
-                if file_id:
-                    sid, mid = 0, message.message_id
-                    if caption and "SID:" in caption and "MID:" in caption:
-                        try:
-                            parts = caption.split("|")
-                            sid = int(parts[0].replace("SID:", "").strip())
-                            mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
-                            caption = caption.split("\n", 1)[1] if "\n" in caption else ""
-                        except: pass
-                    
-                    # Log Bot API also has media_group_id
-                    m_gid = message.media_group_id
-                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, grouped_id=m_gid)
-                    if sid == 0 and message.from_user.id == ADMIN_ID:
-                        bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`\nFetch: `/get {message.message_id}`")
-            except Exception as e: logger.error(f"Logging Error: {e}")
-
-        @bot_instance.callback_query_handler(func=lambda call: True)
-        def handle_log_bot_callbacks(call):
-            if call.from_user.id != ADMIN_ID: return
-            data = call.data
-            uid = call.from_user.id
-            
-            if data == "lb_vault_main":
-                bot_instance.answer_callback_query(call.id)
-                stats = get_log_bot_stats(bot_id)
-                if not stats:
-                    bot_instance.send_message(call.message.chat.id, "❌ No vaulted media found for this bot.")
-                    return
-                    
-                markup = InlineKeyboardMarkup(row_width=1)
-                for sid, title, count in stats:
-                    markup.add(InlineKeyboardButton(f"📁 {title} ({count})", callback_data=f"lb_vault_src_{sid}"))
-                markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="lb_cancel"))
-                
-                bot_instance.edit_message_text("🚀 **Select Source Group**\n\nWhich group's vaulted content do you want to send?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-            elif data.startswith("lb_vault_src_"):
-                bot_instance.answer_callback_query(call.id)
-                sid = int(data.split("_")[-1])
-                login_data[uid] = {"vault_source_id": sid}
-                
-                async def show_tgt():
-                    markup = await get_chat_selection_markup("lb_vault_tgt", 0)
-                    if not markup:
-                        main_bot_username = bot.get_me().username
-                        msg = "⚠️ **Userbot Offline**\n\nI cannot fetch your group list because the main userbot is not connected.\n\nPlease go to your **Main Admin Bot** and use the **'Connect Userbot'** button."
-                        btn = InlineKeyboardMarkup().add(InlineKeyboardButton("🔌 Connect at Main Bot", url=f"https://t.me/{main_bot_username}"))
-                        btn.add(InlineKeyboardButton("🔙 Back", callback_data="lb_vault_main"))
-                        bot_instance.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=btn, parse_mode="Markdown")
-                        return
-                        
-                    bot_instance.edit_message_text("🎯 **Select Target Chat**\n\nChoose the group/channel where you want to release this media.\n⚠️ **IMPORTANT**: The Main Bot must be an admin in the target chat!", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(show_tgt(), loop)
-                
-            elif data.startswith("lb_vault_tgt_"):
-                bot_instance.answer_callback_query(call.id)
-                parts = data.split("_")
-                if parts[3] == "page":
-                    page = int(parts[4])
-                    async def update_tgt_list():
-                        markup = await get_chat_selection_markup("lb_vault_tgt", page)
-                        if markup:
-                            bot_instance.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
-                    asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
-                else:
-                    tid = int(parts[3])
-                    
-                    async def handle_dest():
-                        try:
-                            entity = await userbot.get_entity(tid)
-                            if getattr(entity, 'forum', False):
-                                markup = await get_topic_selection_markup(tid, "lb_vault_topic")
-                                bot_instance.edit_message_text(f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-                            else:
-                                # Standard group
-                                is_dump = "dump_sid" in login_data.get(uid, {})
-                                if is_dump:
-                                    login_data[uid]["dump_tid"] = tid
-                                    login_data[uid]["dump_topic"] = None
-                                    admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
-                                    bot_instance.edit_message_text(f"🔢 **How many items?**\nEnter count for group `{tid}`:", call.message.chat.id, call.message.message_id)
-                                else:
-                                    login_data[uid]["vault_target_id"] = tid
-                                    login_data[uid]["vault_topic_id"] = None
-                                    admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
-                                    bot_instance.edit_message_text("⏳ **Release Interval**\nEnter time (seconds) between messages:", call.message.chat.id, call.message.message_id)
-                        except Exception as e:
-                            bot_instance.send_message(call.message.chat.id, f"❌ Error: {e}")
-                    asyncio.run_coroutine_threadsafe(handle_dest(), loop)
-
-            elif data.startswith("lb_vault_topic_"):
-                bot_instance.answer_callback_query(call.id)
-                payload = data.replace("lb_vault_topic_", "")
-                tid_str, topic_id_str = payload.rsplit("_", 1)
-                tid = int(tid_str)
-                topic_id = int(topic_id_str)
-                topic_val = topic_id if topic_id != 0 else None
-                
-                is_dump = "dump_sid" in login_data.get(uid, {})
-                if is_dump:
-                    login_data[uid]["dump_tid"] = tid
-                    login_data[uid]["dump_topic"] = topic_val
-                    admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
-                    bot_instance.edit_message_text(f"🔢 **Topic Set!**\nEnter count for topic `{topic_id}`:", call.message.chat.id, call.message.message_id)
-                else:
-                    login_data[uid]["vault_target_id"] = tid
-                    login_data[uid]["vault_topic_id"] = topic_val
-                    admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
-                    bot_instance.edit_message_text(f"⏳ **Topic Set!**\nEnter release interval (seconds):", call.message.chat.id, call.message.message_id)
-                    
-            elif data == "lb_cancel":
-                bot_instance.answer_callback_query(call.id)
-                admin_states.pop(f"lb_{bot_id}_{uid}", None)
-                cmd_start(call.message)
-
-            elif data.startswith("lb_stop_rel_"):
-                bot_instance.answer_callback_query(call.id, "🛑 Stopping...")
-                task_key = data.replace("lb_stop_rel_", "")
-                stop_task(task_key)
-
-            elif data.startswith("lb_do_release_"):
-                # lb_do_release_{sid}_{tid}_{interval}_{topic}
-                bot_instance.answer_callback_query(call.id)
-                parts = data.split("_")
-                sid, tid = int(parts[3]), int(parts[4])
-                interval = float(parts[5])
-                topic_id = int(parts[6])
-                
-                # FIX: Convert 0 back to None for the engine
-                topic_val = topic_id if topic_id != 0 else None
-                
-                bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval, target_topic_id=topic_val, log_target_id=bot_id), loop)
-
-        @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
-        def handle_lb_messages(message):
-            uid = message.from_user.id
-            state = admin_states.get(f"lb_{bot_id}_{uid}")
-            text = message.text.strip()
-            
-            if state == "awaiting_rel_interval":
-                try:
-                    interval = float(text)
-                    if interval < 0.1: raise ValueError()
-                    
-                    admin_states.pop(f"lb_{bot_id}_{uid}", None)
-                    sid = login_data.get(uid, {}).get("vault_source_id")
-                    tid = login_data.get(uid, {}).get("vault_target_id")
-                    t_topic = login_data.get(uid, {}).get("vault_topic_id")
-                    
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("🚀 Start Release", callback_data=f"lb_do_release_{sid}_{tid}_{interval}_{t_topic or 0}"))
-                    markup.add(InlineKeyboardButton("❌ Cancel", callback_data="lb_cancel"))
-                    
-                    bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
-                except:
-                    bot_instance.reply_to(message, "⚠️ Invalid interval. Please send a number (e.g. `2.0`).")
-
-            elif state.startswith("wait_dump_count_"):
-                try:
-                    target_cid = int(state.split("_")[-1])
-                    count = int(text)
-                    
-                    user_session = login_data.get(uid)
-                    if not user_session or "dump_sid" not in user_session:
-                        bot_instance.send_message(message.chat.id, "❌ Session expired.")
-                        return
-
-                    source_cid = user_session["dump_sid"]
-                    target_topic = user_session.get("dump_topic") 
-                    
-                    admin_states.pop(f"lb_{bot_id}_{uid}", None)
-                    
-                    # Start the background task
-                    asyncio.run_coroutine_threadsafe(
-                        run_vault_release(
-                            sender_bot=bot_instance, 
-                            admin_chat_id=message.chat.id, 
-                            source_id=source_cid, 
-                            target_id=target_cid, 
-                            interval=2.0, 
-                            log_target_id=bot_id,
-                            limit=count,
-                            target_topic_id=target_topic
-                        ), 
-                        loop
-                    )
-                except Exception as e:
-                    bot_instance.reply_to(message, f"❌ Error: {e}. Please send a number.")
-
-log_bot_manager = LogBotManager()
-
-# -----------------------------
 # Main Loop
 # -----------------------------
 async def main():
@@ -3219,12 +1953,6 @@ async def main():
         logger.warning("⚠️ WARNING: You are using SQLite. Your data (pairs, media) will be DELETED every time Render restarts!")
         logger.warning("Please set a DATABASE_URL (PostgreSQL) for permanent storage.")
 
-    # Boot all saved Log Bots
-    try:
-        log_bot_manager.start_all()
-    except Exception as e:
-        logger.error(f"Error booting log bots: {e}")
-
     asyncio.create_task(userbot_watchdog())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
@@ -3237,41 +1965,31 @@ async def main():
             logger.info("📡 Warming up peer cache...")
             async for _ in userbot.iter_dialogs(limit=50): pass
             logger.info("✅ Peer cache warmed")
-    except Exception as e: 
-        logger.error(f"Userbot startup error: {e}")
-        if "AuthKeyDuplicatedError" in str(e):
-            logger.critical("🚨 CRITICAL: Duplicate session detected. Please log out from other devices or delete session from DB.")
+    except Exception as e: logger.error(f"Userbot error: {e}")
 
     # Start telebot polling with AUTO-RESTART
     def run_polling():
         while True:
             try:
                 logger.info("🚀 Starting Admin Bot polling...")
-                bot.delete_webhook(drop_pending_updates=True)
-                # Reduced timeout and conflict handling
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                # SERVER-SIDE CLEANUP: Flush the getUpdates queue before starting
+                try:
+                    bot.delete_webhook(drop_pending_updates=True)
+                    bot.get_updates(offset=-1, timeout=1)
+                except: pass
+                
+                time.sleep(15) # Longer delay for Render environment stability
+                bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
             except Exception as e:
-                if "Conflict" in str(e):
-                    logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")
-                    time.sleep(20)
-                else:
-                    logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
-                    time.sleep(30)
+                logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
+                time.sleep(30)
     
     polling_thread = threading.Thread(target=run_polling, daemon=True)
     polling_thread.start()
     logger.info("✨ Admin bot monitor started")
     
     if userbot:
-        try:
-            await userbot.run_until_disconnected()
-        except Exception as e:
-            logger.error(f"Userbot disconnected with error: {e}")
-            if "AuthKeyDuplicatedError" in str(e):
-                logger.critical("🚨 CRITICAL: Duplicate session detected. Stopping Userbot loop.")
-            # Keep the main thread alive so background bots keep working
-            while True:
-                await asyncio.sleep(3600)
+        await userbot.run_until_disconnected()
     else:
         while True:
             await asyncio.sleep(3600)
