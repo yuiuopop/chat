@@ -228,6 +228,7 @@ def init_db():
                     log_msg_id BIGINT,
                     source_chat_id BIGINT,
                     source_msg_id BIGINT,
+                    grouped_id BIGINT,
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
@@ -235,6 +236,8 @@ def init_db():
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
+            try: c.execute("ALTER TABLE log_media ADD COLUMN grouped_id BIGINT")
+            except: pass
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
             except: pass
 
@@ -607,7 +610,7 @@ def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.grouped_id
             FROM log_media m
             WHERE m.source_chat_id = {p}
         """
@@ -726,41 +729,69 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
         status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
 
-        for i, item in enumerate(items):
+        # Grouping items by grouped_id or source_msg_id
+        grouped_items = []
+        last_gid = None
+        current_group = []
+        
+        for item in items:
+            # item = (source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, grouped_id)
+            gid = item[6] # grouped_id
+            if gid and gid == last_gid:
+                current_group.append(item)
+            else:
+                if current_group:
+                    grouped_items.append(current_group)
+                current_group = [item]
+                last_gid = gid
+        if current_group:
+            grouped_items.append(current_group)
+            
+        total_groups = len(grouped_items)
+        
+        for i, group in enumerate(grouped_items):
             if not running_tasks.get(task_key):
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
-                
-            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id = item
             
             try:
-                if log_msg_id is None or bot_id is None:
-                    continue 
-
-                # FIX: We fetch the message first, then send it with a reply_to attribute.
-                # This is the only way to guarantee it hits the correct Forum Topic.
+                # Process the group (might be 1 or multiple messages)
+                first_item = group[0]
+                bot_id = first_item[5]
+                log_msg_ids = [int(it[4]) for it in group]
+                captions = [it[3] for it in group]
+                
                 log_bot_entity = await userbot.get_input_entity(int(bot_id))
                 
-                # Get the message from the log bot
-                msg_to_forward = await userbot.get_messages(log_bot_entity, ids=int(log_msg_id))
+                # Fetch all messages in the group from the log bot
+                msgs_to_forward = await userbot.get_messages(log_bot_entity, ids=log_msg_ids)
+                if not isinstance(msgs_to_forward, list):
+                    msgs_to_forward = [msgs_to_forward] if msgs_to_forward else []
                 
-                if msg_to_forward:
-                    # Use send_message with the CLEAN caption from the database
-                    await userbot.send_message(
-                        entity=int(target_id),
-                        message=caption,
-                        file=msg_to_forward.media,
-                        # This specifies the Topic ID
-                        reply_to=target_topic_id if target_topic_id else None 
-                    )
-                    success += 1
+                if msgs_to_forward:
+                    # Filter out None/Failed fetches
+                    msgs_to_forward = [m for m in msgs_to_forward if m]
+                    
+                    if msgs_to_forward:
+                        # Use the first available caption for the album
+                        main_caption = next((c for c in captions if c), "")
+                        
+                        await userbot.send_message(
+                            entity=int(target_id),
+                            message=main_caption,
+                            file=[m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media,
+                            reply_to=target_topic_id if target_topic_id else None 
+                        )
+                        success += len(msgs_to_forward)
+                    else:
+                        failed += len(group)
                 else:
-                    failed += 1
+                    failed += len(group)
             except Exception as e:
-                logger.error(f"Vault Release item error: {e}")
-                failed += 1
+                logger.error(f"Vault Release group error: {e}")
+                failed += len(group)
 
-            if (i + 1) % 5 == 0 or (i + 1) == total:
+            if (i + 1) % 5 == 0 or (i + 1) == total_groups:
                 try: sender_bot.edit_message_text(f"📊 **Status:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
                 except: pass
 
@@ -773,27 +804,27 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
     finally:
         running_tasks.pop(task_key, None)
 
-def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption):
+def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s) 
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
-                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption, grouped_id = EXCLUDED.grouped_id""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
             )
         else:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
-                   media_type = excluded.media_type, caption = excluded.caption""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
+                   media_type = excluded.media_type, caption = excluded.caption, grouped_id = excluded.grouped_id""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
             )
 
 def get_logged_media_stats(bot_id):
@@ -1227,10 +1258,8 @@ async def ensure_userbot():
     return True, "Connected"
 
 async def forward_to_log_bots(client, messages, source_chat_id):
-    """Sends collected content to all registered log bots as a group if it's an album."""
+    """Sends collected content (single or album) to all registered log bots."""
     if not messages: return
-    if not isinstance(messages, list): messages = [messages]
-    
     bots = get_log_bots()
     if not bots: return
     
@@ -1239,9 +1268,10 @@ async def forward_to_log_bots(client, messages, source_chat_id):
         asyncio.create_task(vault_media(client, messages, int(source_chat_id), int(bot_id), username))
 
 async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
-    """Helper to forward to vault as an album and save permanent File IDs for all parts."""
+    """Helper to forward to vault and save the permanent File IDs (handles albums)"""
     try:
-        if not isinstance(messages, list): messages = [messages]
+        if not messages: return
+        first_msg = messages[0]
         
         # RESOLVE ENTITY
         try:
@@ -1249,64 +1279,58 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         except:
             target_peer = await client.get_entity(int(log_chat_id))
 
-        # Prepare media list with metadata for each part
-        media_group = []
-        for m in messages:
-            metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
-            caption = metadata + (m.message or "")
-            # We use a tuple (file, caption) which send_file handles for albums
-            media_group.append((m.media, caption))
+        # Metadata for Log Bot extraction (only on the first message of album if multiple)
+        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+        caption_text = metadata + (first_msg.message or "")
         
-        vaulted_msgs = []
         try:
-            # Send as album if multiple, else single
-            if len(media_group) > 1:
-                vaulted_msgs = await client.send_file(
-                    entity=target_peer,
-                    file=media_group
-                )
-            else:
-                m = messages[0]
-                metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
-                v = await client.send_message(
-                    entity=target_peer,
-                    file=m.media,
-                    message=metadata + (m.message or "")
-                )
-                vaulted_msgs = [v]
-            await asyncio.sleep(1)
+            # Send as album if multiple messages
+            vaulted_result = await client.send_message(
+                entity=target_peer,
+                file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                message=caption_text
+            )
+            await asyncio.sleep(2)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
             await asyncio.sleep(fwe.seconds)
+            return await vault_media(client, messages, source_chat_id, log_chat_id, t_name) # Retry
         except Exception as e:
             if "protected" in str(e).lower() or "forward" in str(e).lower():
-                logger.info(f"🛡️ VAULT: Protected chat detected. Using direct upload...")
-                # Fallback: send one by one for protected chats to be safe
-                vaulted_msgs = []
+                logger.info(f"🛡️ VAULT: Protected chat detected. Attempting direct download/upload...")
+                # Download all if album
+                files = []
                 for m in messages:
-                    metadata = f"SID: {source_chat_id} | MID: {m.id}\n"
-                    path = await client.download_media(m)
-                    v = await client.send_message(entity=target_peer, file=path, message=metadata + (m.message or ""))
-                    vaulted_msgs.append(v)
-                    if path and os.path.exists(path): os.remove(path)
+                    p = await client.download_media(m)
+                    if p: files.append(p)
+                
+                vaulted_result = await client.send_message(
+                    entity=target_peer,
+                    file=files if len(files) > 1 else files[0] if files else None,
+                    message=caption_text
+                )
+                for p in files:
+                    if os.path.exists(p): os.remove(p)
             else:
                 raise e
             
-        if vaulted_msgs:
-            if not isinstance(vaulted_msgs, list): vaulted_msgs = [vaulted_msgs]
-            for i, v in enumerate(vaulted_msgs):
-                if i >= len(messages): break
+        if vaulted_result:
+            # vaulted_result is a list if it was an album, or a single Message object
+            v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+            
+            for i, v_m in enumerate(v_msgs):
                 orig_m = messages[i]
+                logger.info(f"✅ VAULT: Message {orig_m.id} logged to @{t_name} -> Log ID: {v_m.id}")
                 save_logged_media(
                     bot_id=int(log_chat_id),
-                    log_msg_id=int(v.id),
+                    log_msg_id=int(v_m.id),
                     source_chat_id=int(source_chat_id),
                     source_msg_id=int(orig_m.id),
                     file_id=None,
                     media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                    caption=orig_m.message or ""
+                    caption=orig_m.message or "",
+                    grouped_id=orig_m.grouped_id
                 )
-            logger.info(f"✅ VAULT: Group of {len(vaulted_msgs)} logged to @{t_name}")
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
 
@@ -1369,38 +1393,31 @@ def setup_automation_handlers(client: TelegramClient):
                                 "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
-                    
-                    # Database record remains instant for snappy UI
-                    # But the Log Bot forwarding is now handled in the grouped logic below
-                    pass
 
                 if not is_live: 
-                    # If we matched a pair but live is off, we still break to prevent 
-                    # processing the same message for other generic pairs.
+                    # If we matched a pair but live is off, we still break
                     break
 
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        # Wait for all parts to arrive
-                        async def delayed_process(gid, t_id, mir_toggle, mon_toggle, s_id, def_topic):
+                        # Wait for all parts
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring):
                             await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
-                                # 1. Mirroring to Target Group
-                                if mir_toggle:
-                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                                # 2. Vaulting to Log Bots
-                                if mon_toggle:
-                                    await forward_to_log_bots(client, messages, s_id)
-                        asyncio.create_task(delayed_process(m.grouped_id, tid, is_mir, is_mon, sid, t_topic))
+                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                if is_monitoring:
+                                    # Send the entire album to log bots
+                                    asyncio.create_task(forward_to_log_bots(client, messages, s_id))
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon))
+                    else:
+                        album_cache[m.grouped_id].append(m)
                 else:
-                    # Single message case
-                    if is_mir:
-                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
                     if is_mon:
-                        await forward_to_log_bots(client, m, sid)
+                        asyncio.create_task(forward_to_log_bots(client, [m], sid))
                 
                 # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
@@ -2996,7 +3013,9 @@ class LogBotManager:
                             caption = caption.split("\n", 1)[1] if "\n" in caption else ""
                         except: pass
                     
-                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption)
+                    # Log Bot API also has media_group_id
+                    m_gid = message.media_group_id
+                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, grouped_id=m_gid)
                     if sid == 0 and message.from_user.id == ADMIN_ID:
                         bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`\nFetch: `/get {message.message_id}`")
             except Exception as e: logger.error(f"Logging Error: {e}")
