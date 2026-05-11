@@ -70,21 +70,25 @@ async def safe_send(func, *args, retries=3, **kwargs):
             await asyncio.sleep(2)
 
 
-# --- HELPER FOR SAFE MESSAGE EDITS ---
+# --- HELPER FOR SAFE MESSAGE EDITS (FIXED) ---
 def safe_edit_text(bot_obj, text, chat_id, message_id, **kwargs):
     try:
-        return safe_edit_text(bot_obj, text, chat_id, message_id, **kwargs)
+        # Call the actual telebot method, not this helper function
+        return bot_obj.edit_message_text(text, chat_id, message_id, **kwargs)
     except Exception as e:
         if "message is not modified" in str(e).lower():
             return None
+        logger.error(f"Safe Edit Error: {e}")
         raise e
 
 def safe_edit_markup(bot_obj, chat_id, message_id, reply_markup=None, **kwargs):
     try:
-        return safe_edit_markup(bot_obj, chat_id, message_id, reply_markup=reply_markup, **kwargs)
+        # Call the actual telebot method
+        return bot_obj.edit_message_reply_markup(chat_id, message_id, reply_markup=reply_markup, **kwargs)
     except Exception as e:
         if "message is not modified" in str(e).lower():
             return None
+        logger.error(f"Safe Markup Error: {e}")
         raise e
 
 def send_monitor_log(text):
