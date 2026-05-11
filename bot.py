@@ -1296,7 +1296,7 @@ async def resolve_source_topic_name(client, chat_id, message):
         
     try:
         # Check if the chat is a forum
-        entity = await client.get_entity(int(chat_id))
+        entity = await resolve_target_id(client, chat_id)
         is_forum = getattr(entity, 'forum', False)
         logger.debug(f"MIRROR: Chat {chat_id} is_forum: {is_forum}")
         
@@ -1322,12 +1322,12 @@ async def resolve_source_topic_name(client, chat_id, message):
 
 async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
     try:
-        target_entity = await client.get_entity(int(target_chat_id))
+        target_entity = await resolve_target_id(client, target_chat_id)
         if not getattr(target_entity, 'forum', False):
             return None
 
         if not source_msg_topic_name or source_msg_topic_name == "General":
-            source_entity = await client.get_entity(int(source_chat_id))
+            source_entity = await resolve_target_id(client, source_chat_id)
             source_msg_topic_name = getattr(source_entity, 'title', "Archive")
 
         # 1. Check Local Cache First (Fastest)
@@ -1372,12 +1372,8 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
-        # RESOLVE ENTITY: Fetch the access hash for the bot
-        try:
-            target_peer = await client.get_input_entity(int(log_chat_id))
-        except:
-            # If not found, try to 'find' the bot by ID directly (forces session lookup)
-            target_peer = await client.get_entity(int(log_chat_id))
+        # RESOLVE ENTITY: Fetch the access hash for the bot or peer
+        target_peer = await resolve_target_id(client, log_chat_id)
 
         # RESOLVE TOPIC NAME
         src_topic_name = await resolve_source_topic_name(client, source_chat_id, message)
@@ -1972,7 +1968,7 @@ def handle_callbacks(call):
             sid = int(parts[2])
             async def handle_src():
                 try:
-                    full_chat = await userbot.get_entity(sid)
+                    full_chat = await resolve_target_id(userbot, sid)
                     is_forum = getattr(full_chat, "forum", False)
                     
                     if is_forum:
@@ -2016,7 +2012,7 @@ def handle_callbacks(call):
             tid = int(parts[2])
             async def handle_tgt():
                 try:
-                    full_chat = await userbot.get_entity(tid)
+                    full_chat = await resolve_target_id(userbot, tid)
                     is_forum = getattr(full_chat, "forum", False)
                     
                     if is_forum:
@@ -2270,7 +2266,7 @@ def handle_callbacks(call):
         async def run_view():
             if not userbot: return
             try:
-                chat = await userbot.get_entity(chat_id)
+                chat = await resolve_target_id(userbot, chat_id)
                 # For message count, we can use a trick with limit=0
                 history = await userbot.get_messages(chat, limit=0)
                 msg_count = history.total
@@ -2534,15 +2530,26 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         running_tasks.pop(task_key, None)
 
 async def resolve_target_id(client: TelegramClient, target_ref):
+    """Aggressively resolves chat entities to avoid PeerIdInvalid errors."""
     try:
-        return await client.get_entity(target_ref)
-    except Exception as e:
-        logger.error(f"Entity Resolve Error: {e}")
-        # Try finding via dialogs if ref is just an ID
-        async for dialog in client.iter_dialogs(limit=200):
-            if str(dialog.id) == str(target_ref):
-                return dialog.entity
-    raise ValueError(f"Could not find or access chat: {target_ref}")
+        # 1. Try resolving as a direct integer or username (fastest if in cache)
+        ref = int(target_ref) if str(target_ref).replace("-", "").isdigit() else target_ref
+        return await client.get_entity(ref)
+    except Exception:
+        logger.info(f"🔍 Peer {target_ref} not in local cache. Refreshing dialogs...")
+        try:
+            # 2. Search through the last 200 dialogs to discover the entity and its access hash
+            # This is the most reliable way to refresh the session's knowledge of a peer
+            async for dialog in client.iter_dialogs(limit=200):
+                if str(dialog.id) == str(target_ref) or str(getattr(dialog.entity, 'id', None)) == str(target_ref):
+                    logger.info(f"✅ Found peer {target_ref} in recent dialogs.")
+                    return dialog.entity
+            
+            # 3. Last ditch effort: refresh knowledge via username or string if it failed
+            return await client.get_entity(target_ref)
+        except Exception as e:
+            logger.error(f"❌ Failed to resolve peer {target_ref}: {e}")
+            raise e
 
 async def run_collection(admin_chat_id, pair_id, limit=300):
     is_ok, msg = await ensure_userbot()
@@ -3119,7 +3126,7 @@ class LogBotManager:
                     
                     async def handle_dest():
                         try:
-                            entity = await userbot.get_entity(tid)
+                            entity = await resolve_target_id(userbot, tid)
                             if getattr(entity, 'forum', False):
                                 markup = await get_topic_selection_markup(tid, "lb_vault_topic")
                                 bot_instance.edit_message_text(f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
