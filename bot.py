@@ -704,7 +704,7 @@ def stop_task(task_key):
         return True
     return False
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None):
+async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
     """Releases vaulted media using the Userbot for forwarding."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
@@ -743,7 +743,12 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     continue 
 
                 log_bot_peer = await userbot.get_input_entity(int(bot_id))
-                await userbot.forward_messages(int(target_id), int(log_msg_id), from_peer=log_bot_peer)
+                await userbot.forward_messages(
+                    entity=int(target_id), 
+                    messages=int(log_msg_id), 
+                    from_peer=log_bot_peer,
+                    top_msg_id=target_topic_id
+                )
                 success += 1
             except Exception as e:
                 logger.error(f"Vault Release item error: {e}")
@@ -2619,68 +2624,6 @@ async def run_release(admin_chat_id, pair_id, interval=1.2):
     finally:
         running_tasks.pop(task_key, None)
 
-async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.2, log_target_id=None):
-    task_key = f"vault_rel_{source_id}_{target_id}"
-    running_tasks[task_key] = True
-    
-    try:
-        items = get_vaulted_media_for_source(source_id, log_target_id)
-        if not items:
-            sender_bot.send_message(admin_chat_id, "❌ No vaulted media found for this source.")
-            return
-            
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"lb_stop_rel_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Userbot Release Engine...**\nItems: `{len(items)}`", reply_markup=markup, parse_mode="Markdown")
-        
-        sent = 0
-        failed = 0
-        
-        # We use the userbot to forward messages from the Log Bot's chat
-        # Since the Userbot is already authorized and in the target chats, this avoids "chat not found".
-        for smid, file_id, m_type, caption, log_msg_id, bot_id in items:
-            if not running_tasks.get(task_key):
-                sender_bot.send_message(admin_chat_id, "🛑 **Release stopped by user.**", parse_mode="Markdown")
-                break
-                
-            try:
-                # 1. Resolve the Log Bot chat peer
-                log_bot_peer = await userbot.get_input_entity(int(bot_id))
-                
-                # 2. Forward from Log Bot to Target
-                await userbot.forward_messages(
-                    entity=int(target_id),
-                    messages=int(log_msg_id),
-                    from_peer=log_bot_peer
-                )
-                sent += 1
-                
-                if sent % 5 == 0:
-                    try: sender_bot.edit_message_text(f"🚀 **Userbot Releasing...**\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup, parse_mode="Markdown")
-                    except: pass
-            except Exception as item_err:
-                logger.error(f"Vault Release item error (Userbot): {item_err}")
-                # Fallback to Log Bot direct send if userbot fails (unlikely)
-                try:
-                    m_type_lower = (m_type or "").lower()
-                    cap = caption or ""
-                    if m_type == "Text": sender_bot.send_message(target_id, cap or " ")
-                    elif "photo" in m_type_lower: sender_bot.send_photo(target_id, file_id, caption=cap)
-                    elif "video" in m_type_lower: sender_bot.send_video(target_id, file_id, caption=cap)
-                    else: sender_bot.send_document(target_id, file_id, caption=cap)
-                    sent += 1
-                except:
-                    failed += 1
-                
-            await asyncio.sleep(interval)
-            
-        sender_bot.send_message(admin_chat_id, f"✅ **Release Done**\nSent: `{sent}` items.\nFailed: `{failed}`", parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.error(f"Global Vault Release Error: {e}")
-        sender_bot.send_message(admin_chat_id, f"❌ Vault Release Crashed: {e}")
-    finally:
-        running_tasks.pop(task_key, None)
 
 # -----------------------------
 # Watchdog
@@ -2992,26 +2935,6 @@ class LogBotManager:
                 )
             asyncio.run_coroutine_threadsafe(get_list(), loop)
 
-        @bot_instance.callback_query_handler(func=lambda call: call.data.startswith("lb_vault_tgt_") and login_data.get(call.from_user.id, {}).get("dump_sid"))
-        def finish_dump_flow(call):
-            # Format: lb_vault_tgt_{tid}
-            parts = call.data.split("_")
-            if parts[3] == "page": return # Handled by the generic tgt handler if needed
-            
-            target_chat_id = int(parts[3])
-            source_chat_id = login_data.get(call.from_user.id, {}).get("dump_sid")
-            
-            if not source_chat_id:
-                bot_instance.answer_callback_query(call.id, "❌ Session expired")
-                return
-
-            login_data[call.from_user.id]["dump_tid"] = target_chat_id
-            admin_states[f"lb_{bot_id}_{call.from_user.id}"] = f"wait_dump_count_{target_chat_id}"
-            bot_instance.edit_message_text(
-                f"🔢 **How many items?**\nEnter the number of media to send to target `{target_chat_id}`:",
-                call.message.chat.id, call.message.message_id
-            )
-
         @bot_instance.message_handler(content_types=['photo', 'video', 'document', 'audio', 'animation', 'sticker'])
         def handle_logging(message):
             try:
@@ -3090,15 +3013,49 @@ class LogBotManager:
                     asyncio.run_coroutine_threadsafe(update_tgt_list(), loop)
                 else:
                     tid = int(parts[3])
-                    sid = login_data.get(uid, {}).get("vault_source_id")
-                    if not sid:
-                        bot_instance.send_message(call.message.chat.id, "❌ Session expired. Please start over.")
-                        return
                     
-                    # Instead of starting, ask for interval
+                    async def handle_dest():
+                        try:
+                            entity = await userbot.get_entity(tid)
+                            if getattr(entity, 'forum', False):
+                                markup = await get_topic_selection_markup(tid, "lb_vault_topic")
+                                bot_instance.edit_message_text(f"🧵 **Forum Detected**\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+                            else:
+                                # Standard group
+                                is_dump = "dump_sid" in login_data.get(uid, {})
+                                if is_dump:
+                                    login_data[uid]["dump_tid"] = tid
+                                    login_data[uid]["dump_topic"] = None
+                                    admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
+                                    bot_instance.edit_message_text(f"🔢 **How many items?**\nEnter count for group `{tid}`:", call.message.chat.id, call.message.message_id)
+                                else:
+                                    login_data[uid]["vault_target_id"] = tid
+                                    login_data[uid]["vault_topic_id"] = None
+                                    admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
+                                    bot_instance.edit_message_text("⏳ **Release Interval**\nEnter time (seconds) between messages:", call.message.chat.id, call.message.message_id)
+                        except Exception as e:
+                            bot_instance.send_message(call.message.chat.id, f"❌ Error: {e}")
+                    asyncio.run_coroutine_threadsafe(handle_dest(), loop)
+
+            elif data.startswith("lb_vault_topic_"):
+                bot_instance.answer_callback_query(call.id)
+                payload = data.replace("lb_vault_topic_", "")
+                tid_str, topic_id_str = payload.rsplit("_", 1)
+                tid = int(tid_str)
+                topic_id = int(topic_id_str)
+                topic_val = topic_id if topic_id != 0 else None
+                
+                is_dump = "dump_sid" in login_data.get(uid, {})
+                if is_dump:
+                    login_data[uid]["dump_tid"] = tid
+                    login_data[uid]["dump_topic"] = topic_val
+                    admin_states[f"lb_{bot_id}_{uid}"] = f"wait_dump_count_{tid}"
+                    bot_instance.edit_message_text(f"🔢 **Topic Set!**\nEnter count for topic `{topic_id}`:", call.message.chat.id, call.message.message_id)
+                else:
                     login_data[uid]["vault_target_id"] = tid
+                    login_data[uid]["vault_topic_id"] = topic_val
                     admin_states[f"lb_{bot_id}_{uid}"] = "awaiting_rel_interval"
-                    bot_instance.edit_message_text("⏳ **Release Interval**\n\nPlease send the time period (in seconds) between each message:\n(Example: `1.5` or `3`)", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+                    bot_instance.edit_message_text(f"⏳ **Topic Set!**\nEnter release interval (seconds):", call.message.chat.id, call.message.message_id)
                     
             elif data == "lb_cancel":
                 bot_instance.answer_callback_query(call.id)
@@ -3111,13 +3068,16 @@ class LogBotManager:
                 stop_task(task_key)
 
             elif data.startswith("lb_do_release_"):
-                # lb_do_release_{sid}_{tid}_{interval}
+                # lb_do_release_{sid}_{tid}_{interval}_{topic}
                 bot_instance.answer_callback_query(call.id)
                 parts = data.split("_")
                 sid, tid = int(parts[3]), int(parts[4])
                 interval = float(parts[5])
+                topic_id = int(parts[6])
+                topic_val = topic_id if topic_id != 0 else None
+                
                 bot_instance.edit_message_text(f"🚀 **Initializing Engine...**\nInterval: `{interval}s`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval), loop)
+                asyncio.run_coroutine_threadsafe(run_vault_release(bot_instance, call.message.chat.id, sid, tid, interval=interval, target_topic_id=topic_val), loop)
 
         @bot_instance.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_states.get(f"lb_{bot_id}_{m.from_user.id}"))
         def handle_lb_messages(message):
@@ -3133,9 +3093,10 @@ class LogBotManager:
                     admin_states.pop(f"lb_{bot_id}_{uid}", None)
                     sid = login_data.get(uid, {}).get("vault_source_id")
                     tid = login_data.get(uid, {}).get("vault_target_id")
+                    t_topic = login_data.get(uid, {}).get("vault_topic_id")
                     
                     markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("🚀 Start Release", callback_data=f"lb_do_release_{sid}_{tid}_{interval}"))
+                    markup.add(InlineKeyboardButton("🚀 Start Release", callback_data=f"lb_do_release_{sid}_{tid}_{interval}_{t_topic or 0}"))
                     markup.add(InlineKeyboardButton("❌ Cancel", callback_data="lb_cancel"))
                     
                     bot_instance.send_message(message.chat.id, f"✅ **Interval Set: `{interval}s`**\nReady to release from `{sid}` to `{tid}`.", reply_markup=markup, parse_mode="Markdown")
@@ -3146,7 +3107,15 @@ class LogBotManager:
                 try:
                     target_cid = int(state.split("_")[-1])
                     count = int(text)
-                    source_cid = login_data[uid]["dump_sid"]
+                    
+                    user_session = login_data.get(uid)
+                    if not user_session or "dump_sid" not in user_session:
+                        bot_instance.send_message(message.chat.id, "❌ Session expired.")
+                        return
+
+                    source_cid = user_session["dump_sid"]
+                    target_topic = user_session.get("dump_topic") 
+                    
                     admin_states.pop(f"lb_{bot_id}_{uid}", None)
                     
                     # Start the background task
@@ -3158,7 +3127,8 @@ class LogBotManager:
                             target_id=target_cid, 
                             interval=2.0, 
                             log_target_id=bot_id,
-                            limit=count
+                            limit=count,
+                            target_topic_id=target_topic
                         ), 
                         loop
                     )
