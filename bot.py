@@ -1318,137 +1318,74 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
-        # --- BAN LIST CHECK ---
-        sender_id = m.sender_id
-        sender_username = getattr(m.sender, 'username', None)
-        if is_user_banned(sender_id, sender_username):
-            logger.info(f"🚫 BLOCKED: Ignored message from banned user {sender_id} (@{sender_username})")
-            return
+        # 1. Ban Check
+        if is_user_banned(m.sender_id): return
 
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             
             # Normalize ID matching
-            source_id_str = str(sid).replace("-100", "")
-            msg_id_str = str(m.chat_id).replace("-100", "")
-
-            if source_id_str == msg_id_str:
-                # --- TOPIC DETECTION ---
-                msg_topic_anchor = None
-                if m.reply_to:
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
+            if str(sid).replace("-100", "") == str(m.chat_id).replace("-100", ""):
                 
-                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
-                    msg_topic_anchor = m.id
-                
-                if not msg_topic_anchor and m.reply_to_msg_id:
-                    msg_topic_anchor = m.reply_to_msg_id
-
-                # --- CONTENT FILTERING ---
-                cf = cf or "everything"
-                if cf == "media" and not m.media:
-                    continue
-                if cf == "text" and m.media:
-                    continue
-
-                # Specific topic filtering
+                # 2. Manual Topic ID Filtering (If the pair is locked to a specific topic)
                 if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
-                    if str(msg_topic_anchor) != str(s_topic):
-                        continue
+                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id if m.reply_to else None
+                    if str(msg_topic_anchor) != str(s_topic): continue
 
-                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
+                # 3. Collector & Log Bot Indexing
                 if is_mon and m.media:
-                    m_type = type(m.media).__name__
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        if DATABASE_URL:
-                            c.execute(
-                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                        else:
-                            c.execute(
-                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
-                                (pid, sid, m.id, m_type, m.message or "")
-                            )
-                    
-                    # Instantly send to log bots in background
-                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id))
+                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id)) # Log Bot handles DB save
 
-                if not is_live: 
-                    # If we matched a pair but live is off, we still break to prevent 
-                    # processing the same message for other generic pairs.
-                    break
+                if not is_live: break
 
-                # --- ALBUM / SINGLE MESSAGE LOGIC ---
+                # 4. Album Logic vs Single Message
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
-                            await asyncio.sleep(5.0) 
-                            messages = album_cache.pop(gid, [])
-                            if messages:
-                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic))
+                        async def delayed_live_send(gid, target_id, mir_on, source_id, def_topic):
+                            await asyncio.sleep(4.0) 
+                            msgs = album_cache.pop(gid, [])
+                            if msgs: await execute_live_mirror(client, target_id, msgs, def_topic, mir_on, source_id)
+                        asyncio.create_task(delayed_live_send(m.grouped_id, tid, is_mir, sid, t_topic))
                 else:
-                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
-                
-                # CRITICAL: Break the pair loop once the message is handled to prevent duplication
+                    await execute_live_mirror(client, tid, [m], t_topic, is_mir, sid)
                 break
 
-    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
-        """Unified Hub for live mirroring with Topic support for the Userbot."""
+    async def execute_live_mirror(client, tid, messages, default_t_topic, is_mir, sid):
+        """Logic to send content to the correct topic in the target group live."""
         try:
             if not messages: return
             first_msg = messages[0]
-            
-            # --- DYNAMIC TOPIC RESOLUTION ---
-            # Default to the manually set pair topic ID
+            # Use manual topic ID from settings by default
             final_topic_id = default_t_topic 
 
             if is_mir:
-                # 1. Get the topic name from the source message
+                # Resolve the name of the topic where the message came from
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
-                
-                # 2. Resolve or Create that topic name in the target chat
-                resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
-                if resolved_id:
-                    final_topic_id = resolved_id
+                # DYNAMIC RESOLUTION: Find or Create a topic with that name in the target
+                final_topic_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
 
-            # --- PREPARE MESSAGE ---
-            album_text = next((msg.message for msg in messages if msg.message), "")
-            real_tid = int(tid)
-            
-            # 3. Handle specific message replies within the topic
+            # Determine reply header (if message is a reply to something already mapped)
             reply_header = final_topic_id
             if first_msg.reply_to_msg_id:
                 mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
                 if mapped: reply_header = int(mapped)
 
-            # 4. SEND (Using send_message for better Forum reliability)
-            if len(messages) > 1:
-                sent = await client.send_message(
-                    entity=real_tid, 
-                    message=album_text, 
-                    file=[m.media for m in messages],
-                    reply_to=reply_header
-                )
-            else:
-                sent = await client.send_message(
-                    entity=real_tid, 
-                    message=first_msg.message, 
-                    file=first_msg.media,
-                    reply_to=reply_header
-                )
+            # Send the content using the resolved topic ID
+            album_text = next((msg.message for msg in messages if msg.message), "")
+            sent = await client.send_message(
+                entity=int(tid),
+                message=album_text,
+                file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
+                reply_to=reply_header
+            )
 
             if sent:
                 sent_id = sent[0].id if isinstance(sent, list) else sent.id
                 save_message_mapping(sid, first_msg.id, tid, sent_id)
-                logger.info(f"✅ USERBOT LIVE: Mirrored to {tid} Topic: {final_topic_id}")
-
+                logger.info(f"✅ LIVE MIRROR: Sent to {tid} Topic {final_topic_id}")
         except Exception as e:
-            logger.error(f"❌ USERBOT LIVE ERROR: {e}")
+            logger.error(f"❌ LIVE MIRROR ERROR: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
