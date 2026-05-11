@@ -742,16 +742,25 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 if log_msg_id is None or bot_id is None:
                     continue 
 
-                log_bot_peer = await userbot.get_input_entity(int(bot_id))
+                # FIX: We fetch the message first, then send it with a reply_to attribute.
+                # This is the only way to guarantee it hits the correct Forum Topic.
+                log_bot_entity = await userbot.get_input_entity(int(bot_id))
                 
-                # Telethon uses 'comment_to' to specify the Topic ID (thread_id)
-                await userbot.forward_messages(
-                    entity=int(target_id), 
-                    messages=int(log_msg_id), 
-                    from_peer=log_bot_peer,
-                    comment_to=target_topic_id
-                )
-                success += 1
+                # Get the message from the log bot
+                msg_to_forward = await userbot.get_messages(log_bot_entity, ids=int(log_msg_id))
+                
+                if msg_to_forward:
+                    # Use send_message with reply_to to target the topic
+                    await userbot.send_message(
+                        entity=int(target_id),
+                        message=msg_to_forward.message,
+                        file=msg_to_forward.media,
+                        # This specifies the Topic ID
+                        reply_to=target_topic_id if target_topic_id else None 
+                    )
+                    success += 1
+                else:
+                    failed += 1
             except Exception as e:
                 logger.error(f"Vault Release item error: {e}")
                 failed += 1
