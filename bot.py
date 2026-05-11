@@ -1399,28 +1399,26 @@ def setup_automation_handlers(client: TelegramClient):
                                 (pid, sid, m.id, m_type, m.message or "")
                             )
 
-                if not is_live: 
-                    # If we matched a pair but live is off, we still break
-                    break
-
                 # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
                         # Wait for all parts
-                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring):
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic, is_monitoring, live_forward):
                             await asyncio.sleep(5.0) 
                             messages = album_cache.pop(gid, [])
                             if messages:
-                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                                if live_forward:
+                                    await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
                                 if is_monitoring:
-                                    # Send the entire album to log bots
+                                    # Send the entire album to log bots (Vaulting)
                                     asyncio.create_task(forward_to_log_bots(client, messages, s_id))
-                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon))
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic, is_mon, is_live))
                     else:
                         album_cache[m.grouped_id].append(m)
                 else:
-                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                    if is_live:
+                        await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
                     if is_mon:
                         asyncio.create_task(forward_to_log_bots(client, [m], sid))
                 
