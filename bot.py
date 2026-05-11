@@ -47,6 +47,13 @@ logger = logging.getLogger("userbot_v2")
 # {target_chat_id: {topic_title.lower(): top_message_id}}
 topic_cache = {}
 
+def send_monitor_log(text):
+    """Sends background activity directly to the Admin."""
+    try:
+        ts = datetime.now().strftime('%H:%M:%S')
+        bot.send_message(ADMIN_ID, f"🔩 **SYSTEM LOG** [{ts}]\n`{text}`", parse_mode="Markdown")
+    except: pass
+
 # Global State Dictionaries
 login_data = {}    # { user_id: { state_data } }
 admin_states = {}  # { user_id: "current_state" }
@@ -1193,18 +1200,31 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
             return res
             
         # 4) Create if not found
-        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
-        created = await client(functions.channels.CreateForumTopicRequest(
-            channel=t_chat_id,
-            title=topic_title,
-            icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
-        ))
-        
-        final_id = None
-        for update in created.updates:
-            if isinstance(update, types.UpdateNewForumTopic):
-                final_id = update.topic.id
-                break
+        try:
+            logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
+            created = await client(functions.channels.CreateForumTopicRequest(
+                channel=t_chat_id,
+                title=topic_title,
+                icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
+            ))
+            
+            # SAFE WAY to get the ID:
+            final_id = None
+            for update in created.updates:
+                if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                    final_id = update.message.id
+                    break
+            
+            if not final_id and created.updates:
+                final_id = created.updates[0].id
+
+            if final_id:
+                if t_chat_id not in topic_cache:
+                    topic_cache[t_chat_id] = {}
+                topic_cache[t_chat_id][title_key] = final_id
+        except Exception as e:
+            logger.error(f"Failed to create topic in get_or_create: {e}")
+            final_id = None
         
         if not final_id:
             # Fallback: re-fetch
@@ -1348,23 +1368,36 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
                 return t.id
         
         # 3. Create new topic if still not found
-        created = await client(functions.channels.CreateForumTopicRequest(
-            channel=target_entity,
-            title=source_msg_topic_name
-        ))
-        
-        # The Topic ID in Telethon is the ID of the 'service message' (created.updates[0])
-        new_topic_id = None
-        for upd in created.updates:
-            if isinstance(upd, types.UpdateNewForumTopic):
-                new_topic_id = upd.topic.id
-                break
-        
-        if new_topic_id:
-            topic_cache[target_chat_id][source_msg_topic_name.lower()] = new_topic_id
-            return new_topic_id
+        try:
+            logger.info(f"✨ Creating new topic: {source_msg_topic_name}")
+            created = await client(functions.channels.CreateForumTopicRequest(
+                channel=target_entity,
+                title=source_msg_topic_name
+            ))
             
-        return None
+            # SAFE WAY to get the ID: 
+            # The ID of a new topic is the ID of the service message created.
+            new_topic_id = None
+            for update in created.updates:
+                if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                    new_topic_id = update.message.id
+                    break
+            
+            if not new_topic_id and created.updates:
+                # Fallback: The ID is usually the first message ID in the updates
+                new_topic_id = created.updates[0].id
+
+            # Save to cache immediately
+            if new_topic_id:
+                if target_chat_id not in topic_cache:
+                    topic_cache[target_chat_id] = {}
+                topic_cache[target_chat_id][source_msg_topic_name.lower()] = new_topic_id
+                return new_topic_id
+            
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create topic: {e}")
+            return None
     except Exception as e:
         logger.error(f"Topic Resolver Error: {e}")
         return None
@@ -1526,8 +1559,11 @@ def setup_automation_handlers(client: TelegramClient):
             final_topic_id = default_t_topic 
             if is_mir:
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
+                send_monitor_log(f"Incoming msg from Topic: '{src_topic_name}'")
+                
                 resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
                 final_topic_id = resolved_id if resolved_id else default_t_topic
+                send_monitor_log(f"Target Resolved to ID: {final_topic_id}")
 
             # Construct Send parameters
             params = {
@@ -1546,6 +1582,7 @@ def setup_automation_handlers(client: TelegramClient):
                 sent_id = sent[0].id if isinstance(sent, list) else sent.id
                 save_message_mapping(sid, first_msg.id, tid, sent_id)
                 logger.info(f"✅ MIRROR: Sent to {tid} | Topic {final_topic_id}")
+                send_monitor_log(f"✅ Successfully Mirrored to Topic {final_topic_id}")
 
         except Exception as e:
             logger.error(f"❌ MIRROR FATAL ERROR: {e}")
