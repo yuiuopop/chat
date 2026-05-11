@@ -745,10 +745,10 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 msg_to_forward = await userbot.get_messages(log_bot_entity, ids=int(log_msg_id))
                 
                 if msg_to_forward:
-                    # Use send_message with reply_to to target the topic
+                    # Use send_message with the CLEAN caption from the database
                     await userbot.send_message(
                         entity=int(target_id),
-                        message=msg_to_forward.message,
+                        message=caption,
                         file=msg_to_forward.media,
                         # This specifies the Topic ID
                         reply_to=target_topic_id if target_topic_id else None 
