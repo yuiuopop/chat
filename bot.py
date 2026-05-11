@@ -1535,6 +1535,9 @@ def setup_automation_handlers(client: TelegramClient):
                             "is_mir": is_mir, "sid": sid, "pid": pid
                         })
                     
+        except Exception as e:
+            logger.error(f"AUTO_HANDLER ERROR: {e}")
+
     async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid, pair_id=None):
         try:
             if not messages: return
