@@ -1533,7 +1533,9 @@ def setup_automation_handlers(client: TelegramClient):
                                 await asyncio.sleep(5.0) 
                                 messages = album_cache.pop(key, [])
                                 if messages:
-                                    logger.info(f"MIRROR: Sending album ({len(messages)} parts) to {t_id}")
+                                    # CRITICAL: Sort by ID so they send in the exact same order as the source
+                                    messages.sort(key=lambda x: x.id)
+                                    logger.info(f"MIRROR: Sending album ({len(messages)} parts) in order to {t_id}")
                                     await execute_perform_mirror(client, t_id, messages, def_topic, mir_toggle, s_id)
                             asyncio.create_task(delayed_send(album_key, tid, is_mir, sid, t_topic))
                         else:
@@ -1553,7 +1555,7 @@ def setup_automation_handlers(client: TelegramClient):
             if not messages: return
             first_msg = messages[0]
             
-            # Resolve Topic
+            # 1. Resolve Topic ID (Thread)
             final_topic_id = default_t_topic 
             if is_mir:
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
@@ -1563,24 +1565,36 @@ def setup_automation_handlers(client: TelegramClient):
                 final_topic_id = resolved_id if resolved_id else default_t_topic
                 send_monitor_log(f"Target Resolved to ID: {final_topic_id}")
 
-            # Construct Send parameters
-            params = {
-                "entity": int(tid),
-                "message": next((msg.message for msg in messages if msg.message), ""),
-                "file": [m.media for m in messages] if len(messages) > 1 else first_msg.media,
-            }
+            # 2. RESOLVE REPLY (Recursive Reply Mapping)
+            reply_to_id = final_topic_id # Default to the topic anchor
+            
+            if first_msg.reply_to_msg_id:
+                # Check our database: "What was the Target ID for Source Message X?"
+                mapped_target_id = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                if mapped_target_id:
+                    reply_to_id = int(mapped_target_id)
+                    logger.info(f"🔗 REPLY MATCH: Source {first_msg.reply_to_msg_id} -> Target {reply_to_id}")
+                    send_monitor_log(f"🔗 Reply Linked to Target ID: {reply_to_id}")
+                else:
+                    logger.debug("🔗 REPLY: No mapping found, defaulting to topic root.")
 
-            # FORUMS: 'reply_to' should be the Topic ID (Top Message ID)
-            if final_topic_id:
-                params["reply_to"] = int(final_topic_id)
-
-            sent = await client.send_message(**params)
+            # 3. Construct Send Parameters
+            album_text = next((msg.message for msg in messages if msg.message), "")
+            
+            # 4. SEND
+            sent = await client.send_message(
+                entity=int(tid),
+                message=album_text,
+                file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
+                reply_to=reply_to_id # This now points to the specific message if found
+            )
 
             if sent:
+                # Save the mapping of the message we JUST sent
                 sent_id = sent[0].id if isinstance(sent, list) else sent.id
                 save_message_mapping(sid, first_msg.id, tid, sent_id)
-                logger.info(f"✅ MIRROR: Sent to {tid} | Topic {final_topic_id}")
-                send_monitor_log(f"✅ Successfully Mirrored to Topic {final_topic_id}")
+                logger.info(f"✅ MIRROR: Sent successfully to {tid}")
+                send_monitor_log(f"✅ Successfully Mirrored to {tid}")
 
         except Exception as e:
             logger.error(f"❌ MIRROR FATAL ERROR: {e}")
