@@ -197,8 +197,6 @@ def init_db():
             except: pass
             try: c.execute("ALTER TABLE log_targets ADD COLUMN bot_token TEXT")
             except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN IF NOT EXISTS source_topic_name TEXT DEFAULT 'General'")
-            except: pass
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_logs (
                     id SERIAL PRIMARY KEY,
@@ -233,14 +231,11 @@ def init_db():
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
-                    source_topic_name TEXT DEFAULT 'General',
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_name TEXT DEFAULT 'General'")
             except: pass
 
             # Banned Users Table
@@ -368,14 +363,11 @@ def init_db():
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
-                    source_topic_name TEXT DEFAULT 'General',
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(bot_id, source_chat_id, source_msg_id)
                 )
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_name TEXT DEFAULT 'General'")
             except: pass
 
             # Banned Users Table
@@ -615,7 +607,7 @@ def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.source_topic_name
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id
             FROM log_media m
             WHERE m.source_chat_id = {p}
         """
@@ -708,7 +700,7 @@ def clear_bot_logs(bot_id):
 
 def stop_task(task_key):
     if task_key in running_tasks:
-        running_tasks[task_key] = False
+        running_tasks.pop(task_key, None)
         return True
     return False
 
@@ -739,28 +731,19 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
         status_msg = sender_bot.send_message(admin_chat_id, f"🚀 **Initializing Transfer...**\nItems: `{total}`", parse_mode="Markdown")
 
-        resolved_topics_cache = {} # Cache for this run to speed up resolution
-
         for i, item in enumerate(items):
-            if not running_tasks.get(task_key):
+            if task_key not in running_tasks:
                 sender_bot.send_message(admin_chat_id, "🛑 **Release Stopped** by user.")
                 break
                 
-            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, src_topic_name = item
+            source_msg_id, file_id, m_type, caption, log_msg_id, bot_id = item
             
             try:
                 if log_msg_id is None or bot_id is None:
                     continue 
 
-                # Resolve Topic Dynamically if not manually overridden
-                final_topic = target_topic_id
-                if not final_topic:
-                    if src_topic_name in resolved_topics_cache:
-                        final_topic = resolved_topics_cache[src_topic_name]
-                    else:
-                        final_topic = await resolve_target_topic_id(userbot, target_id, source_id, src_topic_name)
-                        resolved_topics_cache[src_topic_name] = final_topic
-
+                # FIX: We fetch the message first, then send it with a reply_to attribute.
+                # This is the only way to guarantee it hits the correct Forum Topic.
                 log_bot_entity = await userbot.get_input_entity(int(bot_id))
                 
                 # Get the message from the log bot
@@ -772,7 +755,8 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                         entity=int(target_id),
                         message=msg_to_forward.message,
                         file=msg_to_forward.media,
-                        reply_to=final_topic
+                        # This specifies the Topic ID
+                        reply_to=target_topic_id if target_topic_id else None 
                     )
                     success += 1
                 else:
@@ -794,29 +778,27 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
     finally:
         running_tasks.pop(task_key, None)
 
-def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name="General"):
+def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if DATABASE_URL:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) 
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
-                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption,
-                   source_topic_name = EXCLUDED.source_topic_name""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name)
+                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
             )
         else:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
-                   media_type = excluded.media_type, caption = excluded.caption,
-                   source_topic_name = excluded.source_topic_name""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name)
+                   media_type = excluded.media_type, caption = excluded.caption""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption)
             )
 
 def get_logged_media_stats(bot_id):
@@ -842,6 +824,12 @@ userbot = None
 admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
+
+def stop_task(task_key):
+    if task_key in running_tasks:
+        running_tasks[task_key] = False
+        return True
+    return False
 
 def is_task_running(task_key):
     return running_tasks.get(task_key, False)
@@ -1125,6 +1113,76 @@ async def get_topic_selection_markup(chat_id, prefix):
 # -----------------------------
 # Userbot Logic
 # -----------------------------
+async def get_or_create_target_topic(client, target_chat_id, topic_title, source_chat_id=None, source_topic_id=None, icon_emoji_id=None):
+    """
+    Search for a topic by title in target chat. If not found, create it.
+    Uses database mapping first, then topic_cache.
+    """
+    if not topic_title: return None
+    
+    t_chat_id = int(target_chat_id)
+    title_key = topic_title.lower().strip()
+    logger.info(f"TOPIC_SEARCH: Looking for '{topic_title}' (Key: '{title_key}') in {t_chat_id}")
+    
+    # 1) Check Database Mapping (Most Reliable)
+    if source_chat_id and source_topic_id:
+        existing_mapping = get_topic_mapping(source_chat_id, source_topic_id, t_chat_id)
+        if existing_mapping:
+            return existing_mapping
+    
+    # 2) Check Cache
+    if t_chat_id in topic_cache and title_key in topic_cache[t_chat_id]:
+        res = topic_cache[t_chat_id][title_key]
+        if source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+        return res
+    
+    # 3) Fetch Topics from Telegram
+    try:
+        result = await client(functions.channels.GetForumTopicsRequest(
+            channel=t_chat_id,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
+        
+        if t_chat_id not in topic_cache:
+            topic_cache[t_chat_id] = {}
+            
+        for topic in result.topics:
+            topic_cache[t_chat_id][topic.title.lower().strip()] = topic.top_message
+            
+        if title_key in topic_cache[t_chat_id]:
+            res = topic_cache[t_chat_id][title_key]
+            if source_chat_id and source_topic_id:
+                save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, res)
+            return res
+            
+        # 4) Create if not found
+        logger.info(f"MIRROR: Creating new topic '{topic_title}' in {t_chat_id} (Icon: {icon_emoji_id})")
+        created = await client(functions.channels.CreateForumTopicRequest(
+            channel=t_chat_id,
+            title=topic_title,
+            icon_emoji_id=int(icon_emoji_id) if icon_emoji_id else None
+        ))
+        
+        await asyncio.sleep(1)
+        res_after = await client(functions.channels.GetForumTopicsRequest(
+            channel=t_chat_id,
+            offset_date=0, offset_id=0, offset_topic=0, limit=20
+        ))
+        for t in res_after.topics:
+            topic_cache[t_chat_id][t.title.lower().strip()] = t.top_message
+            
+        final_id = topic_cache[t_chat_id].get(title_key)
+        if final_id and source_chat_id and source_topic_id:
+            save_topic_mapping(source_chat_id, source_topic_id, t_chat_id, final_id)
+            
+        return final_id
+    except Exception as e:
+        logger.error(f"Mirroring Error (get_or_create): {e}")
+        return None
 
 async def start_userbot():
     global userbot
@@ -1183,79 +1241,6 @@ async def forward_to_log_bots(client, message, source_chat_id, source_msg_id):
         # Run vaulting in background tasks
         asyncio.create_task(vault_media(client, message, int(source_chat_id), int(bot_id), int(source_msg_id), username))
 
-async def resolve_source_topic_name(client, chat_id, message):
-    """Resolves the title of the forum topic the message belongs to."""
-    if not message.reply_to:
-        return "General"
-    
-    top_id = getattr(message.reply_to, 'reply_to_top_id', None) or message.reply_to.reply_to_msg_id
-    if not top_id:
-        return "General"
-        
-    try:
-        # Check if the chat is a forum
-        entity = await client.get_entity(int(chat_id))
-        if not getattr(entity, 'forum', False):
-            return "General"
-
-        # Fetch topics and match ID
-        res = await client(functions.channels.GetForumTopicsRequest(
-            channel=entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
-        ))
-        for t in res.topics:
-            if t.id == top_id:
-                return t.title
-    except Exception as e:
-        logger.debug(f"Source Topic Resolution Failed: {e}")
-    
-    return "General"
-
-async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source_msg_topic_name):
-    """
-    Logic:
-    - If target is NOT a forum: returns None (sends to general).
-    - If target IS a forum:
-        - Tries to find a topic named 'source_msg_topic_name'.
-        - If not found, creates it.
-        - Returns the topic ID.
-    """
-    try:
-        target_entity = await client.get_entity(int(target_chat_id))
-        
-        # CASE 1: Target is a normal group
-        if not getattr(target_entity, 'forum', False):
-            return None
-
-        # CASE 2 & 3: Target is a Forum
-        # If the source didn't have a topic name (Normal Group), use Group Name
-        if not source_msg_topic_name or source_msg_topic_name == "General":
-            source_entity = await client.get_entity(int(source_chat_id))
-            source_msg_topic_name = getattr(source_entity, 'title', "Archive")
-
-        # Search for existing topic by name
-        try:
-            topics = await client(functions.channels.GetForumTopicsRequest(
-                channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
-            ))
-            
-            for t in topics.topics:
-                if t.title.lower() == source_msg_topic_name.lower():
-                    return t.id
-        except: pass
-        
-        # Create new topic if none match
-        try:
-            created = await client(functions.channels.CreateForumTopicRequest(
-                channel=target_entity,
-                title=source_msg_topic_name
-            ))
-            return created.updates[0].id
-        except:
-            return None
-    except Exception as e:
-        logger.error(f"Topic Resolver Error: {e}")
-        return None
-
 async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_id, t_name):
     """Helper to forward to vault and save the permanent File ID"""
     try:
@@ -1266,11 +1251,8 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
             # If not found, try to 'find' the bot by ID directly (forces session lookup)
             target_peer = await client.get_entity(int(log_chat_id))
 
-        # RESOLVE TOPIC NAME
-        src_topic_name = await resolve_source_topic_name(client, source_chat_id, message)
-
         # SEND CONTENT with metadata for Log Bot extraction
-        metadata = f"SID: {source_chat_id} | MID: {source_msg_id} | TOPIC: {src_topic_name}\n"
+        metadata = f"SID: {source_chat_id} | MID: {source_msg_id}\n"
         caption_text = metadata + (message.message or "")
         
         try:
@@ -1306,8 +1288,7 @@ async def vault_media(client, message, source_chat_id, log_chat_id, source_msg_i
                 source_msg_id=int(source_msg_id),
                 file_id=None, # Bot API file_id will be filled by the Log Bot's own listener
                 media_type=type(message.media).__name__ if message.media else "text",
-                caption=message.message or "",
-                source_topic_name=src_topic_name
+                caption=message.message or ""
             )
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
@@ -1318,74 +1299,177 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
-        # 1. Ban Check
-        if is_user_banned(m.sender_id): return
+        # --- BAN LIST CHECK ---
+        sender_id = m.sender_id
+        sender_username = getattr(m.sender, 'username', None)
+        if is_user_banned(sender_id, sender_username):
+            logger.info(f"🚫 BLOCKED: Ignored message from banned user {sender_id} (@{sender_username})")
+            return
 
         pairs = get_target_pairs()
         for pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf in pairs:
             
             # Normalize ID matching
-            if str(sid).replace("-100", "") == str(m.chat_id).replace("-100", ""):
+            source_id_str = str(sid).replace("-100", "")
+            msg_id_str = str(m.chat_id).replace("-100", "")
+
+            if source_id_str == msg_id_str:
+                # --- TOPIC DETECTION ---
+                msg_topic_anchor = None
+                if m.reply_to:
+                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id
                 
-                # 2. Manual Topic ID Filtering (If the pair is locked to a specific topic)
+                if not msg_topic_anchor and getattr(m, 'forum_topic', False):
+                    msg_topic_anchor = m.id
+                
+                if not msg_topic_anchor and m.reply_to_msg_id:
+                    msg_topic_anchor = m.reply_to_msg_id
+
+                # --- CONTENT FILTERING ---
+                cf = cf or "everything"
+                if cf == "media" and not m.media:
+                    continue
+                if cf == "text" and m.media:
+                    continue
+
+                # Specific topic filtering
                 if s_topic and str(s_topic) not in [None, 0, "0", "None"]:
-                    msg_topic_anchor = getattr(m.reply_to, 'reply_to_top_id', None) or m.reply_to.reply_to_msg_id if m.reply_to else None
-                    if str(msg_topic_anchor) != str(s_topic): continue
+                    if str(msg_topic_anchor) != str(s_topic):
+                        continue
 
-                # 3. Collector & Log Bot Indexing
+                # --- LOGGING & COLLECTION LOGIC (is_mon) ---
                 if is_mon and m.media:
-                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id)) # Log Bot handles DB save
+                    m_type = type(m.media).__name__
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        if DATABASE_URL:
+                            c.execute(
+                                "INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
+                        else:
+                            c.execute(
+                                "INSERT OR IGNORE INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption) VALUES (?, ?, ?, ?, ?)",
+                                (pid, sid, m.id, m_type, m.message or "")
+                            )
+                    
+                    # Instantly send to log bots in background
+                    asyncio.create_task(forward_to_log_bots(client, m, sid, m.id))
 
-                if not is_live: break
+                if not is_live: 
+                    # If we matched a pair but live is off, we still break to prevent 
+                    # processing the same message for other generic pairs.
+                    break
 
-                # 4. Album Logic vs Single Message
+                # --- ALBUM / SINGLE MESSAGE LOGIC ---
                 if m.grouped_id:
                     if m.grouped_id not in album_cache:
                         album_cache[m.grouped_id] = [m]
-                        async def delayed_live_send(gid, target_id, mir_on, source_id, def_topic):
-                            await asyncio.sleep(4.0) 
-                            msgs = album_cache.pop(gid, [])
-                            if msgs: await execute_live_mirror(client, target_id, msgs, def_topic, mir_on, source_id)
-                        asyncio.create_task(delayed_live_send(m.grouped_id, tid, is_mir, sid, t_topic))
+                        # Wait for all parts
+                        async def delayed_send(gid, t_id, mir_toggle, s_id, def_topic):
+                            await asyncio.sleep(5.0) 
+                            messages = album_cache.pop(gid, [])
+                            if messages:
+                                await send_mirrored_content(client, t_id, messages, def_topic, mir_toggle, s_id)
+                        asyncio.create_task(delayed_send(m.grouped_id, tid, is_mir, sid, t_topic))
                 else:
-                    await execute_live_mirror(client, tid, [m], t_topic, is_mir, sid)
+                    await send_mirrored_content(client, tid, [m], t_topic, is_mir, sid)
+                
+                # CRITICAL: Break the pair loop once the message is handled to prevent duplication
                 break
 
-    async def execute_live_mirror(client, tid, messages, default_t_topic, is_mir, sid):
-        """Logic to send content to the correct topic in the target group live."""
+    async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid):
+        """Unified Hub for mirrored sending with native Forum Topic support."""
         try:
             if not messages: return
             first_msg = messages[0]
-            # Use manual topic ID from settings by default
-            final_topic_id = default_t_topic 
-
+            dest_topic_id = default_t_topic
+            
+            # 1. Resolve Topic Mapping
             if is_mir:
-                # Resolve the name of the topic where the message came from
-                src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
-                # DYNAMIC RESOLUTION: Find or Create a topic with that name in the target
-                final_topic_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
+                source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                if source_top:
+                    forum = getattr(first_msg.reply_to, "forum_topic", None)
+                    src_title = getattr(forum, "title", None)
+                    src_icon = None
+                    if not src_title:
+                        try:
+                            res = await client(functions.channels.GetForumTopicsRequest(channel=int(sid), offset_date=0, offset_id=0, offset_topic=0, limit=100))
+                            for t in res.topics:
+                                if t.id == source_top:
+                                    src_title = t.title
+                                    src_icon = getattr(t, "icon_emoji_id", None)
+                                    break
+                        except: pass
+                    
+                    if src_title:
+                        logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
+                        dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+                    else:
+                        logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
 
-            # Determine reply header (if message is a reply to something already mapped)
-            reply_header = final_topic_id
-            if first_msg.reply_to_msg_id:
-                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped: reply_header = int(mapped)
+            # 2. Check if Target is a Forum
+            is_forum = False
+            try:
+                # Ensure we have the -100 prefix for entity lookup
+                real_tid = tid if str(tid).startswith("-100") else int(f"-100{str(tid).replace('-100', '')}")
+                try:
+                    tgt_ent = await client.get_entity(real_tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+                except:
+                    tgt_ent = await client.get_entity(tid)
+                    is_forum = getattr(tgt_ent, 'forum', False)
+            except: pass
 
-            # Send the content using the resolved topic ID
+            # 3. Resolve Reply Header
+            reply_header = None
+            if is_forum:
+                reply_header = int(dest_topic_id) if dest_topic_id else None
+                # If replying to a specific message inside the topic, use mapped ID
+                if first_msg.reply_to_msg_id:
+                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                    if mapped: reply_header = int(mapped)
+            else:
+                # Normal Group: Use Message Mapping for Replies
+                if first_msg.reply_to_msg_id:
+                    mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                    if mapped: reply_header = int(mapped)
+
+            # 4. Send Content
             album_text = next((msg.message for msg in messages if msg.message), "")
-            sent = await client.send_message(
-                entity=int(tid),
-                message=album_text,
-                file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
-                reply_to=reply_header
-            )
-
-            if sent:
-                sent_id = sent[0].id if isinstance(sent, list) else sent.id
-                save_message_mapping(sid, first_msg.id, tid, sent_id)
-                logger.info(f"✅ LIVE MIRROR: Sent to {tid} Topic {final_topic_id}")
+            sent = None
+            
+            for attempt in range(3):
+                try:
+                    sent = await client.send_message(
+                        entity=int(tid), 
+                        message=album_text, 
+                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                        reply_to=reply_header
+                    )
+                    if sent:
+                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
+                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                        break # Success!
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
+                    await asyncio.sleep(fwe.seconds)
+                except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "protected" in err_msg or "forward" in err_msg or "restricted" in err_msg:
+                        logger.info("🛡️ MIRROR: Protected chat detected. Using fallback...")
+                        sent = await execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header)
+                        if sent: break # Success via fallback
+                    else:
+                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                        if attempt == 2: # Last attempt
+                            logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+            
         except Exception as e:
-            logger.error(f"❌ LIVE MIRROR ERROR: {e}")
+            logger.error(f"Global Mirror Error: {e}")
 
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header):
         """Downloads and re-uploads protected content."""
@@ -2877,19 +2961,15 @@ class LogBotManager:
                 
                 if file_id:
                     sid, mid = 0, message.message_id
-                    topic_name = "General"
                     if caption and "SID:" in caption and "MID:" in caption:
                         try:
-                            # SID: ... | MID: ... | TOPIC: ...
                             parts = caption.split("|")
                             sid = int(parts[0].replace("SID:", "").strip())
                             mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
-                            if len(parts) > 2 and "TOPIC:" in parts[2]:
-                                topic_name = parts[2].split("\n")[0].replace("TOPIC:", "").strip()
                             caption = caption.split("\n", 1)[1] if "\n" in caption else ""
                         except: pass
                     
-                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption, source_topic_name=topic_name)
+                    save_logged_media(bot_id, message.message_id, sid, mid, file_id, m_type, caption)
                     if sid == 0 and message.from_user.id == ADMIN_ID:
                         bot_instance.reply_to(message, f"✅ **Saved to Vault!**\n🆔 ID: `{message.message_id}`\nFetch: `/get {message.message_id}`")
             except Exception as e: logger.error(f"Logging Error: {e}")
