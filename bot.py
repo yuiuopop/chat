@@ -43,9 +43,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("userbot_v2")
 
-# Topic Mirroring Cache
-# {target_chat_id: {topic_title.lower(): top_message_id}}
+# Topic Mirroring Cache with TTL support
+# {target_chat_id: {topic_name: {"id": topic_id, "time": timestamp}}}
 topic_cache = {}
+
+# Background Job Queue for Mirroring
+mirror_queue = asyncio.Queue()
+album_cache = {} # { album_key: {"messages": {msg_id: msg}, "created": time} }
 
 def send_monitor_log(text):
     """Sends background activity directly to the Admin."""
@@ -708,7 +712,6 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             return int(raw)
 
         final_tid = normalize_tid(target_id)
-        resolved_topics_cache = {}
 
         for i, item in enumerate(items):
             if not running_tasks.get(task_key):
@@ -717,38 +720,43 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             
             smid, file_id, m_type, caption, l_mid, b_id, src_topic_name, s_rid = item
             
-            # Resolve Topic
-            thread_id = target_topic_id
+            # RECONSTRUCT REPLY CHAIN
+            thread_id = target_topic_id # Topic/Thread ID
+            reply_to_message_id = None  # Specific Message ID to reply to
+            
             if not thread_id and src_topic_name:
-                if src_topic_name in resolved_topics_cache:
-                    thread_id = resolved_topics_cache[src_topic_name]
-                else:
+                # Global cache check with TTL (10 min)
+                if target_id in topic_cache and src_topic_name.lower().strip() in topic_cache[target_id]:
+                    import time
+                    cached = topic_cache[target_id][src_topic_name.lower().strip()]
+                    if time.time() - cached["time"] < 600:
+                        thread_id = cached["id"]
+                
+                if not thread_id:
                     thread_id = await resolve_target_topic_id(userbot, target_id, source_id, src_topic_name)
-                    resolved_topics_cache[src_topic_name] = thread_id
 
-            # Reconstruct Reply
-            final_reply_to = thread_id
             if s_rid and int(s_rid) > 0:
                 mapped_target_id = get_message_mapping(source_id, s_rid, target_id)
                 if mapped_target_id:
-                    final_reply_to = int(mapped_target_id)
+                    reply_to_message_id = int(mapped_target_id)
 
             try:
                 m_type = m_type.lower()
                 sent_item = None
                 
+                # telebot: message_thread_id is for Topic, reply_to_message_id is for Message
                 if "photo" in m_type: 
-                    sent_item = sender_bot.send_photo(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_photo(final_tid, file_id, caption=caption, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 elif "video" in m_type: 
-                    sent_item = sender_bot.send_video(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_video(final_tid, file_id, caption=caption, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 elif "audio" in m_type: 
-                    sent_item = sender_bot.send_audio(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_audio(final_tid, file_id, caption=caption, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 elif "animation" in m_type: 
-                    sent_item = sender_bot.send_animation(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_animation(final_tid, file_id, caption=caption, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 elif "sticker" in m_type: 
-                    sent_item = sender_bot.send_sticker(final_tid, file_id, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_sticker(final_tid, file_id, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 else: 
-                    sent_item = sender_bot.send_document(final_tid, file_id, caption=caption, message_thread_id=final_reply_to)
+                    sent_item = sender_bot.send_document(final_tid, file_id, caption=caption, message_thread_id=thread_id, reply_to_message_id=reply_to_message_id)
                 
                 if sent_item:
                     save_message_mapping(source_id, smid, target_id, sent_item.message_id, pair_id=None)
@@ -756,36 +764,31 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 else:
                     failed += 1
 
-            except errors.FloodWaitError as e:
-                logger.warning(f"⚠️ Rate limited. Waiting {e.seconds} seconds.")
-                await asyncio.sleep(e.seconds)
-                # Note: We skip the item here to prevent endless loops, but could retry
             except Exception as e:
-                if "message thread not found" in str(e).lower():
-                    logger.error("❌ Topic ID invalid. Resetting cache.")
-                    resolved_topics_cache.pop(src_topic_name, None)
+                import asyncio
+                if "FloodWait" in str(type(e)):
+                    await asyncio.sleep(60)
                 logger.error(f"❌ LOGBOT SEND ERROR: {e}")
                 failed += 1
 
             if (i + 1) % 5 == 0 or (i + 1) == total:
                 try: 
                     sender_bot.edit_message_text(
-                        f"📊 **Progress:** `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", 
+                        f"📊 **Progress:** {i+1}/{total}\n✅ Success: {success}\n❌ Failed: {failed}", 
                         admin_chat_id, status_msg.message_id
                     )
                 except: pass
             
-            # DYNAMIC INTERVAL: Slow down if success rate is high to prevent flood
+            import asyncio
             current_sleep = interval if success % 10 != 0 else interval * 1.5
             await asyncio.sleep(current_sleep)
 
-        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete!**\nSuccess: `{success}`\nFailed: `{failed}`")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Complete!**\nSuccess: {success}\nFailed: {failed}")
     except Exception as e:
         logger.error(f"Vault Engine Error: {e}")
         sender_bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
     finally:
         running_tasks.pop(task_key, None)
-
 def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, source_topic_name="General", source_reply_to=None):
     with db_conn() as conn:
         c = conn.cursor()
@@ -1312,22 +1315,24 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
         # Normalize name
         t_name = (source_msg_topic_name or "General").lower().strip()
         
-        # 1. Immediate Cache Check
+        # 1. Immediate Cache Check with TTL (10 minutes)
         if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
-            return topic_cache[target_chat_id][t_name]
-
+            cached = topic_cache[target_chat_id][t_name]
+            if time.time() - cached["time"] < 600:
+                return cached["id"]
+        
         # 2. Use Lock to prevent duplicate creation attempts
         async with topic_creation_lock:
-            # Check cache again inside lock (Double-Checked Locking)
+            # Check cache again inside lock
             if target_chat_id in topic_cache and t_name in topic_cache[target_chat_id]:
-                return topic_cache[target_chat_id][t_name]
+                cached = topic_cache[target_chat_id][t_name]
+                if time.time() - cached["time"] < 600:
+                    return cached["id"]
 
-            # Use our aggressive resolver instead of raw get_entity
             target_entity = await resolve_target_id(client, target_chat_id)
             if not getattr(target_entity, 'forum', False):
                 return None
             
-            # Fetch existing topics to see if another process just created it
             topics = await client(functions.channels.GetForumTopicsRequest(
                 channel=target_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
             ))
@@ -1335,8 +1340,9 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
             if target_chat_id not in topic_cache:
                 topic_cache[target_chat_id] = {}
 
+            now = time.time()
             for t in topics.topics:
-                topic_cache[target_chat_id][t.title.lower().strip()] = t.id
+                topic_cache[target_chat_id][t.title.lower().strip()] = {"id": t.id, "time": now}
                 if t.title.lower().strip() == t_name:
                     return t.id
 
@@ -1357,7 +1363,7 @@ async def resolve_target_topic_id(client, target_chat_id, source_chat_id, source
                 new_id = created.updates[0].id
 
             if new_id:
-                topic_cache[target_chat_id][t_name] = new_id
+                topic_cache[target_chat_id][t_name] = {"id": new_id, "time": time.time()}
                 return new_id
             
             return None
@@ -1502,60 +1508,58 @@ def setup_automation_handlers(client: TelegramClient):
                     if m.grouped_id:
                         album_key = f"{pid}_{m.grouped_id}"
                         if album_key not in album_cache:
-                            album_cache[album_key] = [m]
-                            # Wait for all parts
-                            async def delayed_send(key, t_id, mir_toggle, s_id, def_topic, pair_idx):
+                            album_cache[album_key] = {"messages": {m.id: m}, "created": time.time()}
+                            
+                            # Push job to queue after waiting for all parts
+                            async def queue_album(key, t_id, mir_toggle, s_id, def_topic, pair_idx):
                                 await asyncio.sleep(5.0) 
-                                messages = album_cache.pop(key, [])
-                                if messages:
-                                    # SAFETY: Ensure no duplicate message objects in the same album
-                                    unique_msgs = {msg.id: msg for msg in messages}.values()
-                                    sorted_msgs = sorted(unique_msgs, key=lambda x: x.id)
-                                    
-                                    logger.info(f"MIRROR: Sending unique album ({len(sorted_msgs)} parts) for Pair {pair_idx}")
-                                    await execute_perform_mirror(client, t_id, sorted_msgs, def_topic, mir_toggle, s_id, pair_id=pair_idx)
-                            asyncio.create_task(delayed_send(album_key, tid, is_mir, sid, t_topic, pid))
+                                job_data = album_cache.pop(key, None)
+                                if job_data:
+                                    messages = list(job_data["messages"].values())
+                                    sorted_msgs = sorted(messages, key=lambda x: x.id)
+                                    logger.info(f"MIRROR: Queueing album ({len(sorted_msgs)} parts) for Pair {pair_idx}")
+                                    await mirror_queue.put({
+                                        "type": "mirror",
+                                        "tid": t_id, "messages": sorted_msgs, "def_topic": def_topic,
+                                        "is_mir": mir_toggle, "sid": s_id, "pid": pair_idx
+                                    })
+                            asyncio.create_task(queue_album(album_key, tid, is_mir, sid, t_topic, pid))
                         else:
-                            # Only add if this specific message ID isn't already in the list for this pair
-                            if m.id not in [msg.id for msg in album_cache[album_key]]:
-                                album_cache[album_key].append(m)
+                            # Add to existing album dictionary (prevents duplicates automatically)
+                            album_cache[album_key]["messages"][m.id] = m
                     else:
-                        logger.info(f"MIRROR: Sending single message from {sid} to {tid}")
-                        await execute_perform_mirror(client, tid, [m], t_topic, is_mir, sid, pair_id=pid)
+                        # Queue single message
+                        await mirror_queue.put({
+                            "type": "mirror",
+                            "tid": tid, "messages": [m], "def_topic": t_topic,
+                            "is_mir": is_mir, "sid": sid, "pid": pid
+                        })
                     
-                    # Removed break to allow multiple pairs for the same source chat.
-                else:
-                    logger.debug(f"AUTO_HANDLER: Chat ID {m.chat_id} did not match pair source {sid}")
-        except Exception as e:
-            logger.error(f"AUTO_HANDLER ERROR: {e}")
-
     async def execute_perform_mirror(client, tid, messages, default_t_topic, is_mir, sid, pair_id=None):
         try:
             if not messages: return
             first_msg = messages[0]
             
             # 1. Resolve Topic ID (Thread)
-            final_topic_id = default_t_topic 
+            thread_id = default_t_topic 
+            reply_to_msg_id = None
+            
             if is_mir:
                 src_topic_name = await resolve_source_topic_name(client, sid, first_msg)
-                send_monitor_log(f"Incoming msg from Topic: '{src_topic_name}'")
-                
                 resolved_id = await resolve_target_topic_id(client, tid, sid, src_topic_name)
-                final_topic_id = resolved_id if resolved_id else default_t_topic
-                send_monitor_log(f"Target Resolved to ID: {final_topic_id}")
+                if resolved_id:
+                    thread_id = resolved_id
 
-            # 2. RESOLVE REPLY (Recursive Reply Mapping)
-            reply_to_id = final_topic_id # Default to the topic anchor
-            
+            # 2. RESOLVE REPLY
             if first_msg.reply_to_msg_id:
-                # Check our database: "What was the Target ID for Source Message X?"
                 mapped_target_id = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
                 if mapped_target_id:
-                    reply_to_id = int(mapped_target_id)
-                    logger.info(f"🔗 REPLY MATCH: Source {first_msg.reply_to_msg_id} -> Target {reply_to_id}")
-                    send_monitor_log(f"🔗 Reply Linked to Target ID: {reply_to_id}")
-                else:
-                    logger.debug("🔗 REPLY: No mapping found, defaulting to topic root.")
+                    reply_to_msg_id = int(mapped_target_id)
+
+            # 3. CONSTRUCT REPLY PARAMETER
+            reply_param = thread_id
+            if reply_to_msg_id:
+                reply_param = reply_to_msg_id
 
             # 3. Construct Send Parameters
             album_text = next((msg.message for msg in messages if msg.message), "")
@@ -1565,7 +1569,7 @@ def setup_automation_handlers(client: TelegramClient):
                 entity=int(tid),
                 message=album_text,
                 file=[m.media for m in messages] if len(messages) > 1 else first_msg.media,
-                reply_to=reply_to_id # This now points to the specific message if found
+                reply_to=reply_param
             )
 
             if sent:
@@ -1575,15 +1579,13 @@ def setup_automation_handlers(client: TelegramClient):
                 logger.info(f"✅ MIRROR: Sent successfully to {tid}")
                 send_monitor_log(f"✅ Successfully Mirrored to {tid}")
 
-        except errors.FloodWaitError as e:
-            logger.warning(f"⚠️ Flood wait: {e.seconds}s. Waiting...")
-            await asyncio.sleep(e.seconds)
         except Exception as e:
+            import asyncio
+            if "FloodWait" in str(type(e)):
+                await asyncio.sleep(60)
             if "message thread not found" in str(e).lower():
-                logger.error("❌ Target Topic not found. Clearing cache.")
                 topic_cache.pop(int(tid), None)
             logger.error(f"❌ MIRROR FATAL ERROR: {e}")
-
     async def execute_fallback_mirror(client, sid, tid, messages, first_msg, album_text, reply_header, pair_id=None):
         """Downloads and re-uploads protected content."""
         import os
@@ -3418,6 +3420,27 @@ async def main():
     polling_thread.start()
     logger.info("✨ Admin bot monitor started")
     
+    # Background Mirror Worker
+    async def mirror_worker():
+        logger.info("👷 Background Mirror Worker started.")
+        while True:
+            job = await mirror_queue.get()
+            try:
+                if job["type"] == "mirror":
+                    await execute_perform_mirror(
+                        userbot, job["tid"], job["messages"], 
+                        job["def_topic"], job["is_mir"], 
+                        job["sid"], pair_id=job["pid"]
+                    )
+                # Add a small delay between jobs to prevent flood
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Worker Error: {e}")
+            finally:
+                mirror_queue.task_done()
+
+    asyncio.create_task(mirror_worker())
+
     if userbot:
         try:
             await userbot.run_until_disconnected()
